@@ -119,46 +119,31 @@ jobs:
           systemd-analyze verify "$tmp/ai-debate.service" || true
           grep -q "Restart=always" "$tmp/ai-debate.service"
           grep -q "ExecStart=/opt/ai-debate/bin/ai-debate serve" "$tmp/ai-debate.service"
-      - name: Diagnose the systemd options on this runner
-        run: |
-          set +e
-          echo "--- PID 1 ---"
-          ps -p 1 -o comm=
-          echo "--- systemctl state ---"
-          systemctl is-system-running; echo "exit=$?"
-          echo "--- can systemctl start a unit? ---"
-          sudo systemctl start cron && echo "systemctl_start=yes" || echo "systemctl_start=no"
-          sudo systemctl is-active cron; echo "active_exit=$?"
-          echo "--- docker ---"
-          docker info --format '{{.CgroupVersion}} {{.Driver}}' 2>&1 | head -2
-          docker run --rm --privileged alpine:3.20 sh -c 'echo privileged_ok' 2>&1 | tail -3
-          echo "--- systemd container ---"
-          docker rm -f probe >/dev/null 2>&1
-          docker run -d --privileged --name probe ubuntu:22.04 /sbin/init 2>&1 | tail -3
-          sleep 8
-          docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}}' probe 2>&1
-          docker logs probe 2>&1 | tail -20
-          docker rm -f probe >/dev/null 2>&1
-      - name: Start a model stub on the host
+      - name: Prove this runner has a working systemd
         run: |
           set -euo pipefail
-          node test/support/mock-model.mjs &
-          sleep 1
-      - name: Install, enable, kill and reinstall under systemd
+          # The runner's PID 1 is systemd, but it reports `starting` for a while after
+          # boot and never reaches `running` on these images. The honest test is not
+          # the reported state — it is whether a unit can actually be started.
+          ps -p 1 -o comm= | grep -qx systemd
+          sudo systemctl start cron
+          test "$(systemctl is-active cron)" = "active"
+          systemctl --version | head -1
+      - name: Install the archive and run the full lifecycle on real systemd
         run: |
           set -euo pipefail
-          docker exec ai-debate-sysd bash -lc 'apt-get update -qq && apt-get install -y -qq curl >/dev/null'
-          docker cp dist/ai-debate-linux-x64.tgz ai-debate-sysd:/tmp/ai-debate.tgz
-          docker cp test/acceptance/linux-install.sh ai-debate-sysd:/tmp/linux-install.sh
-          docker exec -e AI_DEBATE_MOCK_URL=http://127.0.0.1:17863 ai-debate-sysd bash /tmp/linux-install.sh /tmp/ai-debate.tgz
+          sudo bash test/acceptance/linux-install.sh dist/ai-debate-linux-x64.tgz
       - name: Show the systemd journal if it failed
         if: failure()
         run: |
-          docker exec ai-debate-sysd journalctl -u ai-debate -n 120 --no-pager || true
-          docker logs ai-debate-sysd 2>&1 | tail -60 || true
-      - name: Stop the container
+          systemctl --no-pager --full status ai-debate || true
+          journalctl -u ai-debate -n 150 --no-pager || true
+      - name: Remove the service after the run
         if: always()
-        run: docker rm -f ai-debate-sysd || true
+        run: |
+          sudo systemctl disable --now ai-debate 2>/dev/null || true
+          sudo rm -f /etc/systemd/system/ai-debate.service
+          sudo systemctl daemon-reload || true
       - uses: actions/upload-artifact@v4
         with:
           name: linux-tgz
