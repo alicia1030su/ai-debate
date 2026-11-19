@@ -44,7 +44,7 @@
 | WP6 | CI 与发布 | ✅ `ci.yml`（secrets-scan → test 矩阵 → 两个打包 job，均 `needs: test`）；`release.yml`（`guard` 拒绝覆盖已存在 Release → `verify` → 两平台构建 → `publish` 生成 `SHA256SUMS` 并复验资产名，无 `--clobber`）；`scan-secrets.mjs`；`assert-no-dsh.mjs`（四查，含「打包二进制在无 DSH 环境下可 `--version`」） | `.github/workflows/**`、`scripts/{scan-secrets,assert-no-dsh}.mjs` |
 | 文档 | 用户文档 | ✅ `README.md`、`NOTICE`（上游 AGPL 来源）、`security.md`（保护/不保护都写明）、`install-windows.md`、`install-linux.md`、`migration.md`、`release-notes-v0.1.0.md` | `docs/**` |
 
-**自测状态（逐条实跑，2026-11-19 定时复核）**：`typecheck` ✅｜`build`（core+web）✅｜`bundle` ✅（`dist/ai-debate.cjs` 1127 KB + `dist/web` 6 资源）｜`package:windows` ✅（89.5 MB，`--version` 正常）｜`npm test` ✅（core **113**、server **20**、web **6**、acceptance **25/25**）｜`scan-secrets` ✅（exit 0，**182** 个受版本控制的文件）｜`assert-no-dsh` ✅（106 源文件 / 4 清单 / 91 线路）。**已修并复验**：G3、G4（第二个 `serve` exit 3）、G6、G9（入口文件已建）、G10、G11（含 fail-closed 对照）、G12、G13、G14、G15。**仍开 2 项**：静态产物入库与 gitignore 不一致（G16）｜known-issues 待补（G8-residual）。
+**自测状态（逐条实跑，2026-11-19 定时复核）**：`typecheck` ✅｜`build`（core+web）✅｜`bundle` ✅（`dist/ai-debate.cjs` 1127 KB + `dist/web` 6 资源）｜`package:windows` ✅（89.5 MB，`--version` 正常）｜`npm test` ✅（core **113**、server **20**、web **6**、acceptance **25/25**）｜`scan-secrets` ✅（exit 0，**182** 个受版本控制的文件）｜`assert-no-dsh` ✅（106 源文件 / 4 清单 / 91 线路）。**已修并复验**：G3、G4（第二个 `serve` exit 3）、G6、G9（入口文件已建）、G10、G11（含 fail-closed 对照）、G12、G13、G14、G15。**仍开 3 项**：静态产物入库与 gitignore 不一致（G16）｜known-issues 待补（G8-residual）｜干净克隆 `npm test` 失败（G18）。
 
 ---
 
@@ -52,6 +52,7 @@
 
 > 实测基线（本机 Node 22.22.2）：`typecheck` ✅｜`build` ✅｜`bundle` ✅（`dist/ai-debate.cjs` ~1127 KB + `dist/web` 6 资源）｜`package:windows` ✅（89.5 MB，`--version` → `AI Debate 0.1.0 (win32-x64)`）｜`npm test` ✅（core **113** + server **20** + web **6** + acceptance **25/25**）｜`scan-secrets` ✅｜`assert-no-dsh` ✅（108 源文件 / 4 清单 / 91 线路）｜`npm start` → `/healthz` **200** ✅。
 > 已修并复验：G3、G4、G6、G9、G9-residual、G10、G11、G12、G13、G14、G15、G17。
+> 仍开：G16（构建产物入库）、G8-residual（known-issues 一条）、**G18（干净克隆 `npm test` 失败，阻断级，见 WP8.4）**。
 
 ### WP8.1 `[release]` 静态产物与 `.gitignore` 对齐（G16）
 

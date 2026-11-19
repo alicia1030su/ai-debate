@@ -70,6 +70,11 @@ jobs:
         run: |
           & dist/AI-Debate-windows-x64.exe --version
           & dist/AI-Debate-windows-x64.exe --help
+      - name: Prove the packaged executable completes the workflow
+        shell: bash
+        env:
+          AI_DEBATE_BIN: dist/AI-Debate-windows-x64.exe
+        run: node --experimental-transform-types test/acceptance/standalone.ts
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows
@@ -90,6 +95,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run package:linux
+      - name: Prove the archive installs and serves
+        run: sudo bash test/acceptance/linux-install.sh dist/ai-debate-linux-x64.tgz
       - uses: actions/upload-artifact@v4
         with:
           name: release-linux
