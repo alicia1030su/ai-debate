@@ -75,9 +75,11 @@ packages/web/
 - `initialized:true, authenticated:false` → 渲染登录表单
 - `initialized:true, authenticated:true` → 渲染主界面
 
-**CSRF**：非 GET 请求必须带 `x-ai-debate-csrf`。外壳在 `requestJson` 里加（会话建立后取 `csrf` 字段，首启用字面量 `setup`），同时用 `fetch` 包装给继承页面的所有写请求补上同一个头。`csrf` 缺失时外壳不发送该头——旧服务不受影响。
+**CSRF**：非 GET 请求会带 `x-ai-debate-csrf`。当前服务端（`packages/server/src/http.ts`）**尚未校验**这个头——它用 `SameSite=Strict` cookie + Origin/Host 同源校验 + JSON content-type 就够挡住跨站——但 `docs/architecture.md` §6.2 / T2 要求会话绑定 token，所以外壳**已经按终局契约发头**：`auth/state` 返回 `csrf` 时用它，首启用字面量 `setup`，两者都没有时不发（旧服务不受影响）。服务端补上校验时前端零改动。
 
 **会话失效**：产品路由返回 401/403 → 卸载卡片、回到登录表单、清空 CSRF。网络错误显示「无法连接服务」并提供重试。
+
+**首启令牌**：非回环地址初始化时服务端要求一次性令牌（`packages/server/src/auth.ts` 的 `setupAllowed`）。外壳默认不显示该字段；初始化失败且错误文案提到「令牌/token」时，**自动重渲染出该输入框**并把已填的用户名带回去，不让用户对着一条提到不存在控件的报错发呆。
 
 ### `/status` 需要承载的两个字段
 
@@ -121,8 +123,13 @@ packages/web/
 | 文件 | 对外路径 | 缓存建议 |
 |------|----------|----------|
 | `index.html` | `/` | `no-store` |
-| `assets/app.js` | `/assets/app.js` | `max-age=31536000, immutable`（文件名带内容哈希更好，目前不带，CI 校验字节） |
+| `assets/app.js` | `/assets/app.js` | `max-age=31536000, immutable` |
 | `assets/theme.css` | `/assets/theme.css` | 同上 |
+| `manifest.json` | 不对外 | 打包器用它列出要嵌进二进制的资源键（`web/<相对路径>`） |
+
+`manifest.json` 由构建脚本生成（`scripts/web-manifest.mjs`），**不要手写**：单文件可执行里没有目录可遍历，服务端只能按清单找资源，手写清单与产物不一致就是「样式丢失」这一类线上事故。清单里的键已带 `web/` 前缀，与服务端 `AssetStore` 的约定一致。
+
+`static/theme.css` 是**源文件**，`assets/theme.css` 是它每次构建时的副本（`index.html` 引用后者，因为只有 `assets/` 下的资源才拿 immutable 缓存头）。要改样式改源文件，不要改副本。
 
 **CSP**：`script-src 'self'` 足够（页面无内联脚本），但 `style-src` 必须允许内联——卡片启动时自己注入 `<style>`，React 还会写 `style` 属性。即 `style-src 'self' 'unsafe-inline'`。
 

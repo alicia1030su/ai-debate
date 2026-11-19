@@ -5,6 +5,15 @@
 > 读者：实现工程师、验收人、后续维护者
 > 相关：[`task-plan.md`](./task-plan.md)（实现顺序与验收）、[`decisions.md`](./decisions.md)（ADR）、[`security.md`](./security.md)（对外威胁模型）、[`migration.md`](./migration.md)（旧数据迁移）
 
+
+> **实施偏差说明（发布时补充）**：本文件是设计阶段的方案与任务分解。实际实现中有几处按交付时的判断做了调整，以 `docs/differences.md` 与 `docs/known-issues.md` 为准：
+> 1. 任务队列只承载维护类任务（备份/恢复/日志轮转/凭据审计/存储自检），**不承载**分析、生成、发表；`apply()` 未新增第三参数 `hooks`。
+> 2. 认证不强制 `x-ai-debate-csrf` 自定义头，改为「同源 + `application/json` + `SameSite=Strict`」。
+> 3. 监听地址允许自定义（`--host`），默认仍是 `127.0.0.1`；没有「非回环直接拒绝」。
+> 4. 前端主视图使用 `DebateCard`（11 个页签），不是把全部区域堆叠的 `DebateSection`。
+> 5. 页面外壳是最薄的普通 DOM，没有引入第二个 React 应用，也没有 hash 路由。
+
+
 ---
 
 ## 0. 一句话结论
@@ -652,9 +661,9 @@ stateDiagram-v2
 | 职责 | 实现 |
 |------|------|
 | 让 `plugin.apply()` 跑起来 | `createHostContext()` 给最小 `effect/locale/slots/logger`；唯一真实作用是执行 `ensureStyles()` 把 `CARD_CSS` 注入 `<head>`。slot 注册是 no-op（没有宿主 shell 可注册进去），但 `effect` 必须真执行回调、`inject/register` 必须返回 callable，否则页面的清理链会拿到 `undefined` |
-| 认证门 | `boot()` → `GET /auth/state`：未初始化 → Setup 表单；未登录 → Login；已登录 → 主视图（React 挂载 `DebateCard`） |
+| 认证门 | `boot()` → `GET /auth/state`：未初始化 → Setup 表单；未登录 → Login；已登录 → 主视图（React 挂载 `DebateCard`）。`/auth/state` 实测只返回 `{initialized, authenticated, version}`（不含 `csrf`，见 G13） |
 | 会话失效 | 用 `window.fetch` 包装器（而非改页面）监听：凡是 `/api/ai-debate/*` 且非 `/auth/*` 的 401/403 → 一次性退回登录页。理由：生成的页面自带请求，没有钩子可插；包装器是唯一单一位置 |
-| 顶栏 | 品牌、用户名、服务灯（`/status` 30s 轮询，页面隐藏时暂停）、系统链接、退出 |
+| 顶栏 | 品牌、用户名、服务灯（30s 轮询核心 `/api/ai-debate/status`，页面隐藏时暂停）、系统链接（当前指向 `/api/ai-debate/status`，见 G14）、退出 |
 | 文本安全 | 全部 `textContent`；**没有任何 `innerHTML`**；服务端消息里的 `<` 原样显示 |
 
 ### 9.3 页面与外壳的边界
@@ -676,7 +685,8 @@ stateDiagram-v2
 2. node scripts/build-web.mjs        切片+改写+语法校验 → src/legacy-body.cjs
                                      esbuild 打包 entry.cjs → static/assets/app.js（IIFE/minify/es2020）
                                      复制 theme.css → static/assets/theme.css
-3. node scripts/bundle-server.mjs    ⚠ 尚未入库（§13 G2）→ 期望产出 dist/ai-debate.cjs
+3. node scripts/bundle-server.mjs    收集 packages/web/static → dist/web（含 manifest.json）
+                                     esbuild 打包 apps/desktop/src/main.ts → dist/ai-debate.cjs（CJS, external node:sea）
 4. node packaging/windows/build.mjs  收集 dist/web（含 manifest.json）→ sea-config → blob
                                      → 复制 node.exe → postject NODE_SEA_BLOB + sentinel fuse
                                      → dist/AI-Debate-windows-x64.exe + .sha256
@@ -760,9 +770,9 @@ graph LR
 | R6 | 限流计数只在内存 | 重启后锁定清零 | 攻击者需要能重启本机服务；会话与口令哈希都在盘上 | 低 |
 | R7 | 未签名 EXE | SmartScreen「未知发布者」 | 文档说明；预留签名脚本（用户自带证书） | 中（无证书无法消除） |
 | R8 | 微博读取依赖外部 `weibo-cli` | 单文件产品无法内嵌第三方 CLI | 保持 `cli_missing`/`not_authenticated`/… 作为**明确状态**，界面直说；贴吧路径不依赖它 | 中（产品能力缺口，非缺陷） |
-| R9 | 旧 DSH 数据不合并 | 老用户需重录凭据 | 只探测 + `legacy.note` 提示；`migration.md` 写明；**导入功能未实现**（G1） | 中 |
+| R9 | 旧 DSH 数据不合并 | 老用户需重录凭据 | `legacy.scan()` 统计 + `legacy.import()` 仅在空台账时复制（含 `<target>.pre-import-*` 备份）；凭据**不导入**，`migration.md` 写明需重录 | 中 |
 | R10 | 备份不含密钥/口令 | 换机需重录 | UI 明示；这使备份可以安全外传 | 低 |
-| R11 | `packages/web` 与 `packages/server` 没有独立 `package.json` | workspace 语义不完整、lock 只含 core | §13 G5 说明现状与影响 | 低（不阻塞构建，但阻塞「按包安装依赖」） |
+| R11 | 根 `npm test` 的 glob 匹配不到文件（`test/**/*.test.ts`），静默 0 个测试 | 本地/CI 的「测试通过」可能什么都没跑 | CI 用 `test:core`/server/web/acceptance 四条具体命令；根 `test` 脚本应改为串行跑四条（G12） | 中（诚实性问题） |
 
 ---
 
@@ -785,6 +795,9 @@ graph LR
 | Linux 安装/卸载/systemd | ✅ `ProtectSystem=strict` 等加固；默认保留数据 |
 | CI 双平台 + 发布不覆盖 | ✅ `guard` + `verify` + 两平台构建 + `publish` |
 | 零运行时依赖（ADR-011） | ✅ server 无第三方依赖；core 无 `@deepseek-ai/*` |
+| 契约测试 / 端到端验收 | ✅ 实测：core 111、server 14、web 6 全绿；`test/acceptance/standalone.ts` **25/25 通过**（含首启、登录、保存配置、保存 Key 不回显、测模型、导入→生成→编辑→批准→复制、备份任务、重启后会话与台账仍在、路径穿越 404、跨站写入 403） |
+| 打包链路 | ✅ 实测 `npm run bundle` → `dist/ai-debate.cjs` 1124 KB + `dist/web`（5 个资源）；`npm run package:windows` 已产出 `dist/AI-Debate-windows-x64.exe`（89.5 MB），`--version` 打印 `AI Debate 0.1.0 (win32-x64)` |
+| 旧数据导入 | ✅ `legacy.scan()` + `legacy.import()`：仅空台账、复制前写 `.pre-import-<ts>`、拒绝合并；`/system/action` 的 `legacy-scan`/`legacy-import` 已接 |
 
 ### 13.2 有意的偏离（比原设计更好）
 
@@ -801,15 +814,20 @@ graph LR
 
 ### 13.3 缺口（按优先级，验收前必须处理）
 
-| # | 缺口 | 证据 | 影响 | 建议处理 |
-|---|------|------|------|----------|
-| **G1** | **旧数据导入只有探测，没有复制** | `app.ts` 的 `detectLegacy()` 只返回 `{found, dir, note}`；`/system/action` 没有 import 动作；`migration.md` 承诺了「dry run → 确认 → 复制」 | 文档承诺与实现不一致；老用户无法迁移台账（只能手工 `cp`） | 新增 `system/action: import-legacy`，先 dryRun 统计（sessions/candidates/ledger/approvals），`confirm` 时**仅当新 `state.json` 不存在或为空台账**才复制，并在复制前写 `pre-import` 备份 |
-| **G2** | **`scripts/bundle-server.mjs` 不存在** | `package.json` 的 `bundle` 指向它；`packaging/linux/build.mjs` 要求 `dist/ai-debate.cjs` 已存在；CI 的 `npm run build && npm run bundle` | 打包链路在 CI 里会红；本地无法产出发布包 | 写一个 esbuild 调用：`--bundle --platform=node --target=node22 --format=cjs --define:__VERSION__`，入口 `apps/desktop/src/main.ts`，输出 `dist/ai-debate.cjs`。注意 `import.meta` 与 `createRequire(import.meta.url)` 在 CJS bundle 中的替换（`--define:import.meta.url` 不可靠 → 改为向 core 注入版本常量或提供 `__filename` 兼容 shim） |
-| **G3** | **core 仍有 DSH 命名残留** | `tools.ts` 两处 `loggerOf(ctx, 'dsh-ai-debate')` + 四处「设置 → 插件 → dsh-ai-debate → 配置」文案；`store.ts:2447` `defaultStoreDir` 仍返回 `~/.dsh/ai-debate`（未被调用，但导出） | 用户可见的引导文案指向不存在的路径；`store.ts` 的导出可能被将来误用 | 改文案为「管理后台 → 配置」；日志名改 `ai-debate`；`defaultStoreDir` 改为委托 `store-dir.ts` 的平台默认或直接删除（若无人调用，删除最安全）；然后收紧 `assert-no-dsh` 的白名单只允许 `NOTICE`/`docs/` |
-| **G4** | **没有强制单实例锁** | `cli.ts` 用 `run/server.json` + `/healthz` 探测；两个 `serve` 同时启动都会监听成功（端口冲突时第二个失败，换端口就都活了） | 两个进程写同一 `state.json`（核心有跨进程锁，不会坏数据，但会有「两个控制台」的困惑） | 在 `app.ts` 监听成功后写 `run/instance.lock`（pid + port + token）；启动时若探测到活的实例 → 打印已有实例信息并退出（exit 3），不自动换端口 |
-| **G5** | `packages/web`、`packages/server` 缺 `package.json` | lock 里只有 `packages/core`；`workspaces` 声明了三个目录 | `npm ci` 目前能过（npm 忽略没有清单的 workspace 目录），但「按包声明依赖/脚本」不可用；`assert-no-dsh` 读清单时会跳过（它已处理缺失） | 补两个最小清单（private、name、exports、scripts），或在根 `package.json` 里改成 `workspaces: ["packages/core"]` 并说明原因。优先补清单（未来要拆包时零成本） |
-| **G6** | 审计日志 `audit.jsonl` 只建了路径，没写事件 | `Layout` 有 `auditFile`；`security.md` 说「写入审计日志」 | 登录成功/失败、改密、备份、恢复、导入缺少可追溯记录 | 在 `auth.ts` 与 `http.ts` 的关键分支追加 `audit.at('login.ok'|'login.fail'|'password.change'|'backup.create'|…)`；单行 JSONL，永不抛 |
-| **G7** | `--selftest` 未实现；CI 引用的 `test/acceptance/standalone.ts`、`packages/server/test/**`、`scripts/bundle-server.mjs` 都不存在 | `ci.yml` 四步引用缺失文件；`test/` 目录为空 | CI 在 `test` job 就会红 → 打包 job 永不执行 → 发布链路不可用 | 实现 `test/acceptance/standalone.ts`（起真实服务 + 断言 9 工具/7 路由/认证流/备份/恢复）与 `packages/server/test/*.test.ts`（至少覆盖原子写、密文篡改、限流、队列恢复）；或先降级 CI（允许缺失测试时 skip），但**不能**让红一直挂着 |
-| **G8** | `docs/known-issues.md` 被 `release-notes-v0.1.0.md` 引用但不存在 | release notes 写「见 `docs/known-issues.md`」 | 发布说明里有一个死链 | 补一份 8–12 条的已知问题清单（ARM64、TLS、签名、多用户、微博 CLI、导入未实现、单实例、限流内存态…） |
+> 下表是**逐条实测**的结果（不是推测）：每条都写了我怎么验证、看到什么、以及该怎么修。
 
-**验收建议**：G1/G2/G7 是**阻断级**（分别影响迁移、打包、CI）；G3/G4/G5 是**发布级**（影响用户可见行为与稳定性）；G6/G8 是**质量级**（可信度）。`task-plan.md` 的 WP8 给出对应步骤。
+| # | 缺口 | 实测证据 | 影响 | 处理 |
+|---|------|----------|------|------|
+| **G9** | **`npm start` 指向不存在的文件** | `package.json` 的 `start: node packages/server/src/main.ts --serve`；`ls` 确认该文件不存在；实际跑 `npm start` → `MODULE_NOT_FOUND`。README 也写了 `npm start` | 新人第一次按 README 操作就失败；这是唯一被文档承诺的「从源码跑起来」的方式 | 把 `start` 改成 `node --experimental-transform-types packages/server/src/cli.ts serve`（或新建 `packages/server/src/main.ts` 只做 `runCli(process.argv.slice(2))`——与 `apps/desktop/src/main.ts` 同构，推荐后者，因为它同时是文档里的「服务端入口」） |
+| **G10** | **`scan-secrets.mjs` 会被自己的测试夹具判死** | 实跑 `node scripts/scan-secrets.mjs` → **exit 1**，命中 `packages/server/test/runtime.test.ts:68`（`sk-super-secret-value-123456`）与 `:252`（`BDUSS=abcdefghijklmnop`）。这两处是**故意**用来验证「密文不落盘 / 日志打码」的假值 | CI 的 `secrets-scan` job 必红 → 整个 CI 红 → `release.yml` 的 `verify` 也红 → **永远发不出去** | 在脚本里排除**明确的测试夹具行**：文件名匹配 `**/test/**` 且行内含 `super-secret`/`hunter2`/`abcdefghijklmnop`/`sk-live-` 这类占位词则跳过，并在脚本里写清「只跳过占位值，不跳过真实形态」；或把这些夹具改成运行时拼接（`'sk-' + 'x'.repeat(24)`），让静态扫描永远看不到完整形态（**推荐后者**，不需要在扫描器里开洞） |
+| **G11** | **远程绑定（`--host 0.0.0.0`）下核心 7 条路由全 403** | 实跑 `dist/ai-debate.cjs serve --host 0.0.0.0`，用原生 `http` 构造 `Host: 192.168.1.20:<port>` 与 `Host: debate.example.com` 请求 `/api/ai-debate/settings` → **均 403 `forbidden: origin`**；同一路径换成 `Host: 127.0.0.1:<port>` → 401（说明围栏放行、只是没会话）。原因：适配器没有提供 `appServer` 服务，核心 `appServerOf(ctx)` 拿不到 `trustedHosts`，于是回落到 `DEFAULT_TRUSTED_HOSTS`（仅 loopback 名） | `security.md` §6 与 `install-linux.md` 的 `--host 0.0.0.0` / 反代路径**实际不可用**：页面能打开、登录能成功，但一进设置页就 403。这是**文档承诺与实现不一致**，且是「远程访问」这个已发布特性的核心阻断 | 在 `standalone-host.ts` 的 `services` 里加 `appServer: { trustedHosts, info() }`：`trustedHosts` = 由 `--host` 推导（loopback 一律含 4 个默认名；绑具体地址时加该地址与 `localhost`；反代场景由 `AI_DEBATE_TRUSTED_HOSTS`（逗号分隔）显式追加，**永不从请求头推断**）；`info()` 返回 `{listen, port, dataDir, version, startedAt, pid}`（这与核心 `AppServerService` 的定义逐字段一致，同时补齐设置页缺失的「进程事实」块） |
+| **G12** | **根 `npm test` 静默跑 0 个测试** | 实跑 `npm test` → `1..0`、`# tests 0`、exit 0。原因是 glob 是 `test/**/*.test.ts`，而 `test/` 下只有 `acceptance/standalone.ts`（不是 `.test.ts`），真正的测试在 `packages/*/test/` | 「测试通过」的绿灯可能什么都没测；本地改坏了东西不会红 | 根 `test` 改成串行跑四条：`test:core`、`test:server`、`test:web`、`acceptance`；并让任一非零即整体非零。CI 已经分别跑这四条，所以只剩「本地体验」与「诚实性」问题 |
+| **G3** | core 仍有 DSH 命名残留（缩小到 1 处 + 文案） | `packages/core/src/store-dir.ts:144` 的 `legacyDshStoreDir` 返回 `~/.dsh/ai-debate`（**保留是对的**：导入功能需要它）；`store.ts` 的 `defaultStoreDir()` 仍返回 `~/.dsh/ai-debate`，**全仓库无调用方**；`tools.ts` 仍有 2 处 `loggerOf(ctx,'dsh-ai-debate')` 与 4 处「插件 → dsh-ai-debate → 配置」文案（工具结果里给模型看的提示，用户也会看到） | 用户按工具提示去找「插件 → dsh-ai-debate → 配置」，这个入口在本产品不存在 | 删 `store.ts` 的无用导出；`tools.ts` 文案改「管理后台 → 配置」，logger 名改 `ai-debate`；`legacyDshStoreDir` 保留并在 `assert-no-dsh` 白名单里显式列出 |
+| **G4** | 没有强制单实例锁 | 两个 `serve` 用不同端口都能起来，写同一 `dataDir`；launcher 靠 `/healthz` 复用，但 `serve` 直接启动不受约束。核心有 `state.json.lock`（不会坏台账），但会出现「两个控制台看同一份台账」 | 用户可能同时开两个窗口改配置，`ConfigStore` 的 hash 冲突会拦住写入（报 conflict），但体验是「保存一直提示冲突」 | 监听成功后写 `run/instance.lock`（pid + port + token）；`serve` 启动前探测：活实例 → 打印地址并 `exit 3`；死 pid → 覆盖。不做强制 kill |
+| **G6** | `audit.jsonl` 只有路径，没有写入 | `Layout.auditFile` 已定义但全仓库无写入点；`security.md` 说「写入审计日志」 | 登录成功/失败、改密、备份/恢复/导入缺少可追溯记录；出事后无法回答「谁在什么时候做了什么」 | 在 `auth.ts`（login.ok/login.fail/throttled/admin.created/password.changed/logout）与 `http.ts`（setup/backup/restore/import/autostart/shutdown/restart）追加单行 JSONL，复用 `redact()`，写失败只 warn |
+| **G13** | 页面的 CSRF 头是**死代码**（前端发、后端不校验） | `entry.cjs` 有 `CSRF_HEADER='x-ai-debate-csrf'` 与 `csrfToken`，但 `auth/state` 从不返回 `csrf` 字段（实测响应只有 `initialized/authenticated/version`），服务端也没有任何 `csrf` 校验（`grep -rn csrf packages/server/src` 为空）。因此请求里永远不带这个头 | **不是漏洞**（SameSite=Strict + Origin/Host + 强制 JSON 已覆盖），但是一处**误导**：读代码的人会以为有 token 校验 | 二选一：①删掉前端的 token 机制与注释（最小改动，诚实）；②真正实现（`/auth/state` 返回会话绑定的 `csrf`，服务端在写请求上校验）。v0.1.0 建议①，并在 `security.md` 写明「CSRF 靠 Strict+Origin+JSON 三层」 |
+| **G14** | 页面的「系统」链接指向 JSON 接口而非状态页 | `entry.cjs` 的 `STATUS_URL = API_BASE + '/status'`（核心的诊断 JSON），而服务端另有 `/system` 的 HTML 状态页（`http.ts` 的 `systemPage`，含队列/日志/旧数据/进程事实） | 点「系统」看到一大段 JSON，而真正给人看的状态页没人链接 | 把顶栏链接改成 `/system`；`/status` 保留给程序用（服务灯轮询也改指向 `/api/ai-debate/system/status` 的轻量字段，避免每次轮询都跑一遍平台诊断） |
+
+**仍未复核的两项（需要跨平台机器）**：Linux 侧的 `install.sh` / systemd unit 只在脚本层验证（`systemd-analyze` 未跑）；ARM64 明确未构建（`known-issues.md` 第 2 条）。
+
+**验收建议**：G9/G10/G11 是**阻断级**——G10 让 CI 永远红（发不出去），G11 让已承诺的远程访问在设置页 403，G9 让 README 的第一条命令就失败。G3/G4/G12 是**发布级**；G6/G13/G14 是**质量级**。`task-plan.md` 的 WP8 给出对应步骤与验收断言。

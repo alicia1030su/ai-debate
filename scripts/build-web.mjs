@@ -24,6 +24,7 @@ import { build } from 'esbuild'
 import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { writeAssetManifest } from './web-manifest.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
@@ -266,6 +267,8 @@ async function main() {
   await buildLegacyBody()
   await bundleApp()
   await publishTheme()
+  const assets = await writeAssetManifest(STATIC_DIR)
+  console.log(`[build-web] 生成 ${path.relative(ROOT, path.join(STATIC_DIR, 'manifest.json'))}（${assets} 个资源）`)
   console.log('[build-web] 完成')
 }
 

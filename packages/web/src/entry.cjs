@@ -775,10 +775,10 @@ function resolveNodes() {
     'a',
     {
       class: 'shell-link',
-      href: STATUS_URL,
-      target: '_blank',
-      rel: 'noreferrer',
-      title: '打开服务状态（JSON）',
+      // A real page served by the service (`GET /system`), not the JSON API: the
+      // status payload is for the page, this link is for a person.
+      href: '/system',
+      title: '服务状态与日志',
     },
     ['系统'],
   )

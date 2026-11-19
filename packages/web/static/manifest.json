@@ -1,0 +1,8 @@
+{
+  "assets": [
+    "web/assets/app.js",
+    "web/assets/theme.css",
+    "web/index.html",
+    "web/theme.css"
+  ]
+}

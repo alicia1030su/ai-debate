@@ -98,20 +98,18 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run package:linux
-      - name: Install into a scratch root and start the service binary
+      - name: Verify the systemd unit renders and parses
         run: |
           set -euo pipefail
-          mkdir -p /tmp/aitest
-          tar -xzf dist/ai-debate-linux-x64.tgz -C /tmp/aitest
-          /tmp/aitest/ai-debate-linux-x64/bin/ai-debate --version
-          AI_DEBATE_HOME=/tmp/aitest/data /tmp/aitest/ai-debate-linux-x64/bin/ai-debate serve --port 17861 &
-          pid=$!
-          for i in $(seq 1 40); do
-            if curl -fsS http://127.0.0.1:17861/healthz >/dev/null; then break; fi
-            sleep 0.5
-          done
-          curl -fsS http://127.0.0.1:17861/healthz
-          kill $pid || true
+          tmp=$(mktemp -d)
+          sed "s|@PREFIX@|/opt/ai-debate|g; s|@DATA_DIR@|/var/lib/ai-debate|g; s|@CONF_DIR@|/etc/ai-debate|g; s|@APP_USER@|ai-debate|g"             packaging/linux/ai-debate.service > "$tmp/ai-debate.service"
+          systemd-analyze verify "$tmp/ai-debate.service" || true
+          grep -q "Restart=always" "$tmp/ai-debate.service"
+          grep -q "ExecStart=/opt/ai-debate/bin/ai-debate serve" "$tmp/ai-debate.service"
+      - name: Install the archive and run the full acceptance
+        run: |
+          set -euo pipefail
+          sudo bash test/acceptance/linux-install.sh dist/ai-debate-linux-x64.tgz
       - uses: actions/upload-artifact@v4
         with:
           name: linux-tgz
