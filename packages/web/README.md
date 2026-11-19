@@ -77,9 +77,15 @@ packages/web/
 - `initialized:true, authenticated:false` → 渲染登录表单
 - `initialized:true, authenticated:true` → 渲染主界面
 
-**CSRF**：非 GET 请求会带 `x-ai-debate-csrf`。当前服务端（`packages/server/src/http.ts`）**尚未校验**这个头——它用 `SameSite=Strict` cookie + Origin/Host 同源校验 + JSON content-type 就够挡住跨站——但 `docs/architecture.md` §6.2 / T2 要求会话绑定 token，所以外壳**已经按终局契约发头**：`auth/state` 返回 `csrf` 时用它，首启用字面量 `setup`，两者都没有时不发（旧服务不受影响）。服务端补上校验时前端零改动。
+**写请求的鉴权**：没有自定义 CSRF 头，也不该有。真正挡住跨站写入的是三件事，缺一不可：
 
-**会话失效**：产品路由返回 401/403 → 卸载卡片、回到登录表单、清空 CSRF。网络错误显示「无法连接服务」并提供重试。
+1. 会话 cookie 是 `SameSite=Strict`；
+2. 服务端校验 `Origin` / `Host` 与本服务一致；
+3. 有 body 的写请求必须是 `content-type: application/json` —— 跨站 HTML 表单只能发 `x-www-form-urlencoded` / `multipart/form-data` / `text/plain`，发不出这种类型。
+
+第 3 条是客户端负责的那一半，`requestJson` 已经保证。**不要**再往请求里加服务端不校验的头：那会让「看起来有防护」替代「真的有防护」，而且一旦哪天服务端开始严格校验，旧页面的所有 POST 会瞬间 403。`test/render.test.mjs` 第 4 条测试同时断言「content-type 是 json」和「没有任何 csrf 头」。
+
+**会话失效**：产品路由返回 401/403 → 卸载卡片、回到登录表单。网络错误显示「无法连接服务」并提供重试。
 
 **首启令牌**：非回环地址初始化时服务端要求一次性令牌（`packages/server/src/auth.ts` 的 `setupAllowed`）。外壳默认不显示该字段；初始化失败且错误文案提到「令牌/token」时，**自动重渲染出该输入框**并把已填的用户名带回去，不让用户对着一条提到不存在控件的报错发呆。
 
@@ -127,9 +133,8 @@ packages/web/
 | `index.html` | `/` | `no-store` |
 | `assets/app.js` | `/assets/app.js` | `max-age=31536000, immutable` |
 | `assets/theme.css` | `/assets/theme.css` | 同上 |
-| `manifest.json` | 不对外 | 打包器用它列出要嵌进二进制的资源键（`web/<相对路径>`） |
 
-`manifest.json` 由构建脚本生成（`scripts/web-manifest.mjs`），**不要手写**：单文件可执行里没有目录可遍历，服务端只能按清单找资源，手写清单与产物不一致就是「样式丢失」这一类线上事故。清单里的键已带 `web/` 前缀，与服务端 `AssetStore` 的约定一致。
+**这里没有 `manifest.json`，这是有意的。** 资源清单只有一个生产者：`scripts/bundle-server.mjs`。它把本目录复制进 `dist/web`，然后按**实际复制到的文件**写 `dist/web/manifest.json`（带 `version` 与全部 6 个键，含 sourcemap）。如果 `build-web.mjs` 也写一份，两份必然漂移——一份 4 项无 version、一份 6 项有 version，而偏偏是前者被跟踪；任何「把 `static/` 当资源根」的用法都会拿到残缺清单。单文件可执行（SEA）读的是 `dist/web` 那份，源码开发运行则遍历目录（`packages/server/src/assets.ts` 的两条分支），都不需要 `static/` 里有个清单。
 
 `static/theme.css` 是**源文件**，`assets/theme.css` 是它每次构建时的副本（`index.html` 引用后者，因为只有 `assets/` 下的资源才拿 immutable 缓存头）。要改样式改源文件，不要改副本。
 
@@ -142,7 +147,7 @@ packages/web/
 1. 已登录态：渲染 `.dsd-card`、11 个 `.dsd-tab`、点击第二个页签后 `aria-selected` 翻转、`#app-root` 内无 `CARD-RENDER-ERROR` / `SECTION-RENDER-ERROR`、注入样式表带新标记、`/settings` 真被读取。
 2. 凭据配置态：`secrets[].ref` 用新名字时，页面显示「Configured」与末四位，不回退成「Not configured」。**这条钉的是 ref 改名**（把 build 里那两条替换撤掉，此测试立刻红）。
 3. 会话过期：卡片渲染后 `/settings` 返回 401 → 卡片被卸载、回到登录表单。
-4. CSRF：编辑一个字段并点保存 → 发出的 POST `/api/ai-debate/settings` 带 `x-ai-debate-csrf: <auth/state 返回的 csrf>`。
+4. 保存请求：编辑一个字段并点保存 → POST `/api/ai-debate/settings` 是**同源相对路径**、`content-type: application/json`，且**不带任何 csrf 头**（见上面「写请求的鉴权」）。
 5. 未登录态：渲染登录表单（2 个输入框）、不渲染卡片、顶栏隐藏、无控制台错误。
 6. 未初始化态：渲染初始化表单（3 个输入框）。
 

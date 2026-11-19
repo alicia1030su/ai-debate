@@ -44,33 +44,19 @@ const STATUS_URL = '/system'
 const HEALTH_URL = API_BASE + '/system/status'
 
 /**
- * CSRF header name.
+ * How the service authenticates a write.
  *
- * The service does **not** verify this today: it authenticates writes with a
- * `SameSite=Strict` cookie, an origin/host match and a required JSON content
- * type, and a token nobody checks would read as a control without being one.
- *
- * The shell still sends it whenever the service supplies one (`auth/state` →
- * `csrf`), and sends the literal `setup` for first-run, so that turning on
- * server-side verification needs no change here. When the service returns no
- * token, no header is sent at all — an invented value would be worse than none.
+ * There is **no** custom CSRF header. The three things that actually protect a
+ * request are: a `SameSite=Strict` session cookie, an Origin/Host match checked
+ * server-side, and a required `content-type: application/json` (a cross-site
+ * HTML form cannot set that header without a preflight the service refuses).
+ * A header the server never verifies would be worse than none: it reads as a
+ * control while adding nothing. This shell therefore sends nothing extra — it
+ * only has to keep the JSON content type, which `requestJson` already does.
  */
-const CSRF_HEADER = 'x-ai-debate-csrf'
-/** The value that unlocks first-run setup, before any session exists. */
-const CSRF_SETUP = 'setup'
 
 /** Resolved session-probe path; `null` until one has answered. */
 let authStatePath = null
-
-/**
- * The session's CSRF token.
- *
- * Held here rather than on `globalThis` because the shell's `fetch` wrapper is
- * the one place that injects it: the inherited page builds its own `headers`
- * object and has no hook to add a header, so rewriting that would mean editing
- * generated code. One owner, one injection point.
- */
-let csrfToken = ''
 
 /** How often the top-bar dot re-checks the service. */
 const STATUS_POLL_MS = 30000
@@ -224,31 +210,25 @@ function clear(node) {
  * — "the service is down" and "the service said no" need different words.
  *
  * @param {string} url Absolute path on this origin.
- * @param {{method?: string, body?: unknown, csrf?: string}} [options] Request options.
+ * @param {{method?: string, body?: unknown}} [options] Request options.
  * @returns {Promise<{ok: boolean, status: number, network: boolean, data: any, error: string}>}
  */
 async function requestJson(url, options) {
   const method = (options && options.method) || 'GET'
   const init = {
     method,
+    // `same-origin` so the session cookie travels, and so a request can never be
+    // issued against another origin by mistake.
     credentials: 'same-origin',
     headers: { accept: 'application/json' },
   }
   if (options && options.body !== undefined) {
+    // The service rejects a state-changing request whose body is not JSON. That
+    // requirement is also the cross-site protection: a plain HTML form can only
+    // send `application/x-www-form-urlencoded`, `multipart/form-data` or
+    // `text/plain`, none of which the service accepts.
     init.headers['content-type'] = 'application/json'
     init.body = JSON.stringify(options.body)
-  }
-  if (method !== 'GET') {
-    // The service rejects unsafe requests without this header. `setup` is the
-    // only value that works before a session exists; once there is a session,
-    // its token is used. See `docs/architecture.md` §6.2 and threat T1/T2.
-    //
-    // Login deliberately sends nothing when no token is known yet: it is the
-    // call that *creates* the session, so the service cannot be requiring a
-    // session-bound token on it, and sending a bogus one would be worse than
-    // sending none.
-    const token = (options && options.csrf) || csrfToken
-    if (token) init.headers[CSRF_HEADER] = token
   }
 
   let response
@@ -328,7 +308,6 @@ async function fetchAuthState() {
   }
 
   const data = last.data
-  csrfToken = typeof data.csrf === 'string' ? data.csrf : ''
 
   return {
     ok: true,
@@ -565,9 +544,6 @@ function renderAuthForm(mode, message, extra) {
       const result = await requestJson(isSetup ? AUTH_SETUP_URL : AUTH_LOGIN_URL, {
         method: 'POST',
         body,
-        // Setup runs before any session exists, and `setup` is the one CSRF
-        // value the service accepts at that point.
-        csrf: isSetup ? CSRF_SETUP : undefined,
       })
 
       if (!result.ok) {
@@ -650,26 +626,23 @@ function leaveMain(message) {
     nodes.cardRoot = null
   }
   clear(nodes.appRoot)
-  // The token belonged to the session that just ended. Keeping it would make the
-  // next login's requests carry a credential the service has already revoked.
-  csrfToken = ''
   renderAuthForm('login', message)
 }
 
 /**
  * Session guard, installed as a `fetch` wrapper.
  *
- * The inherited page owns its own requests, so there is no hook in it for
- * either of the two things the standalone service requires:
+ * The inherited page owns its own requests, so there is no hook in it for the
+ * one thing the shell must react to: a 401/403 on a product route means the
+ * session cookie is gone, and the only correct response is to stop showing a
+ * console that cannot save anything.
  *
- *   - **CSRF.** Every unsafe request must carry `x-ai-debate-csrf`. The page
- *     builds its own `headers` object and cannot know that; adding the header
- *     here covers saves, secret writes, approvals and every action button in one
- *     place, without touching generated code.
- *   - **Expiry.** A 401/403 means the cookie is gone. Nothing in the page can
- *     act on that, so the shell takes the user back to the login form.
- *
- * Both rules live in this one function so they cannot drift apart.
+ * Wrapping `fetch` rather than editing generated code keeps this rule in one
+ * place. The request itself is passed through untouched — this shell adds no
+ * headers, because the service authenticates writes with `SameSite=Strict` +
+ * Origin/Host + a required JSON content type (see the note at the top of this
+ * file). It adds exactly one thing on the way out: an abort signal for a
+ * `GET /status` that would otherwise hang.
  */
 function installSessionGuard() {
   if (typeof window.fetch !== 'function') return
@@ -681,16 +654,10 @@ function installSessionGuard() {
     const isAuthRoute = url.indexOf(API_BASE + '/auth/') !== -1
     const method = String((init && init.method) || 'GET').toUpperCase()
 
-    // Copy rather than mutate: `init` belongs to the caller, and a page that
-    // reuses one init object across requests must not accumulate headers.
-    let nextInit = init
-    if (isProductApi && !isAuthRoute && method !== 'GET' && csrfToken !== '') {
-      nextInit = Object.assign({}, init, { headers: withCsrfHeader(init && init.headers) })
-    }
-
     // A hung status read must not hold the configuration form hostage. The
     // caller's own signal (if any) stays in charge — this only adds one when
     // there is nothing to abort with yet.
+    let nextInit = init
     if (method === 'GET' && url.indexOf(API_BASE + '/status') !== -1 && !(nextInit && nextInit.signal)) {
       nextInit = Object.assign({}, nextInit, { signal: AbortSignal.timeout(STATUS_TIMEOUT_MS) })
     }
@@ -702,42 +669,6 @@ function installSessionGuard() {
       return response
     })
   }
-}
-
-/**
- * Copy a `headers` value with the CSRF header added.
- *
- * `init.headers` may be a plain object, an array of pairs or a `Headers`
- * instance depending on who built the request; all three are normalised rather
- * than assumed, because the caller here is code this shell does not own. The
- * `Headers` branch goes through the instance's own constructor, so it works in
- * an environment that has `Headers` but no global binding for it.
- *
- * @param {HeadersInit|undefined} headers Existing headers.
- * @returns {Record<string, string> | object} A copy with the token added.
- */
-function withCsrfHeader(headers) {
-  if (
-    headers &&
-    typeof headers.get === 'function' &&
-    typeof headers.set === 'function' &&
-    typeof headers.constructor === 'function'
-  ) {
-    const copy = new headers.constructor(headers)
-    copy.set(CSRF_HEADER, csrfToken)
-    return copy
-  }
-  const merged = {}
-  if (Array.isArray(headers)) {
-    for (const pair of headers) merged[pair[0]] = pair[1]
-  } else if (headers && typeof headers === 'object') {
-    for (const key of Object.keys(headers)) merged[key] = headers[key]
-  }
-  for (const key of Object.keys(merged)) {
-    if (key.toLowerCase() === CSRF_HEADER) delete merged[key]
-  }
-  merged[CSRF_HEADER] = csrfToken
-  return merged
 }
 
 /** React to a lost session exactly once per expiry. */
@@ -814,7 +745,7 @@ function resolveNodes() {
       class: 'shell-link',
       // A real page served by the service (`GET /system`), not the JSON API: the
       // status payload is for the page, this link is for a person.
-      href: '/system',
+      href: STATUS_URL,
       title: '服务状态与日志',
     },
     ['系统'],

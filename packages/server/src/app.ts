@@ -26,10 +26,11 @@ import { AuthService, isLoopback } from './auth.ts'
 import { ConfigStore } from './config-store.ts'
 import { CredentialStore } from './credential-store.ts'
 import { createHttpServer } from './http.ts'
+import { clearInstance, readInstance, writeInstance } from './instance.ts'
 import { JobQueue } from './jobs.ts'
 import { Logger, redact, type LogLevel } from './logger.ts'
 import { createAuditor } from './audit.ts'
-import { ensureLayout, layoutOf, type Layout } from './paths.ts'
+import { ensureLayout, layoutOf, tightenPermissions, type Layout } from './paths.ts'
 import { WebServerRegistry } from './registry.ts'
 import { createStandaloneHost } from './standalone-host.ts'
 import { writeJson } from './atomic.ts'
@@ -91,6 +92,9 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
   const log = new Logger({ level: options.logLevel ?? 'info', file: layout.logFile })
   const audit = createAuditor(layout.auditFile, redact)
   log.info(`AI Debate ${options.version} 启动：数据目录 ${layout.dataDir}`)
+  // Best-effort owner-only ACL. Runs after the logger exists so a refusal by
+  // `icacls` is visible in the log rather than swallowed.
+  tightenPermissions(layout.dataDir, (message) => log.warn(message))
 
   const config = new ConfigStore({ file: layout.configFile, backup: layout.configBackup })
   const configLoad = config.load(log)
@@ -214,6 +218,45 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     },
   }
 
+  /**
+   * What is on disk under `backups/`, newest first.
+   *
+   * Read on demand rather than cached: the jobs page's restore control must name a
+   * directory that exists *now*, and a cached list would offer one that was pruned
+   * by the auto-backup rotation an hour ago. A directory without a manifest is
+   * listed with `files: 0` instead of being hidden — it is a fact on disk, and
+   * hiding it would make "restore says the backup does not exist" inexplicable.
+   */
+  const backups = {
+    list(): readonly { name: string; createdAt: string; files: number; bytes: number }[] {
+      const out: { name: string; createdAt: string; files: number; bytes: number }[] = []
+      let names: string[]
+      try {
+        names = readdirSync(layout.backupsDir)
+      } catch {
+        return out
+      }
+      for (const name of names) {
+        const dir = join(layout.backupsDir, name)
+        let files = 0
+        let bytes = 0
+        try {
+          if (!statSync(dir).isDirectory()) continue
+          for (const file of readdirSync(dir)) {
+            const info = statSync(join(dir, file))
+            if (!info.isFile()) continue
+            files += 1
+            bytes += info.size
+          }
+        } catch {
+          // A directory being written or removed right now: report it as it stands.
+        }
+        out.push({ name, createdAt: name.startsWith('pre-restore-') ? name.slice(11) : name, files, bytes })
+      }
+      return out.sort((a, b) => b.name.localeCompare(a.name))
+    },
+  }
+
   const info = (): Record<string, unknown> => ({
     server: {
       version: options.version,
@@ -243,6 +286,7 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
       })(),
     },
     legacy: detectLegacy(),
+    backups: backups.list(),
   })
 
   const shutdown = (reason: string): void => {
@@ -275,6 +319,7 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     info,
     controlToken: readControlToken(layout) ?? writeControlToken(layout),
     legacy,
+    backups,
     audit,
     actions: {
       shutdown,
@@ -305,6 +350,13 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     { mode: 0o600, backup: undefined },
   )
   writeFileSync(layout.pidFile, String(process.pid), { encoding: 'utf8', mode: 0o600 })
+  writeInstance(layout.instanceFile, {
+    pid: process.pid,
+    host: options.host,
+    port: actualPort,
+    startedAt,
+    version: options.version,
+  })
 
   log.info(`监听 http://${options.host}:${actualPort}/`)
 
@@ -344,6 +396,10 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
       } catch {
         // Already gone.
       }
+      // Only remove the instance record if it is still ours: a second instance
+      // that deliberately took the lock over must not have it deleted underneath.
+      const instance = readInstance(layout.instanceFile)
+      if (instance === undefined || instance.pid === process.pid) clearInstance(layout.instanceFile)
       log.info('服务已停止')
     })()
     return closing

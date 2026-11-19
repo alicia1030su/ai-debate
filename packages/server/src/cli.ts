@@ -18,6 +18,7 @@ import { join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { request as httpRequest } from 'node:http'
 import { startServer, setAutostart } from './app.ts'
+import { clearInstance, pidAlive, readInstance, type InstanceRecord } from './instance.ts'
 import { layoutOf, resolveDataDir } from './paths.ts'
 import type { LogLevel } from './logger.ts'
 
@@ -74,6 +75,46 @@ function readRunFile(dataDir: string): { pid?: number; host?: string; port?: num
   } catch {
     return undefined
   }
+}
+
+/** The address a human should be told to open, for a given bind address. */
+export function browserHost(host: string): string {
+  return host === '0.0.0.0' || host === '::' || host === '' ? '127.0.0.1' : host
+}
+
+/**
+ * Is another process already serving this data directory?
+ *
+ * Two facts have to agree before a start is refused, because either alone can be
+ * wrong: a pid file left by a crash names a process that no longer exists, and a
+ * port that answers may belong to something else entirely. So the pid must be
+ * alive *and* `/healthz` must answer on the port the record claims.
+ *
+ * A stale record is deleted rather than merely ignored — leaving it would make the
+ * next start pay for the same probe, and the operator would see a "1 instance"
+ * count that does not exist.
+ *
+ * @param dataDir the directory whose instance record to read
+ * @returns the live instance, or undefined when starting is safe
+ */
+export async function liveInstance(dataDir: string): Promise<InstanceRecord | undefined> {
+  const layout = layoutOf(dataDir)
+  const record = readInstance(layout.instanceFile)
+  if (record === undefined) return undefined
+  if (record.pid === process.pid) return undefined
+  if (!pidAlive(record.pid)) {
+    clearInstance(layout.instanceFile)
+    return undefined
+  }
+  const probe = await health(browserHost(record.host), record.port, 1200)
+  if (probe.ok) return record
+  // The process exists but is not serving — it is starting up or shutting down.
+  // Waiting a moment distinguishes "about to be healthy" from "wedged"; if it is
+  // still silent, starting is the better outcome, since refusing would need the
+  // owner to find and kill a pid they cannot see.
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 1500))
+  const second = await health(browserHost(record.host), record.port, 1200)
+  return second.ok ? record : undefined
 }
 
 function readControlToken(dataDir: string): string | undefined {
@@ -371,6 +412,20 @@ async function launch(options: { dataDir: string; portFlag: number; hostFlag: st
 }
 
 async function serveForeground(options: { host: string; port: number; dataDir: string; logLevel: LogLevel }): Promise<void> {
+  const existing = await liveInstance(options.dataDir)
+  if (existing !== undefined) {
+    // Exit code 3 is "already running", not "failed": the launcher and scripts
+    // need to tell those apart, and a user who double-clicks twice should not see
+    // an error.
+    process.stdout.write(
+      `已有实例在运行：http://${browserHost(existing.host)}:${existing.port}/\n` +
+        `数据目录：${options.dataDir}\n` +
+        '同一个数据目录只允许一个实例；要再开一个请看 --data-dir。\n',
+    )
+    process.exitCode = 3
+    return
+  }
+
   const running = await startServer({
     host: options.host,
     port: options.port,
@@ -428,4 +483,28 @@ export function resolveWebDir(): string | undefined {
     if (existsSync(join(candidate, 'index.html'))) return candidate
   }
   return undefined
+}
+
+/**
+ * Whether this module was named on the command line.
+ *
+ * `npm start` runs `node ... packages/server/src/cli.ts serve`, so this file is
+ * both a library (`runCli`, `liveInstance`, `resolveWebDir` for the tests) and an
+ * entry point. Without this guard the entry invocation would authoritatively run
+ * the CLI during an import, and every test that imports a helper would start a
+ * server.
+ *
+ * Only `cli.*` matches, deliberately: `main.ts` imports `runCli` and calls it
+ * itself, so matching `main.*` here would run the CLI twice in one process — the
+ * second copy binding a second listener over the first. The match is on the
+ * executable's own path, so a bundle (`dist/ai-debate.cjs`) is unaffected.
+ */
+const INVOKED_DIRECTLY =
+  typeof process.argv[1] === 'string' && /[\\/]cli\.(?:ts|js|cjs|mjs)$/.test(process.argv[1])
+
+if (INVOKED_DIRECTLY) {
+  runCli(process.argv.slice(2)).catch((error: unknown) => {
+    process.stderr.write(`AI Debate: ${error instanceof Error ? error.message : String(error)}\n`)
+    process.exit(1)
+  })
 }

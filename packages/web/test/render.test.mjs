@@ -317,7 +317,7 @@ test('a 401 from the product API sends the console back to the login form', asyn
   assert.ok(title && title.textContent.includes('登录'), '应显示登录表单')
 })
 
-test('an edit saves with the CSRF header the service requires', async (t) => {
+test('an edit saves as a same-origin JSON request, with no invented auth header', async (t) => {
   const [html, bundle] = await Promise.all([readFile(INDEX_PATH, 'utf8'), readFile(BUNDLE_PATH, 'utf8')])
 
   const dom = new JSDOM(html, {
@@ -338,9 +338,14 @@ test('an edit saves with the CSRF header the service requires', async (t) => {
 
   dom.window.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : String(input && input.url)
-    calls.push({ url, method: (init && init.method) || 'GET', headers: (init && init.headers) || {} })
+    calls.push({
+      url,
+      method: (init && init.method) || 'GET',
+      headers: (init && init.headers) || {},
+      credentials: init && init.credentials,
+    })
     if (url.includes('/auth/state')) {
-      return respond({ initialized: true, authenticated: true, csrf: 'tok-xyz' })
+      return respond({ initialized: true, authenticated: true })
     }
     if (url.includes('/api/ai-debate/settings')) return respond(settings)
     return respond({})
@@ -378,10 +383,36 @@ test('an edit saves with the CSRF header the service requires', async (t) => {
     post.url.endsWith('/api/ai-debate/settings'),
     `保存应打到 /api/ai-debate/settings，实际：${post.url}`,
   )
-  assert.equal(
-    post.headers['x-ai-debate-csrf'],
-    'tok-xyz',
-    `保存请求必须带会话的 CSRF 头，实际 headers：${JSON.stringify(post.headers)}`,
+
+  // The service's actual write protection is SameSite=Strict + Origin/Host +
+  // a required JSON content type. A plain cross-site form cannot produce the
+  // last one, so it is the half this client is responsible for.
+  const headers = post.headers || {}
+  const contentTypeKey = Object.keys(headers).find((key) => key.toLowerCase() === 'content-type')
+  assert.ok(contentTypeKey, `保存请求必须带 content-type，实际 headers：${JSON.stringify(headers)}`)
+  assert.match(
+    String(headers[contentTypeKey]),
+    /^application\/json/i,
+    `content-type 必须是 application/json，实际：${headers[contentTypeKey]}`,
+  )
+
+  // The other two halves come from the request being same-origin: the browser
+  // attaches the `SameSite=Strict` cookie and sets `Origin` itself, and only for
+  // a same-origin target. A relative path is what guarantees that — an absolute
+  // URL to another host would silently be a different (credential-less) request.
+  assert.ok(
+    post.url.startsWith('/'),
+    `保存请求必须是同源相对路径（Origin/凭据由浏览器据此决定），实际：${post.url}`,
+  )
+
+  // And no header the server never reads. A control nobody verifies is worse
+  // than none: it looks like protection while adding nothing, and it is exactly
+  // what would 403 every POST the moment the server started being strict.
+  const csrfLike = Object.keys(headers).filter((key) => /csrf/i.test(key))
+  assert.deepEqual(
+    csrfLike,
+    [],
+    `不应自造服务端不校验的 CSRF 头，实际：${csrfLike.join(', ')}`,
   )
 })
 

@@ -24,7 +24,6 @@ import { build } from 'esbuild'
 import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { writeAssetManifest } from './web-manifest.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
@@ -267,8 +266,11 @@ async function main() {
   await buildLegacyBody()
   await bundleApp()
   await publishTheme()
-  const assets = await writeAssetManifest(STATIC_DIR)
-  console.log(`[build-web] 生成 ${path.relative(ROOT, path.join(STATIC_DIR, 'manifest.json'))}（${assets} 个资源）`)
+  // No `manifest.json` is written here on purpose. The asset inventory is
+  // produced by `scripts/bundle-server.mjs`, which copies this directory into
+  // `dist/web` and then lists exactly what it copied (version + all six files,
+  // including the map). Two producers for one file is how the checked-in
+  // manifest drifted from the packaged one; this build only owns `assets/`.
   console.log('[build-web] 完成')
 }
 

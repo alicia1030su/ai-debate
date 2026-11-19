@@ -49,6 +49,10 @@ export interface HttpDeps {
     scan(): { found: boolean; dir: string; sessions: number; ledger: number; approvals: number; bytes: number }
     import(): { ok: boolean; message: string }
   }
+  /** The backups on disk, newest first — what the restore action may name. */
+  readonly backups: {
+    list(): readonly { name: string; createdAt: string; files: number; bytes: number }[]
+  }
   readonly actions: {
     shutdown(reason: string): void
     restart(reason: string): void
@@ -437,6 +441,24 @@ async function handleOperator(
       case 'rotate-logs': {
         const { job } = deps.queue.enqueue({ type: 'logs.rotate', key: 'manual-rotate' })
         writeJson(response, 200, { ok: true, jobId: job.id })
+        return
+      }
+      case 'restore': {
+        // Restoring is destructive, so it is a queued job rather than an inline
+        // copy: the job takes its own `pre-restore` snapshot first and reports what
+        // it did in its log, which a synchronous request could not do before the
+        // response and could not survive a crash in the middle of.
+        const dir = typeof body.dir === 'string' ? body.dir : ''
+        if (!/^\d{4}-\d{2}-\d{2}T[\w-]+$/.test(dir)) {
+          writeJson(response, 400, { error: '缺少或非法的备份目录名（应为 backups/ 下的时间戳目录）。' })
+          return
+        }
+        const { job } = deps.queue.enqueue({ type: 'backup.restore', key: `restore-${dir}`, payload: { dir } })
+        writeJson(response, 202, { ok: true, jobId: job.id, message: '恢复任务已排队；恢复前的数据会另存为 pre-restore-<时间>。' })
+        return
+      }
+      case 'backups': {
+        writeJson(response, 200, { ok: true, backups: deps.backups.list() })
         return
       }
       case 'storage-check': {

@@ -47,13 +47,22 @@ const assets = copied.map((file) => `web/${path.relative(WEB_OUT, file).split(pa
 await writeFile(path.join(WEB_OUT, 'manifest.json'), `${JSON.stringify({ version: pkg.version, assets }, null, 2)}\n`)
 
 const result = await build({
-  entryPoints: [path.join(ROOT, 'apps', 'desktop', 'src', 'main.ts')],
+  // `main.ts`, not `cli.ts`: the CLI module is a library (it exports `runCli` and
+  // nothing else), so bundling it directly produces an executable that starts,
+  // finds no caller, and exits 0 — which reads as "the binary works" while the
+  // service never listens. `main.ts` is the two-line entry that actually invokes
+  // it, which is the contract SEA needs.
+  entryPoints: [path.join(ROOT, 'packages', 'server', 'src', 'main.ts')],
   outfile: path.join(DIST, 'ai-debate.cjs'),
   bundle: true,
   platform: 'node',
   target: 'node22',
   format: 'cjs',
-  external: ['node:sea'],
+  // Node's built-ins are provided by the runtime, never by the bundle. `node:sea`
+  // is named explicitly because esbuild resolves `node:*` by pattern but the SEA
+  // module is also imported dynamically, and an accidental inline copy of it would
+  // fail at exactly the moment the packaged binary reads its assets.
+  external: ['node:*', 'node:sea'],
   sourcemap: false,
   minify: false,
   legalComments: 'none',

@@ -10,6 +10,7 @@
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { mkdirSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 
 export interface Layout {
   readonly dataDir: string
@@ -28,6 +29,15 @@ export interface Layout {
   readonly runDir: string
   readonly pidFile: string
   readonly runFile: string
+  /**
+   * The single-instance record.
+   *
+   * Separate from `run/server.json` because the two answer different questions:
+   * the run file is "where is the service I started", which a client reads; this
+   * one is "may I start at all", which is only consulted before binding. Keeping
+   * one file for both would mean a status read could be confused with a lock.
+   */
+  readonly instanceFile: string
   readonly controlFile: string
 }
 
@@ -76,6 +86,7 @@ export function layoutOf(dataDir: string): Layout {
     runDir: join(dir, 'run'),
     pidFile: join(dir, 'run', 'server.pid'),
     runFile: join(dir, 'run', 'server.json'),
+    instanceFile: join(dir, 'run', 'instance.lock'),
     controlFile: join(dir, 'run', 'control.json'),
   }
 }
@@ -84,5 +95,38 @@ export function layoutOf(dataDir: string): Layout {
 export function ensureLayout(layout: Layout): void {
   for (const dir of [layout.dataDir, layout.backupsDir, layout.logsDir, layout.runDir]) {
     mkdirSync(dir, { recursive: true })
+  }
+}
+
+/**
+ * Best-effort restriction of the data directory to its owner.
+ *
+ * The directory holds a credential key next to its ciphertext, an administrator
+ * password hash and a publish ledger, so "another local account can read it" is a
+ * real loss. On Windows the mechanism is an ACL: drop inherited entries and grant
+ * the current user full control, which leaves other accounts and `Everyone` out.
+ *
+ * Failure is a warning, never a refusal. `icacls` is absent from some stripped
+ * Windows images, a directory on a FAT volume has no ACLs at all, and a container
+ * may run as an account the tool cannot name — in all three cases the product still
+ * works and the honest response is to say so, not to refuse to start.
+ *
+ * @param dir the data directory to tighten
+ * @param warn where to report a failure; defaults to the process stderr
+ */
+export function tightenPermissions(dir: string, warn: (message: string) => void = () => undefined): void {
+  if (process.platform !== 'win32') return
+  const user = process.env.USERNAME
+  if (typeof user !== 'string' || user.trim() === '') return
+  try {
+    const result = spawnSync('icacls', [dir, '/inheritance:r', '/grant:r', `${user.trim()}:(OI)(CI)F`], {
+      stdio: 'ignore',
+      timeout: 5000,
+    })
+    if (result.status !== 0) {
+      warn(`无法收紧数据目录的访问权限（icacls 退出码 ${String(result.status)}）。文件仍可正常使用。`)
+    }
+  } catch (error) {
+    warn(`无法收紧数据目录的访问权限：${error instanceof Error ? error.message : String(error)}`)
   }
 }

@@ -42,7 +42,7 @@
 
 ---
 
-## ADR-002 前端用「切片 + 5 条改写」，保留整段 `apply()`，而不是重写成 React
+## ADR-002 前端用「切片 + 7 条改写」，保留整段 `apply()`，而不是重写成 React
 
 **Status**：Accepted（已落地；取代最初「12 条规则 + 删 apply」的方案，见 Superseded ADR-002-old 说明）
 
@@ -57,7 +57,7 @@
 `scripts/build-web.mjs`：
 
 1. 用**字符串偏移**（`indexOf` / `lastIndexOf`）切出 `factory: (require) => { … return module.exports }` 之间的整段，不用正则（300 KB 模板字符串会吃错区域）。
-2. 只做 5 条改写，每条带 `expected` 次数断言（命中数不符 → 整次构建失败，不写文件）。
+2. 只做 7 条改写，每条带 `expected` 次数断言（命中数不符 → 整次构建失败，不写文件）。7 条分别是：快照库 `require`、API 前缀、两个凭据 ref 字面量、`card.css` 标识（2 处）、`dataset.plugin`、console 前缀（2 处）。
 3. 用 `new Function('exports','require','module','__filename','__dirname', code)` 做**语法校验**：截断/改错在建包时就失败，而不是浏览器白屏。
 4. 生成的 `src/legacy-body.cjs` **保留 `apply()` 原封不动**；外壳提供 `createHostContext()`（真执行 `effect`、`inject` 立即回调、`register` 返回 callable），让 `apply()` 跑完并注入样式。
 
@@ -202,7 +202,7 @@
 
 - 三层防护**确实生效**：`crossSiteReason` 拦 `sec-fetch-site: cross-site` 与 `Origin≠Host`；写请求无 `application/json` 被 415 拒。
 - **但发现一处不一致（G13）**：`packages/web/src/entry.cjs` 里带着 `x-ai-debate-csrf` 头与 `csrfToken` 逻辑，而 `/auth/state` 从不返回 `csrf`（实测响应只有 `initialized/authenticated/version`），`packages/server/src` 里也**没有任何** `csrf` 校验代码 —— 这个头永远不会被发出，也不会被检查。它不是漏洞（三层已覆盖），但会让读代码的人误以为存在 token 校验。
-- **决定**：v0.1.0 按「删除前端 token 机制 + 在 `security.md` 写明三层覆盖」处理（`task-plan.md` WP8.6）。
+- **已处理**：前端 token 机制已删除（`grep -c csrf packages/web/src/entry.cjs` = 0），`security.md` §2 与实现一致。会话守卫（401/403 → 回登录页）保留。
 
 **Alternatives**
 
@@ -294,11 +294,12 @@
 - **不内置 TLS 终止**；远程必须走反代，且反代必须原样转发 `Host`/`Origin`（否则同源校验会拒，这是设计意图）。
 - 非回环监听时，首启必须出示一次性 token（ADR-006）。
 
-**As-built 复核（实测，2026-11-19）—— 这条决策只落地了一半**
+**As-built 复核（实测，2026-11-19）—— 曾只落地一半，已补齐**
 
-- 核心侧已具备注入点（`trustedHosts`），但 `standalone-host.ts` **没有提供 `appServer` 服务**，所以核心 `appServerOf(ctx)` 拿不到 `trustedHosts`，回落到 `DEFAULT_TRUSTED_HOSTS`（仅 4 个 loopback 名）。
-- 实测：`dist/ai-debate.cjs serve --host 0.0.0.0` 下，用原生 `http` 构造 `Host: 192.168.1.20:<port>` 或 `Host: debate.example.com` 请求 `/api/ai-debate/settings` → **403 `forbidden: origin`**；同路径 `Host: 127.0.0.1:<port>` → 401（说明围栏确实只放行 loopback 名）。
-- 结论：`security.md` §6 与 `install-linux.md` 的远程/反代路径**当前不可用**（页面能开、登录能成，但进设置页 403）。这是 **G11**，阻断级；修法见 `task-plan.md` WP8.2（注入 `appServer.trustedHosts` + `info()`，并新增 `AI_DEBATE_TRUSTED_HOSTS` 显式追加）。
+- 首次复核发现：核心侧有注入点，但 `standalone-host.ts` 没提供 `appServer`，`trustedHosts` 因此回落到「仅 loopback 名」，`--host 0.0.0.0` 下 `Host: 192.168.1.20` / `debate.example.com` 请求 `/settings` 全部 **403**。
+- **已修复**：适配器现在提供 `appServer: { trustedHosts, info() }`；`trustedHostsFor(host, env)` 从**绑定地址**推导（`0.0.0.0` 不推导任何具体网卡名）+ `AI_DEBATE_TRUSTED_HOSTS`（逗号分隔）显式追加；`info()` 补齐设置页的进程事实块。
+- 复验（`dist/ai-debate.cjs serve --host 0.0.0.0`）：env 列出 `192.168.1.20,debate.example.com` → 两者 `/settings` 均 **401**（放行，只缺会话）；未列出的 `evil.example.com` → **403**；**不设 env 时 LAN Host 仍 403**（fail-closed 保持）。
+- 残留：`secureCookies` 仍硬编码 `false`（无内置 TLS 时正确），TLS 分支保留待反代场景启用。
 
 **Consequences**
 
@@ -485,8 +486,10 @@ SEA 要求零原生 addon；供应链攻击在本类产品上是现实风险（�
 
 **Decision**
 
-- 根 `npm test` 改为**串行跑四条**（`test:core`、`test:server`、`test:web`、`acceptance`），任一非零即整体非零。
-- 凭据扫器的**正确修法是改夹具**，不是给扫描器开洞：把假值改成运行时拼接（`'sk-' + 'super-secret-value-123456'`），让单行不满足正则；**不在 `scan-secrets.mjs` 里加「测试目录跳过」**，否则真实凭据一旦被提交进测试文件就再也拦不住。
+- 根 `npm test` 改为**串行跑四条**（`test:core`、`test:server`、`test:web`、`acceptance`），任一非零即整体非零。（已落地，实测 113+20+6+25 全绿。）
+- 凭据扫描：**最终采用的修法是文件级 `ALLOW` 白名单**（`scripts/scan-secrets.mjs`、`test/acceptance/fixtures/README.md`、`packages/server/test/runtime.test.ts`），而不是我建议的「夹具改运行时拼接」。
+  - 这样做的**代价**：这三个文件从此不再被扫描 —— 往里写一个真凭据不会被发现。它是「文件级」而非「目录级」，影响面比「跳过所有 `test/`」小得多，但仍是豁免。
+  - **保留意见**：如果后续有人往这三个文件加真实值，扫描器不会拦。建议在 `runtime.test.ts` 顶部加一行注释重申「本文件内的凭据形态必须是假值」，并在 code review 时人工看一眼这三处 diff。
 
 **Consequences**
 
@@ -507,7 +510,7 @@ SEA 要求零原生 addon；供应链攻击在本类产品上是现实风险（�
 
 | 原编号 | 被替换的方案 | 现在的方案 | 原因 |
 |--------|--------------|------------|------|
-| 002-old | 「12 条转换规则，删 `apply()` 与 `exports`」 | ADR-002（切片 + 5 条改写 + 宿主 shim） | 不删代码就没机会删错；`apply()` 的唯一必要行为（注入样式）保留下来，画布行数可 diff |
+| 002-old | 「12 条转换规则，删 `apply()` 与 `exports`」 | ADR-002（切片 + 7 条改写 + 宿主 shim） | 不删代码就没机会删错；`apply()` 的唯一必要行为（注入样式）保留下来，画布行数可 diff |
 | 004-old | 「新建 `config-schema.ts` 字段元数据」 | ADR-004（`schema.ts` 构建器 + 活对象） | 元数据表会与 `DEFAULT_CONFIG`/`EDITABLE_FIELDS` 三方漂移；构建器让原调用点零改动 |
 | 005-old | 「`secrets.json` 单块密文」 | ADR-005（每 ref 一条密封记录） | 单条损坏不连坐；改一条不重写整块；AAD 使搬移失效 |
 | 006-old | 「会话绑定 CSRF 自定义头」 | ADR-006（Strict + 同源 + 强制 JSON） | 加头要改生成页面（违反 ADR-002）；三层已有覆盖 |
@@ -522,14 +525,14 @@ SEA 要求零原生 addon；供应链攻击在本类产品上是现实风险（�
 | ADR | 主题 | 状态 | 关联实现 | 相关缺口 |
 |-----|------|------|----------|----------|
 | 001 | 复用 `apply()` + 适配器 | Accepted | `server/src/standalone-host.ts` | — |
-| 002 | 前端切片 + 5 条改写 | Accepted | `scripts/build-web.mjs`、`web/src/legacy-body.cjs` | — |
+| 002 | 前端切片 + 7 条改写 | Accepted | `scripts/build-web.mjs`、`web/src/legacy-body.cjs` | — |
 | 003 | SEA 打包 | Accepted-with-risk | `packaging/*/build.mjs` | **G2**（`bundle-server.mjs` 缺失） |
 | 004 | 零依赖 schema + 活配置对象 | Accepted | `core/src/schema.ts`、`server/src/config-store.ts` | — |
 | 005 | AES-256-GCM + 每 ref 密封 | Accepted-with-risk | `server/src/credential-store.ts` | — |
-| 006 | 单管理员 + scrypt + Strict/同源/JSON | Accepted | `server/src/auth.ts`、`server/src/http.ts` | **G13**（前端 CSRF 头是死代码） |
-| 007 | 家务队列 + 发表不进队列 | Accepted | `server/src/jobs.ts` | **G7**（缺测试） |
+| 006 | 单管理员 + scrypt + Strict/同源/JSON | Accepted | `server/src/auth.ts`、`server/src/http.ts` | 已修（G13：前端 token 死代码已删） |
+| 007 | 家务队列 + 发表不进队列 | Accepted | `server/src/jobs.ts` | 已有测试（`runtime.test.ts` 覆盖去重/退避/崩溃恢复/拒收发表类） |
 | 008 | 平台默认目录 + 旧数据只探测 | Accepted | `core/src/store-dir.ts`、`server/src/paths.ts` | **G1**（导入未实现） |
-| 009 | 默认 loopback + 可信主机可注入 | Accepted | `core/src/settings-routes.ts`、`core/src/host.ts` | **G11**（`appServer` 未注入 → 远程 403） |
+| 009 | 默认 loopback + 可信主机可注入 | Accepted | `core/src/settings-routes.ts`、`core/src/host.ts`、`server/src/app.ts` 的 `trustedHostsFor()` | 已修（G11 已复验） |
 | 010 | 备份目录 + manifest，不含身份 | Accepted | `server/src/app.ts`（job handlers） | — |
 | 011 | 零运行时依赖 | Accepted | 全部 | — |
 | 012 | 命名空间一次性切换 | Accepted | `core/src/secrets.ts`、`settings-routes.ts` | **G3**（tools.ts 残留） |
@@ -537,4 +540,4 @@ SEA 要求零原生 addon；供应链攻击在本类产品上是现实风险（�
 | 014 | 快照库本地化 | Accepted | `web/src/snapshot-store.cjs` | — |
 | 015 | version + 原子写 + 损坏隔离 | Accepted | `server/src/atomic.ts` | — |
 | 016 | v0.1.0 范围冻结 | Accepted | — | — |
-| 017 | 测试与扫描必须诚实 | Accepted | `package.json` scripts、`scripts/scan-secrets.mjs`、测试夹具 | **G10**、**G12** |
+| 017 | 测试与扫描必须诚实 | Accepted | `package.json` scripts、`scripts/scan-secrets.mjs`、测试夹具 | 已修（G10 用文件级 ALLOW，G12 改为串行四条） |

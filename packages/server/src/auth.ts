@@ -23,6 +23,9 @@ const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64, saltBytes: 16 }
 const SESSION_IDLE_MS = 12 * 60 * 60 * 1000
 const SESSION_ABSOLUTE_MS = 7 * 24 * 60 * 60 * 1000
 const MAX_SESSIONS = 8
+
+/** How long the non-loopback first-run token is usable. */
+const SETUP_TOKEN_TTL_MS = 10 * 60 * 1000
 const LOGIN_WINDOW_MS = 15 * 60 * 1000
 const LOGIN_MAX_PER_IP = 8
 const LOGIN_MAX_PER_USER = 8
@@ -92,6 +95,16 @@ export class AuthService {
   #attempts = new Map<string, { count: number; resetAt: number }>()
   /** One-time token printed at boot for non-loopback first runs. */
   #setupToken: string | undefined
+  /**
+   * When the setup token stops working.
+   *
+   * The log line says "10 分钟内有效", and a message that promises a limit the code
+   * does not enforce is worse than no message: the operator would leave a first-run
+   * token in a log file for a week believing it had expired. A remote deployment's
+   * first-run window is the single most consequential minute of the product's life,
+   * so the bound is real and it is checked here.
+   */
+  #setupTokenExpiresAt = 0
   readonly #allowLoopbackSetup: boolean
 
   constructor(options: {
@@ -122,8 +135,10 @@ export class AuthService {
     if (this.#admin === undefined) {
       if (!this.#allowLoopbackSetup) {
         this.#setupToken = randomBytes(16).toString('hex')
+        this.#setupTokenExpiresAt = Date.now() + SETUP_TOKEN_TTL_MS
         this.#log.warn(
-          `首次初始化需要一次性令牌（监听地址不是回环）：${this.#setupToken} —— 在初始化页面填入。10 分钟内有效。`,
+          `首次初始化需要一次性令牌（监听地址不是回环）：${this.#setupToken} —— 在初始化页面填入。` +
+            `${Math.round(SETUP_TOKEN_TTL_MS / 60_000)} 分钟内有效；过期后可重启服务重新生成。`,
         )
       }
       return { initialized: false }
@@ -143,7 +158,16 @@ export class AuthService {
   setupAllowed(remoteAddress: string | undefined, token: string | undefined): { ok: true } | { ok: false; reason: string } {
     if (this.#admin !== undefined) return { ok: false, reason: '已经初始化过了。' }
     if (isLoopback(remoteAddress)) return { ok: true }
-    if (this.#setupToken !== undefined && typeof token === 'string' && token === this.#setupToken) return { ok: true }
+    if (this.#setupToken !== undefined && Date.now() <= this.#setupTokenExpiresAt) {
+      if (typeof token === 'string' && token === this.#setupToken) return { ok: true }
+      return { ok: false, reason: '远程初始化需要服务启动时打印的一次性令牌。请查看服务日志，或在本机完成初始化。' }
+    }
+    if (this.#setupToken !== undefined) {
+      return {
+        ok: false,
+        reason: '一次性令牌已过期。重启服务会打印新的令牌，或直接在本机完成初始化（回环访问不需要令牌）。',
+      }
+    }
     return { ok: false, reason: '远程初始化需要服务启动时打印的一次性令牌。请查看服务日志，或在本机完成初始化。' }
   }
 
