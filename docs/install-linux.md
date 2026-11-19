@@ -26,12 +26,14 @@ sudo ./install.sh
 
 ```bash
 sudo ./install.sh --port 18080              # 换端口
-sudo ./install.sh --host 0.0.0.0            # 允许远程（先读 docs/security.md）
+sudo ./install.sh --host 0.0.0.0            # 监听所有网卡（还要在 env 里写 AI_DEBATE_TRUSTED_HOSTS，见 §5）
 sudo ./install.sh --data-dir /srv/ai-debate # 换数据目录
 sudo ./install.sh --no-start                # 只安装不启动
 ```
 
 默认监听 `127.0.0.1:17860`。
+
+改成 `0.0.0.0` 只是「监听所有网卡」，并**不会**自动信任某个域名或 IP：请求的 `Host` 必须出现在 `AI_DEBATE_TRUSTED_HOSTS` 里，否则配置接口返回 403。这是故意的——一个「谁声称自己是谁就信谁」的校验等于没有校验。
 
 ## 3. 首次配置
 
@@ -71,6 +73,8 @@ AI_DEBATE_HOST=127.0.0.1
 AI_DEBATE_PORT=17860
 AI_DEBATE_HOME=/var/lib/ai-debate
 AI_DEBATE_LOG_LEVEL=info
+# 远程/反代时列出浏览器实际访问的域名或 IP，逗号分隔；不填就只信任回环
+AI_DEBATE_TRUSTED_HOSTS=debate.example.com
 ```
 
 改完 `sudo systemctl restart ai-debate`。

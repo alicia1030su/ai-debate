@@ -1,7 +1,7 @@
 # AI Debate 任务计划（as-built + 剩余工作）
 
 > 版本口径：v0.1.0 的交付已在仓库里；v0.1.1 是发布后的质量修复（单实例、`npm start` 入口、删 CSRF 死代码、清单单一来源）。本文件按**最新工作树**描述状态。
-> 配套：[`architecture.md`](./architecture.md)（§13.3 的「仍然开着」2 项是本文件的输入）、[`decisions.md`](./decisions.md)、[`differences.md`](./differences.md)
+> 配套：[`architecture.md`](./architecture.md)（§13.3 的「仍然开着」清单与 §0.1 的既定输入是本文件的输入）、[`decisions.md`](./decisions.md)、[`differences.md`](./differences.md)
 > 本文件回答两个问题：**已经做完了什么**（便于验收对照）、**还差什么、按什么顺序做**。
 > 标记：`[done]` 已落地并自测过 ｜ `[blocked]` 阻断发布 ｜ `[release]` 发布前必须 ｜ `[quality]` 可信度项
 
@@ -48,7 +48,7 @@
 
 ---
 
-## 第二部分：剩余工作（只剩 2 项）
+## 第二部分：剩余工作（4 个开发步骤 + 验收）
 
 > 实测基线（本机 Node 22.22.2）：`typecheck` ✅｜`build` ✅｜`bundle` ✅（`dist/ai-debate.cjs` ~1127 KB + `dist/web` 6 资源）｜`package:windows` ✅（89.5 MB，`--version` → `AI Debate 0.1.0 (win32-x64)`）｜`npm test` ✅（core **113** + server **20** + web **6** + acceptance **25/25**）｜`scan-secrets` ✅｜`assert-no-dsh` ✅（108 源文件 / 4 清单 / 91 线路）｜`npm start` → `/healthz` **200** ✅。
 > 已修并复验：G3、G4、G6、G9、G9-residual、G10、G11、G12、G13、G14、G15、G17。
@@ -82,7 +82,18 @@
 | 验收 | 新测试红→绿：先故意把 publish 塞进队列能跑通（证明测试有效），再断言它不能 |
 | 依赖 | 无 |
 
-### WP8.4 `[release]` 双平台真机验收（收口）
+### WP8.4 `[blocked]` 让 `npm test` 在干净克隆里能跑（测试依赖 `lib` 的隐性前置）
+
+| 项 | 内容 |
+|----|------|
+| 现象 | 在 `git archive HEAD` 出来的干净树里跑 `npm test`（或单跑 `test:core`）→ 首条测试就 `ERR_MODULE_NOT_FOUND: packages/core/lib/analyzer.js`。因为 `lib/` 被 `.gitignore`，而 8 个 core 测试文件都 import `../lib/*.js` |
+| 为什么不能改 import | 实测：把测试改成 `import '../src/config.ts'` 后 → `ERR_MODULE_NOT_FOUND: src/schema.js imported from src/config.ts`。核心源码是 NodeNext 风格（`import './schema.js'`），`--experimental-transform-types` **只剥类型、不改说明符**。要改就得把 88 个文件的相对 import 全改成 `.ts`，代价远大于收益，且与 tsc 产物不一致 |
+| 做法（推荐） | 加 `pretest` 钩子：`"pretest": "node scripts/build-core.mjs"`。这样 `npm test` 前自动构建；子命令（`test:core` 等）保持原样，并在 README 写明「单独跑某一套前先 build」 |
+| 备选 | 在 `test:core` 脚本里前置 build：`"test:core": "node scripts/build-core.mjs && node --experimental-transform-types --test ..."`。缺点：CI 会重复构建一次（可接受） |
+| 验收 | ① 删掉 `packages/core/lib` 后 `npm test` 仍全绿（pretest 自动构建）；② 干净树（`git archive HEAD`）里 `npm install && npm test` 全绿；③ 总时长增加 ≤3s |
+| 依赖 | 无 |
+
+### WP8.5 `[release]` 双平台真机验收（收口）
 
 | # | 检查 | 通过标准 |
 |---|------|----------|
@@ -109,12 +120,13 @@
 
 ```mermaid
 graph TD
-  WP81[WP8.1 静态产物与 gitignore] --> WP84[WP8.4 双平台验收]
-  WP82[WP8.2 补 known-issues] --> WP84
-  WP83[WP8.3 队列反例测试] --> WP84
+  WP81[WP8.1 静态产物与 gitignore] --> WP85[WP8.5 双平台验收]
+  WP82[WP8.2 补 known-issues] --> WP85
+  WP83[WP8.3 队列反例测试] --> WP85
+  WP84[WP8.4 npm test 的 lib 前置] --> WP85
 ```
 
-**关键路径**：`WP8.1 / WP8.2 / WP8.3 → WP8.4`。前三步互相独立，可并行。
+**关键路径**：`WP8.1 / WP8.2 / WP8.3 / WP8.4 → WP8.5`。四步互相独立，可并行。
 
 ## 第四部分：提交约定
 

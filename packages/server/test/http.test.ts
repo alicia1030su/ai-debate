@@ -99,6 +99,29 @@ test('前端门禁：健康检查免认证，业务接口需会话，跨站写�
     const jobs = await fetch(`${base}/api/ai-debate/jobs`, { headers: { cookie } })
     assert.equal(jobs.status, 200)
 
+    // The queue switch is authenticated like every other operator route. It used
+    // to be unreachable: the route existed but the prefix fence did not include it,
+    // so pausing answered 404 — a control that silently does nothing is worse than
+    // no control, because the operator believes background work stopped.
+    const pause = await fetch(`${base}/api/ai-debate/queue`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base, cookie },
+      body: JSON.stringify({ action: 'pause' }),
+    })
+    assert.equal(pause.status, 200)
+    assert.equal(((await pause.json()) as { paused?: boolean }).paused, true)
+    const pausedView = (await (await fetch(`${base}/api/ai-debate/jobs`, { headers: { cookie } })).json()) as {
+      paused?: boolean
+    }
+    assert.equal(pausedView.paused, true)
+    const resume = await fetch(`${base}/api/ai-debate/queue`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base, cookie },
+      body: JSON.stringify({ action: 'resume' }),
+    })
+    assert.equal(resume.status, 200)
+    assert.equal(((await resume.json()) as { paused?: boolean }).paused, false)
+
     // 5. Cross-site writes are refused even with a valid cookie. `SameSite=Strict`
     //    already blocks the browser from sending one, so this is the second lock —
     //    it must hold on its own for the case where a fork relaxes the cookie.
