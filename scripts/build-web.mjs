@@ -109,6 +109,85 @@ const BODY_REWRITES = [
     expected: 2,
     label: 'console prefix',
   },
+  {
+    // The status panel's version row used to name the host. Here the host *is*
+    // this service, so the label says what the value actually is.
+    needle: "dshVersion: 'DSH 版本'",
+    replacement: "dshVersion: '服务版本'",
+    expected: 1,
+    label: 'status label (zh)',
+  },
+  {
+    needle: "dshVersion: 'DSH version'",
+    replacement: "dshVersion: 'Service version'",
+    expected: 1,
+    label: 'status label (en)',
+  },
+  {
+    // "Host model" does not exist in a standalone deployment. Relabelling rather
+    // than removing keeps the field, its switch and its probe button intact — the
+    // page simply reports that this build has no host model, which is the truth.
+    needle: "hostLlmTitle: '宿主模型服务'",
+    replacement: "hostLlmTitle: '宿主模型（本构建不提供）'",
+    expected: 1,
+    label: 'host model title (zh)',
+  },
+  {
+    needle: "hostLlmTitle: 'Host model service'",
+    replacement: "hostLlmTitle: 'Host model (not available in this build)'",
+    expected: 1,
+    label: 'host model title (en)',
+  },
+  {
+    needle: "hostLlmNone: '宿主没有提供模型服务（旧版 DSH 或未启用）。不影响「自己配置」那条路。'",
+    replacement: "hostLlmNone: '独立版没有宿主模型服务。请用下方「自己配置」填写 OpenAI 兼容接口。'",
+    expected: 1,
+    label: 'host model hint (zh)',
+  },
+  {
+    needle: 'hostLlmNone: \'The host exposes no model service (older DSH or disabled). This does not affect the "own endpoint" path.\'',
+    replacement: "hostLlmNone: 'The standalone build has no host model. Use \"Own endpoint\" below with any OpenAI-compatible API.'",
+    expected: 1,
+    label: 'host model hint (en)',
+  },
+  {
+    // The auto/own/host switch keeps all three options (removing one would
+    // change the layout the acceptance compares), but the "auto" description
+    // must stop promising a host model that is not there.
+    needle: "llmSourceHint: '自动：自己配了接口就用它，没配就用宿主已配置的模型。宿主模型由 DSH 调用，插件不读取也不保存任何密钥。'",
+    replacement: "llmSourceHint: '自动：使用下方配置的 OpenAI 兼容接口。独立版不读取也不保存除本机凭据存储之外的任何密钥。'",
+    expected: 1,
+    label: 'model source hint (zh)',
+  },
+  {
+    needle: "llmSourceHint: 'Auto: use your own endpoint when configured, otherwise the model DSH already has. Host models are called by DSH; this plugin never reads or stores a key.'",
+    replacement: "llmSourceHint: 'Auto: use the OpenAI-compatible endpoint configured below. This build stores keys only in the local credential store.'",
+    expected: 1,
+    label: 'model source hint (en)',
+  },
+  {
+    // The directory note explained DSH profiles. The standalone equivalent is
+    // "this service owns this directory", which is what the sentence now says.
+    needle: "storePathNote: '会话存在这个目录里。换一个 DSH profile 时，这里可能指向别处 —— 历史会话没有消失，只是这个 profile 指向另一个目录。插件不会去扫描其他 profile 的会话。'",
+    replacement: "storePathNote: '会话存在这个目录里。用 --data-dir 或 AI_DEBATE_HOME 指向别的目录时，这里会跟着变；本实例不会去扫描其它目录里的会话。'",
+    expected: 1,
+    label: 'store dir note (zh)',
+  },
+  {
+    needle: "storePathNote: 'Sessions live in this directory. A different DSH profile may point somewhere else — your history is not gone, this profile just looks elsewhere. The plugin never scans other profiles.'",
+    replacement: "storePathNote: 'Sessions live in this directory. Pointing --data-dir or AI_DEBATE_HOME elsewhere moves it; this instance never scans another data directory.'",
+    expected: 1,
+    label: 'store dir note (en)',
+  },
+  {
+    // The source line appended the host's own environment variable when it had
+    // one. The standalone service reports `appHome` instead, so this prints the
+    // directory it actually resolved rather than a variable that does not exist.
+    needle: "`${status.storeDirSource || '—'}${status.dshHome ? `（DSH_HOME=${status.dshHome}）` : ''}`",
+    replacement: "`${status.storeDirSource || '—'}${status.appHome ? `（${status.appHome}）` : ''}`",
+    expected: 1,
+    label: 'store dir source detail',
+  },
 ]
 
 /**
