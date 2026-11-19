@@ -935,7 +935,7 @@ graph LR
 | G4 | 无强制单实例锁 | **已修**：`paths.instanceFile = run/instance.lock`；`app.ts` `writeInstance()`/`clearInstance()`；`cli.ts` `liveInstance()`（pid 存活 + `/healthz` 可达 + 1.5s 二次确认，避免把「正在启动」判成「已挂」） | 同一 dataDir 起第二个 `serve`（换端口）→ **exit 3**，打印「已有实例在运行」（实测） |
 | G13 | 页面的 CSRF 头是死代码 | **已修**：`grep -c csrf packages/web/src/entry.cjs` = **0**，服务端也为空 —— 前端不再发没人校验的头，注释与实现一致 | 登录 → 改配置 → 存凭据 → 建备份任务全部正常（会话守卫保留，只删 token 注入） |
 | G15 | `static/manifest.json` 过期且被跟踪 | **已修**：该文件已删除（`git status` 显示 `D`）；manifest 只剩 `dist/web/manifest.json`（6 项 + `version`） | `npm run build && npm run bundle` 后 `dist/web/manifest.json` 是唯一一份 |
-| G9-residual | `npm start` 空转（`runCli` 无模块级调用） | **已修**：既有独立的 `packages/server/src/main.ts`（`runCli(process.argv.slice(2))`），`cli.ts` 也加了 `INVOKED_DIRECTLY` 守卫（`process.argv[1]` 匹配 `cli.(ts|js|cjs|mjs)` 时自执行，被 import 时不执行） | `AI_DEBATE_HOME=<tmp> npm start` → `/healthz` **200**，日志「9 个工具、7 条路由」（实测） |
+| G9-residual | `npm start` 空转（`runCli` 无模块级调用） | **已修**：既有独立的 `packages/server/src/main.ts`（`runCli(process.argv.slice(2))`），`cli.ts` 也加了 `INVOKED_DIRECTLY` 守卫（`process.argv[1]` 匹配 cli 的 ts/js/cjs/mjs 后缀时自执行，被 import 时不执行） | `AI_DEBATE_HOME=<tmp> npm start` → `/healthz` **200**，日志「9 个工具、7 条路由」（实测） |
 | G17 | `differences.md` 测试数字略旧 | **已修**：现为「核心 113 + 服务端 20 + 前端 6 + 端到端 25 项」 | `grep -n "核心" docs/differences.md` 与实际测试数一致 |
 
 #### 仍然开着的（发布前判断）

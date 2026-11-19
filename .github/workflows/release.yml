@@ -124,7 +124,7 @@ jobs:
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "AI Debate $TAG" \
-            --notes-file docs/release-notes-v0.1.0.md \
+            --notes-file "docs/release-notes-${TAG}.md" \
             release/AI-Debate-windows-x64.exe \
             release/ai-debate-linux-x64.tgz \
             release/SHA256SUMS.txt

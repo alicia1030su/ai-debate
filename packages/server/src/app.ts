@@ -274,16 +274,20 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     },
     engine: { tools: host.tools.length, routes: registry.paths() },
     store: {
-      configBytes: config.sizeBytes(),
-      credentialsBytes: credentials.sizeBytes(),
-      queueBytes: queue.sizeBytes(),
-      stateBytes: (() => {
+      // `path`/`sizeBytes` are the two facts a "is my data where I think it is"
+      // check needs, and they are answered by the engine's own directory rather
+      // than by this process's guess about it.
+      path: join(layout.dataDir, 'state.json'),
+      sizeBytes: (() => {
         try {
           return statSync(join(layout.dataDir, 'state.json')).size
         } catch {
           return 0
         }
       })(),
+      configBytes: config.sizeBytes(),
+      credentialsBytes: credentials.sizeBytes(),
+      queueBytes: queue.sizeBytes(),
     },
     legacy: detectLegacy(),
     backups: backups.list(),
