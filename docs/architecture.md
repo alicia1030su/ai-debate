@@ -1,6 +1,6 @@
 # AI Debate v0.1.0 系统架构设计（as-built）
 
-> 状态：**v1.1，按已落地的实现校准**（工作区 `ai-debate`）
+> 状态：**v1.1，按已落地的实现校准**（工作区 `ai-debate`；产品版本 v0.1.0 发布后进入 v0.1.1 质量修复，本文按最新工作树校准）
 > 作者：架构师 高见远
 > 读者：实现工程师、验收人、后续维护者
 > 相关：[`task-plan.md`](./task-plan.md)（实现顺序与验收）、[`decisions.md`](./decisions.md)（ADR）、[`security.md`](./security.md)（对外威胁模型）、[`migration.md`](./migration.md)（旧数据迁移）
@@ -339,6 +339,11 @@ classDiagram
 | `appServer` | `{ trustedHosts, info() }`（`trustedHostsFor(host, env)` 推导 + `AI_DEBATE_TRUSTED_HOSTS` 追加） | `trustedHosts` 注入信任围栏；`serverInfo()` 供状态面板显示进程事实 |
 | `llm` | **永远 `undefined`** | `hostLlmOf` → 模型来源回落到自配 OpenAI 兼容客户端 |
 
+**`SettingsRouteDeps` 的注入面（已确认可原样复用，不改 `makeSettingsRoutes` 的 7 条路由逻辑）**：
+`authorize(req) → 'ok' | 401 | 403`、`config()`、`credentials()`、`overlay()`、`refreshSecrets()`、`settings()`（`writable` / `update(namespace, patch)` / `mutate(namespace, ops)`）、`namespace()`、`testModel()`、`probeHostLlm()`、`probeEgress()`、`describePlatforms()`、`describeSecurity()`、`pendingApprovals()`、`approve`、`manualImport`、`runVerification`、`workbench`、`editCandidate`、`analyzeThread`、`generateCandidates`、`publishApproved`、`diagnostics()`、`trustedHosts`、`serverInfo`。
+
+其中 `isTrustedRequest` **已改为按注入的 `trustedHosts` 判定**（不再写死 loopback）：绑定 `0.0.0.0` 时若不注入实际监听地址，用户自己也会被 403 —— 这就是 G11 的成因，修复见 §13.3。
+
 `ctx` 的 5 个成员：
 
 ```ts
@@ -627,7 +632,7 @@ startServer(options)
 |------|------|------|------|
 | GET | `/healthz` | 无 | `{ok, version, uptimeSec}`；launcher/systemd 探活 |
 | GET | `/auth/state` | 无 | `{initialized, authenticated, username?, version}`（不泄漏其它） |
-| POST | `/auth/setup` | 未初始化 + loopback 或一次性 token | `{username, password, token?}` → 200 + Set-Cookie；已初始化 → 409 |
+| POST | `/auth/setup` | 未初始化 + （loopback 或一次性 token）+ 同源 + `application/json` | `{username, password, token?}` → 200 + Set-Cookie；已初始化 → 409；**不校验自定义头** |
 | POST | `/auth/login` | 无 | `{username, password}` → 200 + Set-Cookie；401 / 429(+Retry-After) |
 | POST | `/auth/logout` | 无（凭 cookie） | 撤销当前会话 + 清 cookie |
 | POST | `/auth/password` | 会话 | `{current, next}` → 200；**撤销所有会话**，要求重新登录 |
@@ -709,7 +714,7 @@ stateDiagram-v2
 
 | # | 威胁 | 路径 | 对策（代码位置） | 残留 |
 |---|------|------|------------------|------|
-| T1 | 首启被本机他进程抢占 | 抢先 POST `/auth/setup` | 未初始化 + loopback peer 直接放行；**非回环监听**必须出示启动日志里的一次性 token（`setupAllowed`）；初始化后 409，token 立刻失效 | 同用户下的恶意进程本就能读 `admin.json`；声明在 `security.md` |
+| T1 | 首启被本机他进程抢占 | 抢先 POST `/auth/setup` | 三个条件**同时**成立：① 未初始化；② 来源是 loopback **或** 持有启动日志里打印的一次性 token（`setupAllowed(remoteAddress, token)`，10 分钟有效、用后即废）；③ 同源（`Origin` 与 `Host` 一致）+ `content-type: application/json`。**不要求自定义头**（页面本来不发，强制会让初始化直接不可用）。初始化成功后接口关闭（409）。 | 同用户下的恶意进程本就能读 `admin.json`；声明在 `security.md` |
 | T2 | CSRF | 恶意网页诱导浏览器 | `SameSite=Strict` cookie + `crossSiteReason`(Origin/Host + `sec-fetch-site`) + 写请求必须 `application/json` | 无 |
 | T3 | DNS rebinding | 恶意域名解析到 127.0.0.1 | 核心的 `isTrustedRequest(request, trustedHosts)`：Host 必须**精确等于** `DEFAULT_TRUSTED_HOSTS`（127.0.0.1/localhost/[::1]/::1），且 Origin 存在时必须与 Host 同源；可信主机表由 server 注入，**永不从请求头自动扩宽** | 无 |
 | T4 | 凭据泄漏 | 日志/前端/备份/诊断 | 密文落盘；`describe` 只答 configured；日志 `redact()`；备份不含 credentials/admin/sessions；`/system/status` 不含凭据 | 进程内存中的明文 |
@@ -943,6 +948,6 @@ graph LR
 | # | 缺口 | 实测证据 | 影响 | 处理建议 |
 |---|------|----------|------|----------|
 | **G16** | `packages/web/static/assets/` 的产物仍被跟踪 | `git ls-files packages/web/static` 仍列出 `assets/app.js`(318 KB)、`assets/app.js.map`(873 KB)、`assets/theme.css`；`.gitignore` 里两条 `packages/web/static/app.js*` 已失效（产物进了 `assets/` 子目录） | 每改一次前端就产生 ~1 MB 的 diff；「产物入库」与「CI 构建后打包」重复 | 二选一：① `.gitignore` 改成 `packages/web/static/assets/` 并 `git rm --cached`（推荐）；② 保留入库但删掉两条失效 ignore 规则 |
-| **G8-residual** | `known-issues.md` 的两条新限制可再明确 | 现文已含少量条目；「限流计数在内存、重启清零」与「审计 append-only 不防篡改」宜各写成独立一条并给出缓解 | 用户对失败模式的理解依赖这份清单 | 补 2 条，各一句话说明「现在是什么行为」 |
+| **G8-residual** | `known-issues.md` 已覆盖「单实例」「审计不防篡改」，**只差「限流计数在内存」一条** | 现文 11 条；`grep -n 限流 docs/known-issues.md` 无命中 | 用户不知道「重启服务可以重置登录锁定」 | 补一条：「登录限流按 IP 与用户名计数，保存在内存；重启服务会清零——能重启本机服务的人可以重置锁定」 |
 
-**验收建议**：只剩 **2 项**——**G16**（仓库里 ~1 MB 的构建产物，发布级）与 **G8-residual**（`known-issues.md` 补两条，质量级）。其余 12 项（G3/G4/G6/G9/G9-residual/G10/G11/G12/G13/G14/G15/G17）都已修并有复现记录（见上表）。`task-plan.md` 的 WP8 相应收敛为 2 个开发步骤 + 验收。
+**验收建议**：只剩 **2 项**——**G16**（仓库里 ~1 MB 的构建产物，发布级）与 **G8-residual**（`known-issues.md` 补一条，质量级）。其余 12 项（G3/G4/G6/G9/G9-residual/G10/G11/G12/G13/G14/G15/G17）都已修并有复现记录（见上表）。`task-plan.md` 的 WP8 相应收敛为 2 个开发步骤 + 验收。

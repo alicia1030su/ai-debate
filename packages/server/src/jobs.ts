@@ -100,7 +100,14 @@ export class JobQueue {
   }) {
     this.#file = options.file
     this.#log = options.log
-    this.#concurrency = Math.max(1, Math.min(4, options.concurrency ?? 1))
+    // One at a time by default, and never more than four: the engine's own limits
+    // (`maxAutoPerSession`, `cooldownSeconds`, one adapter per platform) assume a
+    // single process doing one thing at a time, and two backups writing the same
+    // `backups/` tree is a data race with no upside. The environment variable
+    // exists for a CPU-bound installation, not as a tuning knob to be discovered.
+    const fromEnv = Number(process.env.AI_DEBATE_JOB_CONCURRENCY ?? '')
+    const requested = options.concurrency ?? (Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 1)
+    this.#concurrency = Math.max(1, Math.min(4, Math.floor(requested)))
   }
 
   register(type: JobType, handler: JobHandler): void {
