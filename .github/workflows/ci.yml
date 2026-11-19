@@ -40,6 +40,8 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Typecheck
+        # Builds core first: the monitoring acceptance imports the compiled surface
+        # (lib/) deliberately, the same way the migrated core tests do.
         run: npm run typecheck
       - name: Build core, web and server bundle
         run: npm run build && npm run bundle

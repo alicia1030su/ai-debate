@@ -36,7 +36,8 @@
     "test:automation": "node --experimental-transform-types test/acceptance/automation.ts",
     "test:recovery": "node --experimental-transform-types test/acceptance/recovery.ts",
     "pretest:automation": "node scripts/build-core.mjs",
-    "pretest:recovery": "node scripts/build-core.mjs && node scripts/bundle-server.mjs"
+    "pretest:recovery": "node scripts/build-core.mjs && node scripts/bundle-server.mjs",
+    "pretypecheck": "node scripts/build-core.mjs"
   },
   "devDependencies": {
     "@types/node": "~22.10.2",
