@@ -185,7 +185,7 @@
 2. **口令**：`scrypt` N=16384, r=8, p=1, keylen=64, salt 16 B；`timingSafeEqual`；`params`（`iterations`）随记录落盘以便将来升级；强度：≥10 字符 + 非弱口令；用户名 3–64 且限字符集。
 3. **会话**：32 B 随机 → Cookie 明文 `ai_debate_session`；磁盘只存 `sha256(id)`；`HttpOnly; SameSite=Strict; Path=/`，TLS 时加 `Secure`；12h 空闲 / 7d 绝对 / 最多 8 条。
 4. **CSRF**：**不用自定义头**。改用三层：`SameSite=Strict`（跨站请求不携带 cookie）+ 全局 `crossSiteReason`（`sec-fetch-site: cross-site` 直接 403；`Origin` 存在且 ≠ `Host` 即 403）+ **写请求必须 `content-type: application/json`**（跨站 HTML 表单无法发送该类型，而 JSON 的跨站发送需要 CORS 预检，本服务从不批准）。
-5. **首启**：未初始化时，loopback 对端可直接初始化；**非回环监听**必须出示启动日志里的一次性 token（10 分钟有效、初始化后立即失效）。
+5. **首启（三条件，缺一不可）**：① 未初始化；② 来源是 loopback **或** 持有一开始打印的一次性 token（10 分钟有效、初始化后立即失效）；③ 同源（`Origin` 与 `Host` 一致）+ `content-type: application/json`。**不校验任何自定义头** —— 前端不会发，强制会让初始化流程直接不可用（红线 R-7）。
 6. **限流**：per-IP 与 per-username 双维，15 分钟窗口 8 次；超限 429 + `Retry-After`。
 7. **改密**：撤销全部会话并要求重新登录；**退出**撤销当前会话并清 cookie。
 8. **控制令牌**：`run/control.json`（0600）里的 token 只允许 `system/status` 与 `system/action` 两个路径 —— CLI 没有浏览器会话但要能停掉自己启动的服务，而能读该文件的进程本来就能删 `state.json`。
@@ -506,6 +506,41 @@ SEA 要求零原生 addon；供应链攻击在本类产品上是现实风险（�
 
 ---
 
+## ADR-018 队列红线：不可逆动作永不进入重试路径
+
+**Status**：Accepted（红线，不可协商）
+
+**Context**
+
+队列的价值是「失败了再试一次」。同一个机制用在不可逆动作上，会把一次网络抖动变成两次发表。而在本产品里，发表是最不可逆的动作：一句话发出去就有了公开记录，删帖也不是撤销。
+
+同时，`backup.restore` 也不是幂等写——中断的恢复只做了一半，重跑会把「一半新一半旧」变成「另一个一半」。
+
+**Decision**
+
+1. **publish 永不进队列、永不重试**：`JobType` 是封闭集合，没有 publish 类成员；`POST /jobs` 的允许列表也只有 4 类读任务。发表走核心 `/action` 的 `publish-approved`，同步、人工在场、结果立即可见。
+2. **重试只作用于幂等动作**：`RETRYABLE = {backup.create, logs.rotate, credentials.audit, storage.check}`；`backup.restore` 崩溃后置 `failed` 并写明原因，**不重跑**。
+3. **若将来把 verify 这类一次性写操作排队，`maxAttempts` 必须硬编码 1**：一次性验证的语义是「要么发出去了，要么没发」，重试等于重复发表。
+4. **新增任务类型时必须同时回答两个问题**：它可重放吗？如果不可，`maxAttempts` 是多少？——类型联合与 `RETRYABLE` 集合是这条规则的强制点，不是注释。
+5. 队列触发入口不暴露业务写能力：`/system/action` 只接受维护类动作，`/jobs` 只接受 4 类读任务。
+
+**Consequences**
+
+- 「重试导致重复发表」这条最危险的路径在类型层面不可达，而不是靠约定。
+- 负面：没有「批量后台发表」。这是需求（人工批准）而不是缺陷。
+- 负面：中断的 `backup.restore` 需要人工处理（要用户确认恢复的是哪一份），数量极少。
+- 负面：`runtime.test.ts` 里那条「拒绝发表入队」目前只断言**允许集合**是封闭的五项，并没有真的尝试塞一个 publish 类型（TypeScript 会拦，但运行时没有反例）。**建议补一条运行时反例测试**（用 `as never` 绕过类型，断言抛错）。
+
+**Alternatives**
+
+| 方案 | 否决理由 |
+|------|----------|
+| 所有任务统一重试（包括 publish） | 直接产生重复发表；这是本项目最不能接受的故障 |
+| 用「幂等键 + 服务端去重」允许 publish 重试 | 平台侧没有幂等键（贴吧/微博都不支持），去重只能靠本地台账，而台账无法证明远端是否已写入 |
+| 队列完全不重试（所有任务都一次） | 备份/日志轮转这类家务失败一次就永久失败，运维成本上升；它们的重试没有副作用 |
+
+---
+
 ## Superseded：被替换的早期方案（保留记录）
 
 | 原编号 | 被替换的方案 | 现在的方案 | 原因 |
@@ -541,3 +576,4 @@ SEA 要求零原生 addon；供应链攻击在本类产品上是现实风险（�
 | 015 | version + 原子写 + 损坏隔离 | Accepted | `server/src/atomic.ts` | — |
 | 016 | v0.1.0 范围冻结 | Accepted | — | — |
 | 017 | 测试与扫描必须诚实 | Accepted | `package.json` scripts、`scripts/scan-secrets.mjs`、测试夹具 | 已修（G10 用文件级 ALLOW，G12 改为串行四条） |
+| 018 | 队列红线：不可逆动作不进重试 | Accepted | `server/src/jobs.ts` 的 `JobType`/`RETRYABLE`/`#recover()` | 建议补一条运行时反例测试 |

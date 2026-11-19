@@ -30,6 +30,32 @@
 
 ---
 
+## 0.1 已核实的既定输入（团队实测，不再论证）
+
+> 以下事实由团队实测确认，作为设计输入写死；实现若与其中一条不一致，视为实现偏差而不是设计争议。
+
+| # | 事实 | 对设计的影响 |
+|---|------|--------------|
+| I1 | `client.cjs` 与宿主外壳的耦合只有 4 处：`window.__ModuleLoader__.load({id,factory})` 外壳、`require('@deepseek-ai/dsh-client-store')`、`apply(ctx)` 内的 `ctx.locale.register` 与两处 `ctx.slots.register`。组件层完全不依赖宿主（`DebateSection()` 无 props，走模块级 `storeForSection()`） | 转换是**确定性抽取**，不是重写 UI。见 §9 与 ADR-002 |
+| I2 | `CardStore` 只用快照库的 `getSnapshot()` / `subscribe(fn)` / `set(snapshot)` 三个方法，且 `subscribe` 回调必须**无参**调用（传 `setState` 会被 React 当成 set-undefined） | 40 行替身即可；通知必须 `listener()`，见 ADR-014 |
+| I3 | `TABS` 实际是 **11 项**（`account/model/persona/publish/approve/platforms/verify/workbench/manual/security/status`），需求文档写的 10 项是笔误 | 保留 11 项，在 `differences.md` 注明 |
+| I4 | `SettingsRouteDeps` 全部可注入复用（清单见 §4）；`isTrustedRequest` 必须按**实际监听地址**判定，否则用户配 `0.0.0.0` 时自己也被 403 | 不改 `makeSettingsRoutes` 的 7 条路由；`trustedHosts` 注入（§13.3 G11） |
+| I5 | `@deepseek-ai/schemastery` 只出现在 `config.ts` 定义 `Config`；`resolveConfig(raw)` 已是纯函数、含默认值与白名单；`EDITABLE_FIELDS` + `coerceField` 是第二道 | 只替换 `Config` 的构造器，**不重写 `resolveConfig`**；见 ADR-004 |
+| I6 | 凭据 ref 字面量共 21 处 + `security/output-guard.ts` 的 `/DSH_AI_DEBATE_[A-Z_]+/` 正则；`CredentialSeam` 四方法不变 | 统一改 `AI_DEBATE_*`；旧名仅用于显式导入（ADR-012） |
+| I7 | `store-dir.ts` 的 DSH 依赖只有 `dshHomeDir()` / `hostDataDir()` | 换成 `AI_DEBATE_HOME` → 平台默认；保留「两目录都有数据就拒绝」与 `state.json` 语义 |
+| I8 | `diagnostics.ts` 曾用 `new URL('../package.json', import.meta.url)` 读版本；SEA 里 `import.meta` 不可用 | **已按此修**：优先级改为 `AI_DEBATE_VERSION` 环境变量 → SEA 资源 `package.json` → `import.meta` 兜底 → `0.0.0-unknown`。实测打包产物 `/status` 返回 `pluginVersion: "0.1.1"`，**不是 unknown** |
+| I9 | 上游 234 个测试里 176 个 import `../lib/*.js`（tsc 产物）、4 个 import `client/client.cjs`、仅 `test/cordis-integration.test.ts` 真 import `@deepseek-ai/cordis` | 迁移策略：core 测试保留并改 import 到 `../src/*`（Node 22 `--experimental-transform-types` 直接跑 .ts）；`cordis-integration` 丢弃并在 `differences.md` 记录；前端 4 个测试保留（用直接 import 生成物，**不**为产物加 `__ModuleLoader__` 兼容层——多一层假外壳等于永久维护它） |
+| I10 | 前端独立化原型已跑通（factory 体抽成 CJS + 自写 snapshot store + esbuild + jsdom 渲染）：`DebateCard` 能直接渲染 11 个页签 | 前端任务 = 抽取 + shim + 挂载壳，不是重写 |
+
+**与上表相关的实现偏差（已发生、且有理由）**
+
+| 输入 | 实现选择 | 理由 |
+|------|----------|------|
+| I1 建议「删掉 `apply/inject` 函数体，再 append 挂载代码」 | 保留整个 `apply()`，外壳提供一个最小宿主 shim（`effect/locale/slots/logger`），唯一真实作用是把 `CARD_CSS` 注入 `<head>` | 不删代码就没机会删错；`ensureStyles()` 是 `apply()` 里唯一必要行为，shim 让这一条保留、slot 注册自然退化为 no-op。生成物行数 ≈ 原文件，验收可 diff（ADR-002） |
+| 队列边界（团队红线：只承载可重复动作、verify `maxAttempts=1`） | 落地为**更严格**的封闭集合：只承载 `backup.create/restore`、`logs.rotate`、`credentials.audit`、`storage.check`；analyze/generate 走核心 `/action` 同步执行 | 分析/生成是「有人点了按钮」的交互动作，排队会让 UI 状态变成推测；且业务仍只有 `settingsRouteDeps` 一个出口。发表**永不**进队列这条红线完全满足（ADR-007 / ADR-018） |
+
+---
+
 ## 1. 难点与选型
 
 ### 1.1 七个核心难点

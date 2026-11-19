@@ -77,6 +77,11 @@ jobs:
           $exe = Resolve-Path dist/AI-Debate-windows-x64.exe
           & $exe --version
           & $exe --help
+      - name: Run the acceptance against the packaged executable
+        shell: bash
+        env:
+          AI_DEBATE_BIN: dist/AI-Debate-windows-x64.exe
+        run: node --experimental-transform-types test/acceptance/standalone.ts
       - uses: actions/upload-artifact@v4
         with:
           name: windows-exe

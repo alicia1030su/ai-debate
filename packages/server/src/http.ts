@@ -179,7 +179,14 @@ export function createHttpServer(deps: HttpDeps): Server {
         return
       }
 
-      if (pathname.startsWith('/api/ai-debate/system/') || pathname.startsWith('/api/ai-debate/jobs')) {
+      if (
+        pathname.startsWith('/api/ai-debate/system/') ||
+        pathname.startsWith('/api/ai-debate/jobs') ||
+        // The queue switch is its own path because it is not about one job: "stop
+        // doing background work" applies to everything queued. It is named here in
+        // the same fence, so a pause is exactly as authenticated as a cancel.
+        pathname === '/api/ai-debate/queue'
+      ) {
         // The CLI has no browser session, and it must still be able to stop and
         // restart the service it started. That is a local-only ability, proved by a
         // token that only a process able to read the data directory can obtain —
