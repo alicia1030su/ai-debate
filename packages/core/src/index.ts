@@ -39,7 +39,7 @@ import { chooseModelSource } from './model-source.js'
 import { hostLlmOf, probeHostLlm } from './host-llm.js'
 import { EgressGuard, EgressLog, egressPolicyOf } from './net-audit.js'
 import { join } from 'node:path'
-import { resolveStoreDirStrict } from './store-dir.js'
+import { chooseStoreDir, resolveStoreDirStrict } from './store-dir.js'
 import { MAX_STORED_COMMENTS, type StoredCandidate, type StoredSession } from './store.js'
 import { PlatformRegistry } from './platforms/registry.js'
 import { __setHttpEgressGate } from './platforms/http.js'
@@ -1643,7 +1643,17 @@ export function apply(ctx: PluginContext, config?: unknown): () => void {
             try {
               return appServer.info!()
             } catch {
-              return { listen: '', port: 0, dataDir: resolveStoreDir(effectiveConfig()), version: APP_VERSION, startedAt: '', pid: process.pid }
+              // Reported from what is known rather than from what would have to be
+              // created: `chooseStoreDir` is pure, so a failing probe cannot make a
+              // read-only settings request create a directory.
+              return {
+                listen: '',
+                port: 0,
+                dataDir: chooseStoreDir({ configured: effectiveConfig().storeDir }).dir,
+                version: APP_VERSION,
+                startedAt: '',
+                pid: process.pid,
+              }
             }
           },
         }),

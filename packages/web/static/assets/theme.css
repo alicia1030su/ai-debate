@@ -304,6 +304,13 @@ body {
   color: var(--dsw-alias-label-secondary);
 }
 
+.shell-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-tertiary);
+  overflow-wrap: anywhere;
+}
+
 /* --- Auth gate ----------------------------------------------------------- */
 
 .app-auth {

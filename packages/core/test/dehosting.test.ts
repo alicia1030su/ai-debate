@@ -12,7 +12,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, win32 } from 'node:path'
 import type { IncomingMessage } from 'node:http'
 
 import {
@@ -132,7 +132,9 @@ test('the platform default directory is the one convention for that platform', (
       home: 'C:/Users/x',
       env: { LOCALAPPDATA: 'C:/Users/x/AppData/Local' },
     }),
-    join('C:/Users/x/AppData/Local', 'ai-debate'),
+    // The Windows branch builds its path with path.win32, so the expectation has to
+    // use the same separators — a POSIX join would pass on Windows and fail on CI.
+    win32.join('C:/Users/x/AppData/Local', 'ai-debate'),
   )
   assert.equal(
     platformDefaultStoreDir({ platform: 'darwin', home: '/Users/x', env: {} }),

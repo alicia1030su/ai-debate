@@ -417,14 +417,19 @@ function renderUnreachable(detail) {
  *
  * @param {'setup'|'login'} mode Which form to show.
  * @param {string} [message] Error text to preselect.
+ * @param {{showToken?: boolean, username?: string}} [extra]
+ *   `showToken` reveals the one-time token field — the service only requires it
+ *   when the console is reached over something other than loopback, and asking
+ *   for it up front would puzzle the ordinary local user.
  */
-function renderAuthForm(mode, message) {
+function renderAuthForm(mode, message, extra) {
   currentView = 'auth'
   setBarVisible(false)
   showNode('auth')
   clear(nodes.authHost)
 
   const isSetup = mode === 'setup'
+  const showToken = isSetup && Boolean(extra && extra.showToken)
   const errorNode = el('p', { class: 'auth-error', role: 'alert' }, [message || ''])
 
   const username = el('input', {
@@ -435,6 +440,8 @@ function renderAuthForm(mode, message) {
     spellcheck: 'false',
     required: 'required',
   })
+  if (extra && typeof extra.username === 'string') username.value = extra.username
+
   const password = el('input', {
     class: 'shell-input',
     type: 'password',
@@ -451,6 +458,15 @@ function renderAuthForm(mode, message) {
         required: 'required',
       })
     : null
+  const setupToken = showToken
+    ? el('input', {
+        class: 'shell-input',
+        type: 'text',
+        name: 'token',
+        autocomplete: 'off',
+        spellcheck: 'false',
+      })
+    : null
 
   const submit = el('button', { class: 'shell-btn shell-btn-primary', type: 'submit' }, [
     isSetup ? '初始化并进入' : '登录',
@@ -463,6 +479,15 @@ function renderAuthForm(mode, message) {
       ? el('label', { class: 'shell-field' }, [
           el('span', { class: 'shell-label' }, ['确认密码']),
           confirm,
+        ])
+      : null,
+    setupToken
+      ? el('label', { class: 'shell-field' }, [
+          el('span', { class: 'shell-label' }, ['一次性令牌']),
+          setupToken,
+          el('span', { class: 'shell-hint' }, [
+            '从非本机地址初始化时需要。令牌会打印在服务启动日志里。',
+          ]),
         ])
       : null,
     errorNode,
@@ -502,23 +527,31 @@ function renderAuthForm(mode, message) {
     submit.textContent = isSetup ? '正在初始化…' : '正在登录…'
 
     void (async () => {
+      const body = { username: name, password: password.value }
+      // Only sent when the operator filled it in: an empty token is not the same
+      // thing as "no token needed", and the service decides which it wants.
+      if (setupToken && setupToken.value.trim() !== '') body.token = setupToken.value.trim()
+
       const result = await requestJson(isSetup ? AUTH_SETUP_URL : AUTH_LOGIN_URL, {
         method: 'POST',
-        // `username` is advisory: the service owns a single local owner and may
-        // ignore it, but shipping it means a multi-account service can be added
-        // later without changing this form.
-        body: { username: name, password: password.value },
+        body,
         // Setup runs before any session exists, and `setup` is the one CSRF
         // value the service accepts at that point.
         csrf: isSetup ? CSRF_SETUP : undefined,
       })
 
       if (!result.ok) {
-        errorNode.textContent = result.network
-          ? '无法连接服务，请检查服务是否在运行。'
-          : result.error
         submit.disabled = false
         submit.textContent = isSetup ? '初始化并进入' : '登录'
+        // A refusal that mentions the token is the service telling the operator
+        // this console was reached from off-machine. Re-render with the field
+        // rather than leaving them with a message naming a control that is not
+        // on screen.
+        if (isSetup && !showToken && /令牌|token/i.test(result.error)) {
+          renderAuthForm('setup', result.error, { showToken: true, username: name })
+          return
+        }
+        errorNode.textContent = result.network ? '无法连接服务，请检查服务是否在运行。' : result.error
         return
       }
 

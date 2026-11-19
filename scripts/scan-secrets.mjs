@@ -20,7 +20,14 @@ const RULES = [
 ]
 
 /** Paths that are allowed to *describe* the patterns, not carry them. */
-const ALLOW = new Set(['scripts/scan-secrets.mjs', 'test/acceptance/fixtures/README.md'])
+const ALLOW = new Set([
+  // Documents the patterns themselves.
+  'scripts/scan-secrets.mjs',
+  'test/acceptance/fixtures/README.md',
+  // Asserts that redaction removes these shapes; the literals are deliberately
+  // fake and exist only to be redacted.
+  'packages/server/test/runtime.test.ts',
+])
 
 const files = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8' })
   .split('\0')
