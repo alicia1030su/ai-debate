@@ -130,8 +130,11 @@ jobs:
           docker run -d --privileged --cgroupns=host --network host --name ai-debate-sysd \
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw jrei/systemd-ubuntu:22.04
           started=0
-          for _ in $(seq 1 60); do
-            if docker exec ai-debate-sysd systemctl is-system-running >/dev/null 2>&1; then started=1; break; fi
+          for _ in $(seq 1 90); do
+            # `is-system-running` exits non-zero for `degraded`, which is the normal
+            # state of a container image with a few unneeded units failing. The
+            # private socket is the honest "PID 1 is systemd and listening" signal.
+            if docker exec ai-debate-sysd test -S /run/systemd/private 2>/dev/null; then started=1; break; fi
             if [[ "$(docker inspect -f '{{.State.Running}}' ai-debate-sysd 2>/dev/null)" != "true" ]]; then break; fi
             sleep 1
           done
@@ -140,7 +143,7 @@ jobs:
             docker logs ai-debate-sysd 2>&1 | tail -40 || true
             exit 1
           fi
-          docker exec ai-debate-sysd bash -lc 'systemctl is-system-running; systemctl --version | head -1'
+          docker exec ai-debate-sysd bash -lc 'systemctl is-system-running || true; systemctl --version | head -1'
       - name: Start a model stub on the host
         run: |
           set -euo pipefail
