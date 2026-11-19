@@ -119,26 +119,39 @@ jobs:
           systemd-analyze verify "$tmp/ai-debate.service" || true
           grep -q "Restart=always" "$tmp/ai-debate.service"
           grep -q "ExecStart=/opt/ai-debate/bin/ai-debate serve" "$tmp/ai-debate.service"
-      - name: Prove systemd is running on this runner
+      - name: Boot a real systemd inside a container
         run: |
           set -euo pipefail
-          state="$(systemctl is-system-running 2>/dev/null || true)"
-          # `degraded` means one unrelated unit failed on the runner image; systemd is
-          # still PID 1 and still able to start ours. Only `offline`/`unknown`/empty
-          # means there is nothing to test against.
-          if [[ -d /run/systemd/system ]] && [[ "${state}" == "running" || "${state}" == "degraded" ]]; then
-            echo "systemd 已在运行（${state}）"
-            systemctl --version | head -1
-          else
-            # The runner image starts many jobs in a container without systemd as PID 1.
-            # Boot it for this job rather than pretending a unit file is a deployment.
-            echo "::error::这个 runner 没有运行中的 systemd，无法做真实 systemd 验收"
-            exit 1
-          fi
-      - name: Install the archive and run the full acceptance
+          # The ubuntu-22.04 runner has no systemd as PID 1, so a unit file cannot be
+          # "verified" by starting it. A privileged container running systemd is the
+          # smallest environment where install.sh, systemctl enable --now, a kill -9
+          # restart and a reinstall can all be exercised for real.
+          docker run --rm -d --privileged --network host --name ai-debate-sysd jrei/systemd-ubuntu:22.04
+          for _ in $(seq 1 60); do
+            if docker exec ai-debate-sysd systemctl is-system-running >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker exec ai-debate-sysd bash -lc 'systemctl is-system-running || true; systemctl --version | head -1'
+      - name: Start a model stub on the host
         run: |
           set -euo pipefail
-          sudo bash test/acceptance/linux-install.sh dist/ai-debate-linux-x64.tgz
+          node test/support/mock-model.mjs &
+          sleep 1
+      - name: Install, enable, kill and reinstall under systemd
+        run: |
+          set -euo pipefail
+          docker exec ai-debate-sysd bash -lc 'apt-get update -qq && apt-get install -y -qq curl >/dev/null'
+          docker cp dist/ai-debate-linux-x64.tgz ai-debate-sysd:/tmp/ai-debate.tgz
+          docker cp test/acceptance/linux-install.sh ai-debate-sysd:/tmp/linux-install.sh
+          docker exec -e AI_DEBATE_MOCK_URL=http://127.0.0.1:17863 ai-debate-sysd bash /tmp/linux-install.sh /tmp/ai-debate.tgz
+      - name: Show the systemd journal if it failed
+        if: failure()
+        run: |
+          docker exec ai-debate-sysd journalctl -u ai-debate -n 120 --no-pager || true
+          docker logs ai-debate-sysd 2>&1 | tail -60 || true
+      - name: Stop the container
+        if: always()
+        run: docker rm -f ai-debate-sysd || true
       - uses: actions/upload-artifact@v4
         with:
           name: linux-tgz

@@ -34,6 +34,12 @@ if [[ ! -f "${ARCHIVE}" ]]; then
 fi
 
 # A mock OpenAI-compatible endpoint so the model step is real HTTP, not a stub.
+# When the service runs inside a container that shares the host network (the CI
+# systemd job), the caller starts this on the host and passes AI_DEBATE_MOCK_URL.
+if [[ -n "${AI_DEBATE_MOCK_URL:-}" ]]; then
+  echo "使用外部模型地址 ${AI_DEBATE_MOCK_URL}"
+  MOCK_PID=""
+else
 node -e '
 const http = require("node:http");
 const server = http.createServer((req, res) => {
@@ -61,6 +67,7 @@ server.listen('"${MOCK_PORT}"', "127.0.0.1");
 ' &
 MOCK_PID=$!
 sleep 1
+fi
 
 echo "== 解压并安装 =="
 mkdir -p "${WORK}/pkg"
@@ -72,9 +79,13 @@ if [[ "$(id -u)" -eq 0 ]]; then
   if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
     SYSTEMD=1
     echo "== 检测到运行中的 systemd：走真实安装（含开机自启）=="
-    ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" --data-dir "${WORK}/data" --prefix "${WORK}/opt" ) \
+    # Default paths on purpose: the unit sets ProtectSystem=strict and whitelists
+    # /opt + /var/lib, so installing into a temp directory would leave the service
+    # unable to write its own data — a harness failure, not a product one.
+    ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" ) \
       && pass "安装脚本执行（systemd 模式）" || fail "安装脚本执行"
-    BIN="${WORK}/opt/bin/ai-debate"
+    STATE_DIR="/var/lib/ai-debate"
+    BIN="/opt/ai-debate/bin/ai-debate"
     # The real proof: systemd says the unit is active, not that we spawned a process.
     for _ in $(seq 1 40); do
       if systemctl is-active --quiet ai-debate; then break; fi
@@ -86,10 +97,12 @@ if [[ "$(id -u)" -eq 0 ]]; then
     echo "== 没有运行中的 systemd：退化为手工启动 =="
     ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" --data-dir "${WORK}/data" --prefix "${WORK}/opt" --no-start ) \
       && pass "安装脚本执行" || fail "安装脚本执行"
+    STATE_DIR="${WORK}/data"
     BIN="${WORK}/opt/bin/ai-debate"
   fi
 else
   echo "非 root：跳过 install.sh，直接使用解压出的二进制"
+  STATE_DIR="${WORK}/data"
   BIN="${WORK}/pkg/ai-debate-linux-x64/bin/ai-debate"
 fi
 
@@ -101,7 +114,7 @@ if [[ "${SYSTEMD}" -eq 1 ]]; then
   # same data directory, so this exercises the real unit rather than a copy of it.
   SERVICE_PID=""
 else
-  AI_DEBATE_HOME="${WORK}/data" "${BIN}" serve --port "${PORT}" > "${WORK}/service.log" 2>&1 &
+  AI_DEBATE_HOME="${STATE_DIR}" "${BIN}" serve --port "${PORT}" > "${WORK}/service.log" 2>&1 &
   SERVICE_PID=$!
 fi
 
@@ -129,7 +142,8 @@ api POST /api/ai-debate/auth/setup '{"username":"owner","password":"linux-accept
 
 api GET /api/ai-debate/settings | grep -q '"status":"ready"' && pass "读取配置" || fail "读取配置"
 
-api POST /api/ai-debate/settings "{\"set\":{\"llmBaseUrl\":\"http://127.0.0.1:${MOCK_PORT}/v1\",\"llmModel\":\"mock-model\",\"llmSource\":\"custom\"}}" >/dev/null
+MOCK_BASE="${AI_DEBATE_MOCK_URL:-http://127.0.0.1:${MOCK_PORT}}"
+api POST /api/ai-debate/settings "{\"set\":{\"llmBaseUrl\":\"${MOCK_BASE}/v1\",\"llmModel\":\"mock-model\",\"llmSource\":\"custom\"}}" >/dev/null
 api POST /api/ai-debate/secrets '{"ref":"AI_DEBATE_LLM_API_KEY","value":"sk-linux-acceptance-123"}' >/dev/null
 api POST /api/ai-debate/action '{"action":"test-llm"}' | grep -q '"ok":true' && pass "模型连接测试" || fail "模型连接测试"
 
@@ -152,7 +166,7 @@ if [[ "${SYSTEMD}" -eq 1 ]]; then
   sleep 1
 else
   kill "${SERVICE_PID}"; wait "${SERVICE_PID}" 2>/dev/null || true
-  AI_DEBATE_HOME="${WORK}/data" "${BIN}" serve --port "${PORT}" >> "${WORK}/service.log" 2>&1 &
+  AI_DEBATE_HOME="${STATE_DIR}" "${BIN}" serve --port "${PORT}" >> "${WORK}/service.log" 2>&1 &
   SERVICE_PID=$!
 fi
 ready=0
@@ -163,7 +177,7 @@ done
 [[ "${ready}" -eq 1 ]] && pass "重启后服务可用" || fail "重启后服务"
 
 api GET /api/ai-debate/settings | grep -q '"status":"ready"' && pass "重启后会话仍有效" || fail "重启后会话"
-grep -q "${SESSION}" "${WORK}/data/state.json" && pass "重启后会话数据仍在" || fail "重启后数据"
+grep -q "${SESSION}" "${STATE_DIR}/state.json" && pass "重启后会话数据仍在" || fail "重启后数据"
 
 if [[ "${SYSTEMD}" -eq 1 ]]; then
   echo "== 强制 kill -9，验证 systemd 自动拉起 =="
@@ -188,16 +202,16 @@ if [[ "${SYSTEMD}" -eq 1 ]]; then
   echo "== 卸载（保留数据）=="
   ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./uninstall.sh ) >/dev/null 2>&1 || true
   systemctl is-active --quiet ai-debate && fail "卸载后服务仍活动" || pass "卸载后服务已停止"
-  [[ -f "${WORK}/data/state.json" ]] && pass "卸载保留用户数据" || fail "卸载保留用户数据"
+  [[ -f "${STATE_DIR}/state.json" ]] && pass "卸载保留用户数据" || fail "卸载保留用户数据"
 
   echo "== 重新安装并启动，验证升级不丢数据 =="
-  ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" --data-dir "${WORK}/data" --prefix "${WORK}/opt" ) >/dev/null 2>&1
+  ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" ) >/dev/null 2>&1
   for _ in $(seq 1 40); do
     if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then break; fi
     sleep 0.5
   done
-  grep -q "${SESSION}" "${WORK}/data/state.json" && pass "重新安装后历史数据仍在" || fail "重新安装后历史数据仍在"
-  if [[ -f "${WORK}/data/monitors.json" ]]; then
+  grep -q "${SESSION}" "${STATE_DIR}/state.json" && pass "重新安装后历史数据仍在" || fail "重新安装后历史数据仍在"
+  if [[ -f "${STATE_DIR}/monitors.json" ]]; then
     pass "监控配置文件随数据目录保留"
   else
     echo "  （本次运行未创建监控目标，跳过 monitors.json 检查）"
