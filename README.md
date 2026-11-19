@@ -7,10 +7,18 @@ approves the exact body**.
 This repository is an independent product. It is **not** a plugin, and it does not require DSH,
 Cordis, Node.js, Docker or Python at run time.
 
-- Windows: `AI-Debate-windows-x64.exe` — double-click, the browser opens, the service keeps
-  running in the background.
-- Linux: `ai-debate-linux-x64.tgz` — `install.sh` installs a systemd service on
-  `127.0.0.1:17860`.
+Download the latest release from
+[Releases](https://github.com/alicia1030su/ai-debate/releases/latest). Verify it first:
+
+```bash
+sha256sum -c SHA256SUMS.txt          # Linux
+certutil -hashfile AI-Debate-windows-x64.exe SHA256   # Windows
+```
+
+- **Windows** `AI-Debate-windows-x64.exe` — double-click; the browser opens and the service keeps
+  running in the background. `--status`, `--stop`, `--restart`, `--logs` control it.
+- **Linux** `ai-debate-linux-x64.tgz` — `sudo ./install.sh` installs a systemd service on
+  `127.0.0.1:17860`, restarts it on failure, and keeps data in `/var/lib/ai-debate`.
 
 See `docs/install-windows.md`, `docs/install-linux.md`, `docs/security.md`, `docs/migration.md`,
 `docs/architecture.md`.
