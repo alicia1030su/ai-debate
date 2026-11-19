@@ -34,6 +34,10 @@ import { ensureLayout, layoutOf, tightenPermissions, type Layout } from './paths
 import { WebServerRegistry } from './registry.ts'
 import { createStandaloneHost } from './standalone-host.ts'
 import { writeJson } from './atomic.ts'
+import { MonitorStore } from './monitor/store.ts'
+import { AutoTaskStore } from './monitor/tasks.ts'
+import { AutomationEngine, monitorViews } from './monitor/engine.ts'
+import type { DebateProductApi } from '../../core/src/product-api.ts'
 
 export interface StartOptions {
   readonly host: string
@@ -44,6 +48,10 @@ export interface StartOptions {
   readonly webDir?: string | undefined
   /** Override for tests: do not schedule the periodic backup. */
   readonly scheduleBackups?: boolean
+  /** Global cap on concurrent background tasks (default 1). */
+  readonly monitorConcurrency?: number
+  /** Scheduler tick in milliseconds; tests shrink it. */
+  readonly monitorTickMs?: number
   /**
    * Hostnames this deployment answers to, when `--host` cannot express them.
    *
@@ -142,13 +150,30 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     log,
   })
 
+  const monitors = new MonitorStore({ file: layout.monitorsFile, log })
+  monitors.load()
+  if (monitors.loadError !== undefined) log.error(monitors.loadError)
+
+  const autoTasks = new AutoTaskStore({ file: layout.autoTasksFile, log })
+  const taskLoad = autoTasks.load()
+  const recoveredTasks = autoTasks.recoverInterrupted()
+  if (recoveredTasks > 0) log.warn(`恢复 ${recoveredTasks} 个中断的后台任务`)
+  void taskLoad
+
+  let productApi: DebateProductApi | undefined
+  let engine: AutomationEngine | undefined
+
   let mounted = true
   let mountError: string | undefined
   try {
     // The adapter is structurally a plugin context; the core's exported type is
     // narrower than the object it actually reads, so the cast is at the boundary
     // and nowhere else.
-    apply(host.ctx as never, config.raw)
+    apply(host.ctx as never, config.raw, {
+      onReady: (api) => {
+        productApi = api
+      },
+    })
     log.info(`辩论引擎挂载完成：${host.tools.length} 个工具、${registry.size} 条路由`)
   } catch (error) {
     mounted = false
@@ -325,6 +350,46 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     legacy,
     backups,
     audit,
+    automation: {
+      status: (): Record<string, unknown> => ((engine?.status() ?? { paused: true, running: false, concurrency: 1, perPlatform: 1, monitors: { total: 0, enabled: 0, blocked: 0 }, tasks: {}, today: { discovered: 0, candidates: 0, failures: 0 }, queued: 0, runningTasks: 0 }) as unknown as Record<string, unknown>),
+      monitors: () => monitorViews(monitors.list(), autoTasks.all()),
+      tasks: (limit: number) => autoTasks.list(limit),
+      reviews: () => autoTasks
+        .list(400)
+        .filter((task) => task.state === 'needs_review')
+        .map((task) => ({
+          taskId: task.id,
+          monitorId: task.monitorId,
+          sessionId: task.sessionId,
+          postId: task.postId,
+          createdAt: task.createdAt,
+          updatedAt: task.updatedAt,
+          monitorName: monitors.get(task.monitorId)?.name,
+          threadUrl: monitors.get(task.monitorId)?.url,
+        })),
+      createMonitor: (input: { name: string; url: string; intervalSec?: number; accountLabel?: string }) => {
+        const resolved = productApi === undefined ? undefined : productApi.resolveUrl(input.url)
+        if (resolved === undefined) throw new Error('无法识别这个链接所属的平台。请粘贴完整的帖子链接。')
+        if (monitors.findByThread(resolved.platform, resolved.threadId) !== undefined) {
+          throw new Error('这个帖子已经在监控列表里了。请直接在列表里编辑它。')
+        }
+        const monitor = monitors.create(input, resolved)
+        // A brand-new monitor gets one immediate check, so the owner sees
+        // something happen instead of waiting a full interval to learn it works.
+        autoTasks.enqueue({ kind: 'probe', monitorId: monitor.id, dedupeKey: `probe:${monitor.id}` })
+        return monitor
+      },
+      updateMonitor: (id: string, patch: { name?: string; intervalSec?: number; enabled?: boolean; accountLabel?: string }) => {
+        if (patch.enabled === true) monitors.clearBlock(id)
+        return monitors.update(id, patch)
+      },
+      removeMonitor: (id: string) => monitors.remove(id),
+      checkNow: (id: string) => engine?.checkNow(id) ?? { ok: false, message: '后台引擎未启动。' },
+      pauseAll: () => engine?.pause(),
+      resumeAll: () => engine?.resume(),
+      cancelTask: (id: string) => autoTasks.cancel(id),
+      loadErrors: () => [monitors.loadError, autoTasks.loadError].filter((entry): entry is string => entry !== undefined),
+    },
     actions: {
       shutdown,
       restart,
@@ -364,6 +429,20 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
 
   log.info(`监听 http://${options.host}:${actualPort}/`)
 
+  engine = new AutomationEngine({
+    monitors,
+    tasks: autoTasks,
+    api: () => productApi,
+    log,
+    ...(options.monitorConcurrency === undefined ? {} : { concurrency: options.monitorConcurrency }),
+    ...(options.monitorTickMs === undefined ? {} : { tickMs: options.monitorTickMs }),
+  })
+  if (mounted) {
+    engine.start()
+  } else {
+    log.warn('辩论引擎未挂载，后台挂机不启动（监控配置保留，修复后重启即可继续）')
+  }
+
   let autoBackupTimer: NodeJS.Timeout | undefined
   if (options.scheduleBackups !== false) {
     const schedule = (): void => {
@@ -389,6 +468,7 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     if (closing !== undefined) return closing
     closing = (async () => {
       if (autoBackupTimer !== undefined) clearInterval(autoBackupTimer)
+      if (engine !== undefined) await engine.stop()
       await queue.stop()
       await new Promise<void>((resolve) => server.close(() => resolve()))
       // The run file is what "is it running" reads; leaving it behind would make a

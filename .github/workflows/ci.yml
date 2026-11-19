@@ -55,6 +55,12 @@ jobs:
       - name: End-to-end acceptance
         shell: bash
         run: node --experimental-transform-types test/acceptance/standalone.ts
+      - name: Background monitoring acceptance
+        shell: bash
+        run: node --experimental-transform-types test/acceptance/automation.ts
+      - name: Crash recovery acceptance
+        shell: bash
+        run: node --experimental-transform-types test/acceptance/recovery.ts
       - name: No DSH dependency
         shell: bash
         run: node scripts/assert-no-dsh.mjs
@@ -111,6 +117,22 @@ jobs:
           systemd-analyze verify "$tmp/ai-debate.service" || true
           grep -q "Restart=always" "$tmp/ai-debate.service"
           grep -q "ExecStart=/opt/ai-debate/bin/ai-debate serve" "$tmp/ai-debate.service"
+      - name: Prove systemd is running on this runner
+        run: |
+          set -euo pipefail
+          state="$(systemctl is-system-running 2>/dev/null || true)"
+          # `degraded` means one unrelated unit failed on the runner image; systemd is
+          # still PID 1 and still able to start ours. Only `offline`/`unknown`/empty
+          # means there is nothing to test against.
+          if [[ -d /run/systemd/system ]] && [[ "${state}" == "running" || "${state}" == "degraded" ]]; then
+            echo "systemd 已在运行（${state}）"
+            systemctl --version | head -1
+          else
+            # The runner image starts many jobs in a container without systemd as PID 1.
+            # Boot it for this job rather than pretending a unit file is a deployment.
+            echo "::error::这个 runner 没有运行中的 systemd，无法做真实 systemd 验收"
+            exit 1
+          fi
       - name: Install the archive and run the full acceptance
         run: |
           set -euo pipefail

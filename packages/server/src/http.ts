@@ -44,6 +44,27 @@ export interface HttpDeps {
   /** Local-only token that lets the CLI stop or restart the service. */
   readonly controlToken: string
   readonly audit: Auditor
+  /**
+   * The background monitoring surface (v0.2.0).
+   *
+   * A narrow, read-mostly object rather than the engine itself: the HTTP layer must
+   * not be able to start a task by accident, and every mutating method here
+   * corresponds to one explicit operator action.
+   */
+  readonly automation: {
+    status(): Record<string, unknown>
+    monitors(): readonly Record<string, unknown>[]
+    tasks(limit: number): readonly unknown[]
+    reviews(): readonly Record<string, unknown>[]
+    createMonitor(input: { name: string; url: string; intervalSec?: number; accountLabel?: string }): { id: string }
+    updateMonitor(id: string, patch: { name?: string; intervalSec?: number; enabled?: boolean; accountLabel?: string }): unknown
+    removeMonitor(id: string): boolean
+    checkNow(id: string): { ok: boolean; message?: string }
+    pauseAll(): void
+    resumeAll(): void
+    cancelTask(id: string): boolean
+    loadErrors(): readonly string[]
+  }
   /** The old plugin's data directory, read only when the owner asks. */
   readonly legacy: {
     scan(): { found: boolean; dir: string; sessions: number; ledger: number; approvals: number; bytes: number }
@@ -182,6 +203,10 @@ export function createHttpServer(deps: HttpDeps): Server {
       if (
         pathname.startsWith('/api/ai-debate/system/') ||
         pathname.startsWith('/api/ai-debate/jobs') ||
+        // Background monitoring is an operator surface: it starts reads against
+        // platforms and spends model calls, so it sits behind the same session as
+        // the settings page. The control token is not widened to cover it.
+        pathname.startsWith('/api/ai-debate/automation') ||
         // The queue switch is its own path because it is not about one job: "stop
         // doing background work" applies to everything queued. It is named here in
         // the same fence, so a pause is exactly as authenticated as a cancel.
@@ -407,6 +432,123 @@ async function handleOperator(
       return
     }
   }
+  if (pathname === '/api/ai-debate/automation/status' && method === 'GET') {
+    // `monitors` is the summary object from `status()`; the list is a separate
+    // field. Overwriting one with the other would make `status.monitors.total`
+    // undefined — and the page would print "undefined 个监控" instead of zero.
+    writeJson(response, 200, {
+      ...deps.automation.status(),
+      monitorList: deps.automation.monitors(),
+      reviews: deps.automation.reviews(),
+      loadErrors: deps.automation.loadErrors(),
+      recentTasks: deps.automation.tasks(40),
+    })
+    return
+  }
+
+  if (pathname === '/api/ai-debate/automation/monitors' && method === 'GET') {
+    writeJson(response, 200, { monitors: deps.automation.monitors() })
+    return
+  }
+
+  if (pathname === '/api/ai-debate/automation/monitors' && method === 'POST') {
+    const body = await readJsonBody(request)
+    if (body === undefined) {
+      writeJson(response, 400, { error: '请求体不是合法 JSON。' })
+      return
+    }
+    const url = typeof body.url === 'string' ? body.url.trim() : ''
+    if (url === '') {
+      writeJson(response, 400, { error: '缺少帖子链接。' })
+      return
+    }
+    try {
+      const monitor = deps.automation.createMonitor({
+        name: typeof body.name === 'string' ? body.name : '',
+        url,
+        ...(typeof body.intervalSec === 'number' ? { intervalSec: body.intervalSec } : {}),
+        ...(typeof body.accountLabel === 'string' ? { accountLabel: body.accountLabel } : {}),
+      })
+      deps.audit.write('monitor.created', { id: monitor.id, url })
+      writeJson(response, 200, { ok: true, monitor })
+    } catch (error) {
+      writeJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+    return
+  }
+
+  const monitorMatch = /^\/api\/ai-debate\/automation\/monitors\/([^/]+)(?:\/(check|pause|resume))?$/.exec(pathname)
+  if (monitorMatch !== null) {
+    const id = decodeURIComponent(monitorMatch[1] as string)
+    const action = monitorMatch[2]
+    if (method === 'PATCH' || method === 'POST') {
+      const body = await readJsonBody(request)
+      if (body === undefined) {
+        writeJson(response, 400, { error: '请求体不是合法 JSON。' })
+        return
+      }
+      if (action === 'check') {
+        const outcome = deps.automation.checkNow(id)
+        writeJson(response, outcome.ok ? 200 : 404, outcome)
+        return
+      }
+      if (action === 'pause' || action === 'resume') {
+        const updated = deps.automation.updateMonitor(id, { enabled: action === 'resume' })
+        deps.audit.write('monitor.toggled', { id, enabled: action === 'resume' })
+        writeJson(response, updated === undefined ? 404 : 200, updated === undefined ? { error: '监控目标不存在。' } : { ok: true })
+        return
+      }
+      const patch: { name?: string; intervalSec?: number; enabled?: boolean; accountLabel?: string } = {}
+      if (typeof body.name === 'string') patch.name = body.name
+      if (typeof body.intervalSec === 'number') patch.intervalSec = body.intervalSec
+      if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
+      if (typeof body.accountLabel === 'string') patch.accountLabel = body.accountLabel
+      const updated = deps.automation.updateMonitor(id, patch)
+      if (updated === undefined) {
+        writeJson(response, 404, { error: '监控目标不存在。' })
+        return
+      }
+      deps.audit.write('monitor.updated', { id })
+      writeJson(response, 200, { ok: true, monitor: updated })
+      return
+    }
+    if (method === 'DELETE') {
+      const removed = deps.automation.removeMonitor(id)
+      deps.audit.write('monitor.removed', { id, removed })
+      writeJson(response, removed ? 200 : 404, removed ? { ok: true } : { error: '监控目标不存在。' })
+      return
+    }
+    writeJson(response, 405, { error: 'method not allowed' })
+    return
+  }
+
+  if (pathname === '/api/ai-debate/automation/tasks' && method === 'GET') {
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get('limit') ?? 100) || 100))
+    writeJson(response, 200, { tasks: deps.automation.tasks(limit) })
+    return
+  }
+
+  if (pathname === '/api/ai-debate/automation/pause' && method === 'POST') {
+    deps.automation.pauseAll()
+    deps.audit.write('automation.paused', { by: session.username })
+    writeJson(response, 200, { ok: true, paused: true })
+    return
+  }
+
+  if (pathname === '/api/ai-debate/automation/resume' && method === 'POST') {
+    deps.automation.resumeAll()
+    deps.audit.write('automation.resumed', { by: session.username })
+    writeJson(response, 200, { ok: true, paused: false })
+    return
+  }
+
+  const taskCancel = /^\/api\/ai-debate\/automation\/tasks\/([^/]+)\/cancel$/.exec(pathname)
+  if (taskCancel !== null && method === 'POST') {
+    const ok = deps.automation.cancelTask(decodeURIComponent(taskCancel[1] as string))
+    writeJson(response, ok ? 200 : 404, ok ? { ok: true } : { error: '任务不存在或已结束。' })
+    return
+  }
+
   if (pathname === '/api/ai-debate/system/status' && method === 'GET') {
     writeJson(response, 200, {
       ...deps.info(),

@@ -1,6 +1,6 @@
 {
   "name": "ai-debate",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "private": true,
   "description": "AI Debate — standalone discussion analysis, persona-driven reply drafting and human-approved publishing workbench.",
   "license": "AGPL-3.0-only",
@@ -21,7 +21,7 @@
     "bundle": "node scripts/bundle-server.mjs",
     "package:windows": "node packaging/windows/build.mjs",
     "package:linux": "node packaging/linux/build.mjs",
-    "test": "npm run test:core && npm run test:server && npm run test:web && npm run acceptance",
+    "test": "npm run test:core && npm run test:server && npm run test:web && npm run acceptance && npm run test:automation && npm run test:recovery",
     "test:core": "node --experimental-transform-types --test --test-concurrency=4 \"packages/core/test/**/*.test.ts\"",
     "start": "node --experimental-transform-types packages/server/src/cli.ts serve",
     "smoke": "node --experimental-transform-types test/acceptance/standalone.ts",
@@ -32,7 +32,11 @@
     "pretest:core": "node scripts/build-core.mjs",
     "pretest:server": "node scripts/build-core.mjs && node scripts/build-web.mjs && node scripts/bundle-server.mjs",
     "pretest:web": "node scripts/build-web.mjs",
-    "preacceptance": "node scripts/build-core.mjs && node scripts/build-web.mjs && node scripts/bundle-server.mjs"
+    "preacceptance": "node scripts/build-core.mjs && node scripts/build-web.mjs && node scripts/bundle-server.mjs",
+    "test:automation": "node --experimental-transform-types test/acceptance/automation.ts",
+    "test:recovery": "node --experimental-transform-types test/acceptance/recovery.ts",
+    "pretest:automation": "node scripts/build-core.mjs",
+    "pretest:recovery": "node scripts/build-core.mjs && node scripts/bundle-server.mjs"
   },
   "devDependencies": {
     "@types/node": "~22.10.2",

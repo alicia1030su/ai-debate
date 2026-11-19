@@ -67,10 +67,27 @@ mkdir -p "${WORK}/pkg"
 tar -xzf "${ARCHIVE}" -C "${WORK}/pkg"
 ( cd "${WORK}/pkg/ai-debate-linux-x64" && sha256sum -c SHA256SUMS --quiet ) && pass "安装包 SHA256 校验" || fail "安装包 SHA256 校验"
 
+SYSTEMD=0
 if [[ "$(id -u)" -eq 0 ]]; then
-  ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" --data-dir "${WORK}/data" --prefix "${WORK}/opt" --no-start ) \
-    && pass "安装脚本执行" || fail "安装脚本执行"
-  BIN="${WORK}/opt/bin/ai-debate"
+  if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+    SYSTEMD=1
+    echo "== 检测到运行中的 systemd：走真实安装（含开机自启）=="
+    ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" --data-dir "${WORK}/data" --prefix "${WORK}/opt" ) \
+      && pass "安装脚本执行（systemd 模式）" || fail "安装脚本执行"
+    BIN="${WORK}/opt/bin/ai-debate"
+    # The real proof: systemd says the unit is active, not that we spawned a process.
+    for _ in $(seq 1 40); do
+      if systemctl is-active --quiet ai-debate; then break; fi
+      sleep 0.5
+    done
+    systemctl is-active --quiet ai-debate && pass "systemctl 报告服务 active" || fail "systemctl 报告服务 active"
+    systemctl is-enabled --quiet ai-debate && pass "systemd 已 enable（开机自启）" || fail "systemd 已 enable"
+  else
+    echo "== 没有运行中的 systemd：退化为手工启动 =="
+    ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" --data-dir "${WORK}/data" --prefix "${WORK}/opt" --no-start ) \
+      && pass "安装脚本执行" || fail "安装脚本执行"
+    BIN="${WORK}/opt/bin/ai-debate"
+  fi
 else
   echo "非 root：跳过 install.sh，直接使用解压出的二进制"
   BIN="${WORK}/pkg/ai-debate-linux-x64/bin/ai-debate"
@@ -79,8 +96,14 @@ fi
 [[ -x "${BIN}" ]] && pass "程序可执行" || fail "程序缺失"
 
 echo "== 启动已安装的程序 =="
-AI_DEBATE_HOME="${WORK}/data" "${BIN}" serve --port "${PORT}" > "${WORK}/service.log" 2>&1 &
-SERVICE_PID=$!
+if [[ "${SYSTEMD}" -eq 1 ]]; then
+  # systemd owns the process; the config file written by install.sh points at the
+  # same data directory, so this exercises the real unit rather than a copy of it.
+  SERVICE_PID=""
+else
+  AI_DEBATE_HOME="${WORK}/data" "${BIN}" serve --port "${PORT}" > "${WORK}/service.log" 2>&1 &
+  SERVICE_PID=$!
+fi
 
 ready=0
 for _ in $(seq 1 60); do
@@ -124,9 +147,14 @@ api POST /api/ai-debate/action "{\"action\":\"manual-edit\",\"sessionId\":\"${SE
 api POST /api/ai-debate/action "{\"action\":\"manual-approve\",\"sessionId\":\"${SESSION}\",\"candidateId\":\"${CANDIDATE}\",\"approvedText\":\"你举的例子只能说明有人这样，不能代表所有人。\"}" | grep -q '"ok":true' && pass "人工批准" || fail "人工批准"
 
 echo "== 重启，验证持久化 =="
-kill "${SERVICE_PID}"; wait "${SERVICE_PID}" 2>/dev/null || true
-AI_DEBATE_HOME="${WORK}/data" "${BIN}" serve --port "${PORT}" >> "${WORK}/service.log" 2>&1 &
-SERVICE_PID=$!
+if [[ "${SYSTEMD}" -eq 1 ]]; then
+  systemctl restart ai-debate
+  sleep 1
+else
+  kill "${SERVICE_PID}"; wait "${SERVICE_PID}" 2>/dev/null || true
+  AI_DEBATE_HOME="${WORK}/data" "${BIN}" serve --port "${PORT}" >> "${WORK}/service.log" 2>&1 &
+  SERVICE_PID=$!
+fi
 ready=0
 for _ in $(seq 1 60); do
   if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then ready=1; break; fi
@@ -136,6 +164,45 @@ done
 
 api GET /api/ai-debate/settings | grep -q '"status":"ready"' && pass "重启后会话仍有效" || fail "重启后会话"
 grep -q "${SESSION}" "${WORK}/data/state.json" && pass "重启后会话数据仍在" || fail "重启后数据"
+
+if [[ "${SYSTEMD}" -eq 1 ]]; then
+  echo "== 强制 kill -9，验证 systemd 自动拉起 =="
+  MAIN_PID=$(systemctl show -p MainPID --value ai-debate)
+  [[ -n "${MAIN_PID}" && "${MAIN_PID}" != "0" ]] && pass "读到服务主进程 PID" || fail "读到服务主进程 PID"
+  kill -9 "${MAIN_PID}" 2>/dev/null || true
+  restarted=0
+  for _ in $(seq 1 40); do
+    NEW_PID=$(systemctl show -p MainPID --value ai-debate)
+    if [[ -n "${NEW_PID}" && "${NEW_PID}" != "0" && "${NEW_PID}" != "${MAIN_PID}" ]] && systemctl is-active --quiet ai-debate; then
+      restarted=1; break
+    fi
+    sleep 0.5
+  done
+  [[ "${restarted}" -eq 1 ]] && pass "进程被 kill -9 后由 systemd 自动拉起" || fail "进程被 kill -9 后由 systemd 自动拉起"
+  for _ in $(seq 1 40); do
+    if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+  done
+  curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1 && pass "拉起后再次可服务" || fail "拉起后再次可服务"
+
+  echo "== 卸载（保留数据）=="
+  ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./uninstall.sh ) >/dev/null 2>&1 || true
+  systemctl is-active --quiet ai-debate && fail "卸载后服务仍活动" || pass "卸载后服务已停止"
+  [[ -f "${WORK}/data/state.json" ]] && pass "卸载保留用户数据" || fail "卸载保留用户数据"
+
+  echo "== 重新安装并启动，验证升级不丢数据 =="
+  ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" --data-dir "${WORK}/data" --prefix "${WORK}/opt" ) >/dev/null 2>&1
+  for _ in $(seq 1 40); do
+    if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+  done
+  grep -q "${SESSION}" "${WORK}/data/state.json" && pass "重新安装后历史数据仍在" || fail "重新安装后历史数据仍在"
+  if [[ -f "${WORK}/data/monitors.json" ]]; then
+    pass "监控配置文件随数据目录保留"
+  else
+    echo "  （本次运行未创建监控目标，跳过 monitors.json 检查）"
+  fi
+fi
 
 echo
 echo "${PASS}/$((PASS + FAIL)) 项通过"

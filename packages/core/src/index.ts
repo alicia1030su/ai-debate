@@ -35,6 +35,9 @@ import {
   type Runtime,
 } from './runtime.js'
 import { buildTools } from './tools.js'
+import { probeThread } from './probe.js'
+import type { ApplyHooks, DebateProductApi, SessionSummary } from './product-api.js'
+import { ownerIdentity, resolveThreadRef } from './runtime.js'
 import { chooseModelSource } from './model-source.js'
 import { hostLlmOf, probeHostLlm } from './host-llm.js'
 import { EgressGuard, EgressLog, egressPolicyOf } from './net-audit.js'
@@ -715,7 +718,7 @@ function applyOverlay(
  */
 const compareRuns = new Map<string, AbortController>()
 
-export function apply(ctx: PluginContext, config?: unknown): () => void {
+export function apply(ctx: PluginContext, config?: unknown, hooks?: ApplyHooks): () => void {
   const log = loggerOf(ctx, 'ai-debate')
 
   /**
@@ -2738,6 +2741,95 @@ export function apply(ctx: PluginContext, config?: unknown): () => void {
         for (const off of offs) off()
       }
     })
+  }
+
+  /**
+   * The background worker's surface (v0.2.0).
+   *
+   * Every method delegates to the same function the interactive routes call, so a
+   * monitor cannot get a different answer than a click would. There is deliberately
+   * no publish method: auto-posting is out of scope, and the way to keep that true
+   * is to not expose the capability.
+   */
+  if (hooks?.onReady !== undefined) {
+    const summarise = (session: StoredSession): SessionSummary => ({
+      id: session.id,
+      platform: session.platform,
+      threadId: session.threadId,
+      threadTitle: session.threadTitle,
+      threadUrl: session.threadUrl,
+      state: session.state,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      ...(session.selectedTargetPostId === undefined ? {} : { targetPostId: session.selectedTargetPostId }),
+      candidates: session.candidates.map((candidate) => ({
+        replyId: candidate.replyId,
+        text: candidate.text,
+        targetPostId: candidate.targetPostId,
+        candidateVersion: candidate.candidateVersion,
+        createdAt: candidate.createdAt,
+      })),
+    })
+
+    const productApi: DebateProductApi = {
+      resolveUrl: (url) => {
+        const ref = resolveThreadRef(runtimeView, url)
+        return { platform: ref.platform, threadId: ref.threadId, url: ref.url }
+      },
+      probe: async (input) => probeThread(runtimeView, input),
+      analyze: async (input) => {
+        const output = await runAnalysis(runtimeView, {
+          url: input.url,
+          ...(input.postId === undefined ? {} : { postId: input.postId }),
+          ...(input.ownerInstruction === undefined ? {} : { ownerInstruction: input.ownerInstruction }),
+          ...(input.signal === undefined ? {} : { signal: input.signal }),
+        })
+        return { sessionId: output.sessionId }
+      },
+      generate: async (input) => {
+        const output = await runGeneration(runtimeView, {
+          sessionId: input.sessionId,
+          ...(input.targetPostId === undefined ? {} : { targetPostId: input.targetPostId }),
+          ...(input.ownerInstruction === undefined ? {} : { ownerInstruction: input.ownerInstruction }),
+          ...(input.signal === undefined ? {} : { signal: input.signal }),
+        })
+        const produced = output.outcome === 'valid_draft' || output.outcome === 'invalid_draft'
+        return {
+          ok: output.outcome === 'valid_draft',
+          outcome: output.outcome,
+          ...(produced && output.candidateId !== undefined ? { candidateId: output.candidateId } : {}),
+          ...(output.needsInputReason === undefined ? {} : { message: output.needsInputReason }),
+          ...(output.violations === undefined ? {} : { violations: output.violations }),
+        }
+      },
+      session: async (sessionId) => {
+        await runtimeView.store.ready()
+        const session = runtimeView.store.getSession(sessionId)
+        return session === undefined ? undefined : summarise(session)
+      },
+      sessionForThread: async (url) => {
+        await runtimeView.store.ready()
+        let ref: { platform: string; threadId: string }
+        try {
+          ref = resolveThreadRef(runtimeView, url)
+        } catch {
+          return undefined
+        }
+        const sessions = runtimeView.store
+          .snapshot()
+          .sessions.filter((row) => row.platform === ref.platform && row.threadId === ref.threadId)
+          .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+        const newest = sessions[0]
+        return newest === undefined ? undefined : summarise(newest)
+      },
+      ownerIdentity: (platform) => ownerIdentity(effectiveConfig(), platform),
+    }
+
+    try {
+      hooks.onReady(productApi)
+    } catch (error) {
+      log.warn(`后台接口装配失败：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   // ---- credential subscription ---------------------------------------------

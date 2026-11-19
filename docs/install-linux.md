@@ -43,6 +43,10 @@ sudo ./install.sh --no-start                # 只安装不启动
 
 如果服务器没有图形界面，端口转发是最安全的首次配置方式；不要在配置完成前就把端口暴露到公网。
 
+## 3.5 自动挂机
+
+安装完成后，在「自动挂机」页添加要监控的帖子。后台由 systemd 托管，SSH 退出、注销、浏览器关闭都不影响；`kill -9` 会被 `Restart=always` 拉起；服务器重启后自动恢复。
+
 ## 4. 服务管理
 
 ```bash
@@ -62,7 +66,7 @@ journalctl -u ai-debate -f
 | 路径 | 内容 |
 |------|------|
 | `/opt/ai-debate/bin/ai-debate` | 单文件程序（内含 Node 运行时与网页资源） |
-| `/var/lib/ai-debate/` | 数据：配置、台账、凭据、日志、备份 |
+| `/var/lib/ai-debate/` | 数据：配置、台账、凭据、日志、备份、监控目标（`monitors.json`）与任务台账（`auto-tasks.json`） |
 | `/etc/ai-debate/ai-debate.env` | 监听地址、端口、数据目录 |
 | `/etc/systemd/system/ai-debate.service` | systemd 单元 |
 

@@ -483,3 +483,56 @@ test('auth gate shows the first-run form when the service is uninitialised', asy
   assert.ok(title && title.textContent.includes('初始化'), `标题应含「初始化」，实际：${title && title.textContent}`)
   assert.equal(doc.querySelectorAll('.shell-input').length, 3, '初始化表单应有用户名、密码、确认密码三个输入框')
 })
+
+test('自动挂机页：切换视图后渲染真实统计，且不丢原有 11 个页签', async (t) => {
+  const { dom, document: doc, calls, logs } = await bootConsole()
+  t.after(() => dom.window.close())
+
+  await waitFor(() => doc.querySelector('.dsd-card') !== null, '配置卡片应先渲染')
+
+  const navs = [...doc.querySelectorAll('.shell-nav')]
+  assert.equal(navs.length, 2, '顶栏应有两个主视图入口')
+  const autoNav = navs.find((node) => node.textContent === '自动挂机')
+  assert.ok(autoNav, '应有「自动挂机」入口')
+
+  autoNav.click()
+
+  await waitFor(() => doc.querySelector('.auto-panel') !== null, '自动挂机面板应渲染')
+  // The card is unmounted on purpose: a hidden React tree would keep polling seven
+  // endpoints from a tab nobody is looking at.
+  assert.equal(doc.querySelector('.dsd-card'), null, '切走后配置卡片应被卸载，而不是隐藏')
+  assert.ok(
+    calls.some((url) => url.includes('/automation/status')),
+    `应读取真实状态，实际请求：${JSON.stringify(calls.slice(-6))}`,
+  )
+
+  // The stats are filled from an async read, so wait for them rather than reading
+  // the container the moment it exists.
+  await waitFor(() => doc.querySelectorAll('.auto-stat').length === 5, '统计卡应按真实数据渲染')
+
+  // Five headline numbers, all from the payload — the double returns `{}`, so they
+  // must render as "—" or 0 rather than inventing values.
+  const stats = [...doc.querySelectorAll('.auto-stat')]
+  assert.equal(stats.length, 5, `应有 5 个统计卡，实际 ${stats.length}`)
+  for (const stat of stats) {
+    assert.ok(stat.querySelector('.auto-stat-label')?.textContent, '每个统计卡都要有标签')
+    assert.ok(stat.querySelector('.auto-stat-value')?.textContent, '每个统计卡都要有值')
+  }
+
+  // Empty states are stated, not left blank.
+  assert.match(
+    doc.querySelector('.auto-monitors')?.textContent ?? '',
+    /还没有监控目标/,
+    '没有监控时应给出明确空状态',
+  )
+
+  // Switching back restores the inherited card with its eleven tabs.
+  const configNav = navs.find((node) => node.textContent === '配置')
+  assert.ok(configNav)
+  configNav.click()
+  await waitFor(() => doc.querySelector('.dsd-card') !== null, '切回后配置卡片应重新渲染')
+  assert.equal(doc.querySelectorAll('.dsd-tab').length, EXPECTED_TABS, '原有 11 个页签必须完整保留')
+
+  const renderErrors = logs.filter((line) => line.includes('RENDER-ERROR'))
+  assert.deepEqual(renderErrors, [], '不应出现渲染错误')
+})

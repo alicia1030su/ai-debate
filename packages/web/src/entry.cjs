@@ -24,6 +24,7 @@ const React = require('react')
 const ReactDOMClient = require('react-dom/client')
 const { createSnapshotStore } = require('./snapshot-store.cjs')
 const factory = require('./legacy-body.cjs')
+const { createAutomationPanel } = require('./automation-panel.cjs')
 
 /** Route family owned by the standalone service. */
 const API_BASE = '/api/ai-debate'
@@ -334,7 +335,20 @@ const nodes = {
   authHost: null,
   appRoot: null,
   cardRoot: null,
+  navConfig: null,
+  navAuto: null,
+  automation: null,
 }
+
+/**
+ * Which main view is on screen.
+ *
+ * Two views, not a tab inside the inherited card: the 11 tabs are the plugin's
+ * configuration and must keep their order and behaviour, while this new page is the
+ * background engine's console. Putting it in the card would mean editing generated
+ * code for a feature that has nothing to do with configuration.
+ */
+let mainView = 'config'
 
 /** Which view is on screen: `'boot' | 'error' | 'auth' | 'main'`. */
 let currentView = 'boot'
@@ -609,18 +623,67 @@ function enterMain(state) {
     nodes.barUser.hidden = state.username === ''
   }
 
-  if (nodes.cardRoot === null) {
-    nodes.cardRoot = ReactDOMClient.createRoot(nodes.appRoot)
-  }
-  nodes.cardRoot.render(React.createElement(plugin.DebateCard))
+  mainView = 'config'
+  renderMainView()
 
   sessionExpiryHandled = false
   startStatusPolling()
 }
 
+/**
+ * Paint whichever main view is selected.
+ *
+ * The contact form and the automation console are separate trees: the inherited
+ * React card is unmounted when the console is shown so it cannot keep polling its
+ * seven endpoints from a hidden tab.
+ */
+function renderMainView() {
+  if (nodes.navConfig !== null) nodes.navConfig.className = mainView === 'config' ? 'shell-nav shell-nav-on' : 'shell-nav'
+  if (nodes.navAuto !== null) nodes.navAuto.className = mainView === 'auto' ? 'shell-nav shell-nav-on' : 'shell-nav'
+
+  if (mainView === 'config') {
+    if (nodes.automation !== null) {
+      nodes.automation.stop()
+      nodes.automation = null
+    }
+    clear(nodes.appRoot)
+    if (nodes.cardRoot === null) {
+      nodes.cardRoot = ReactDOMClient.createRoot(nodes.appRoot)
+    }
+    nodes.cardRoot.render(React.createElement(plugin.DebateCard))
+    return
+  }
+
+  // Switching away from the card: unmount it so its polling stops, then hand the
+  // node to the plain-DOM panel.
+  if (nodes.cardRoot !== null) {
+    nodes.cardRoot.unmount()
+    nodes.cardRoot = null
+  }
+  clear(nodes.appRoot)
+  if (nodes.automation === null) {
+    nodes.automation = createAutomationPanel({
+      request: (path, options) =>
+        requestJson(path, options).then((result) => ({ ...result, body: result.data })),
+    })
+  }
+  nodes.appRoot.appendChild(nodes.automation.node)
+  nodes.automation.start()
+}
+
+function switchMainView(next) {
+  if (currentView !== 'main' || mainView === next) return
+  mainView = next
+  renderMainView()
+}
+
 /** Tear the card down and return to the login form. */
 function leaveMain(message) {
   stopStatusPolling()
+  if (nodes.automation !== null) {
+    nodes.automation.stop()
+    nodes.automation = null
+  }
   if (nodes.cardRoot !== null) {
     nodes.cardRoot.unmount()
     nodes.cardRoot = null
@@ -752,8 +815,16 @@ function resolveNodes() {
   )
   const logout = el('button', { class: 'shell-btn shell-btn-ghost', type: 'button' }, ['退出'])
 
+  const navConfig = el('button', { class: 'shell-nav shell-nav-on', type: 'button' }, ['配置'])
+  const navAuto = el('button', { class: 'shell-nav', type: 'button' }, ['自动挂机'])
+  navConfig.addEventListener('click', () => switchMainView('config'))
+  navAuto.addEventListener('click', () => switchMainView('auto'))
+
   const bar = el('header', { class: 'shell-bar', hidden: 'hidden' }, [
-    el('div', { class: 'shell-bar-left' }, [el('span', { class: 'shell-brand' }, ['AI Debate'])]),
+    el('div', { class: 'shell-bar-left' }, [
+      el('span', { class: 'shell-brand' }, ['AI Debate']),
+      el('nav', { class: 'shell-nav-group', 'aria-label': '主视图' }, [navConfig, navAuto]),
+    ]),
     el('div', { class: 'shell-bar-right' }, [barUser, barStatus, systemLink, logout]),
   ])
 
@@ -765,6 +836,8 @@ function resolveNodes() {
   nodes.barStatusText = statusText
   nodes.barUser = barUser
   nodes.logout = logout
+  nodes.navConfig = navConfig
+  nodes.navAuto = navAuto
 
   logout.addEventListener('click', () => {
     void doLogout()

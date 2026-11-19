@@ -243,6 +243,7 @@ const HELP = `AI Debate — 独立讨论分析与回复工作台
 用法：
   ai-debate                     启动（若未运行）并打开浏览器
   ai-debate serve               前台运行服务（systemd 使用这个）
+  ai-debate supervise           守护模式：serve 异常退出后自动拉起
   ai-debate status              查看服务状态
   ai-debate stop                停止后台服务
   ai-debate restart             重启后台服务
@@ -276,6 +277,16 @@ export async function runCli(argv: readonly string[]): Promise<void> {
   }
   if (parsed.flags.help === true || parsed.command === 'help') {
     process.stdout.write(HELP)
+    return
+  }
+
+  if (parsed.command === 'supervise') {
+    await supervise({
+      host: hostFlag ?? process.env.AI_DEBATE_HOST ?? DEFAULT_HOST,
+      port: Number.isFinite(portFlag) && portFlag > 0 ? portFlag : Number(process.env.AI_DEBATE_PORT ?? DEFAULT_PORT),
+      dataDir,
+      logLevel: (flagString(parsed.flags, 'log-level') ?? process.env.AI_DEBATE_LOG_LEVEL ?? 'info') as LogLevel,
+    })
     return
   }
 
@@ -380,7 +391,10 @@ async function launch(options: { dataDir: string; portFlag: number; hostFlag: st
 
   process.stdout.write(`正在启动 AI Debate（${host}:${port}）…\n`)
   const packaged = await isSea()
-  const args = packaged ? ['serve'] : [process.argv[1] ?? '', 'serve']
+  // The foreground entry is the *supervisor*, not the service: a crashed service
+  // must come back without the owner noticing, and on Windows there is no systemd
+  // to do that. The supervisor exits when the service stops cleanly.
+  const args = packaged ? ['supervise'] : [process.argv[1] ?? '', 'supervise']
   if (options.portFlag > 0) args.push('--port', String(options.portFlag))
   if (options.hostFlag !== undefined) args.push('--host', options.hostFlag)
   args.push('--data-dir', options.dataDir)
@@ -460,6 +474,65 @@ export function logSizeOf(dataDir: string): number {
     return statSync(layoutOf(dataDir).logFile).size
   } catch {
     return 0
+  }
+}
+
+/**
+ * Keep the service running.
+ *
+ * Windows has no systemd, so "the process died" would otherwise mean "the product
+ * silently stopped working" — the exact failure a background engine must not have.
+ * This loop restarts it after an abnormal exit with a capped backoff, and stops when
+ * the service exits cleanly (which is what the `stop` action does) so that an
+ * intentional shutdown is not fought by the supervisor.
+ */
+async function supervise(options: { host: string; port: number; dataDir: string; logLevel: LogLevel }): Promise<void> {
+  const packaged = await isSea()
+  const layout = layoutOf(options.dataDir)
+  let stopping = false
+  let attempt = 0
+
+  const stop = (): void => {
+    stopping = true
+    if (child !== undefined && child.exitCode === null) child.kill()
+  }
+  process.on('SIGTERM', stop)
+  process.on('SIGINT', stop)
+
+  let child: ReturnType<typeof spawn> | undefined
+  while (!stopping) {
+    const args = packaged ? ['serve'] : [process.argv[1] ?? '', 'serve']
+    args.push('--host', options.host, '--port', String(options.port), '--data-dir', options.dataDir, '--log-level', options.logLevel)
+    // `ignore`, not `inherit`: the supervisor is spawned detached by the launcher,
+    // where inheriting a console that no longer exists would fail on Windows. The
+    // service writes its own log file, which is what `ai-debate logs` reads.
+    child = spawn(process.execPath, args, {
+      stdio: 'ignore',
+      windowsHide: true,
+      env: { ...process.env, AI_DEBATE_VERSION: version() },
+    })
+
+    const code: number = await new Promise((resolve) => {
+      child!.once('exit', (value) => resolve(value ?? 1))
+    })
+    if (stopping) break
+    // 0 = asked to stop; 75 = asked to restart; anything else is a crash.
+    if (code === 0) break
+    if (code === 75) {
+      attempt = 0
+      continue
+    }
+    attempt += 1
+    const delay = Math.min(30_000, 1000 * 2 ** Math.min(5, attempt - 1))
+    process.stderr.write(`AI Debate 服务异常退出（码 ${code}），${Math.round(delay / 1000)} 秒后重启（第 ${attempt} 次）\n`)
+    await new Promise((resolve) => setTimeout(resolve, delay))
+  }
+
+  try {
+    const { unlinkSync } = await import('node:fs')
+    unlinkSync(join(layout.runDir, 'supervisor.pid'))
+  } catch {
+    // Already gone.
   }
 }
 

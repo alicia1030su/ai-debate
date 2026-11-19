@@ -20,6 +20,18 @@ certutil -hashfile AI-Debate-windows-x64.exe SHA256   # Windows
 - **Linux** `ai-debate-linux-x64.tgz` — `sudo ./install.sh` installs a systemd service on
   `127.0.0.1:17860`, restarts it on failure, and keeps data in `/var/lib/ai-debate`.
 
+## 后台挂机
+
+配置一次之后，它可以不看屏幕地工作：
+
+1. 在「自动挂机」页添加要盯的帖子（可多个），设一个轮询间隔。
+2. 后台按间隔读取，发现新回复后自动分析上下文、继承主人立场、生成候选、过安全检查。
+3. 结果进入「待审核」，你在审批页确认后才手动发表。**后台不会自发任何内容。**
+
+- 首次检查只建立基线，不分析历史楼层。
+- 中断的任务重启后自动恢复；限流按平台要求等待；认证失效会暂停该目标并写明原因。
+- 详见 `docs/automation-architecture.md`。
+
 See `docs/install-windows.md`, `docs/install-linux.md`, `docs/security.md`, `docs/migration.md`,
 `docs/architecture.md`.
 

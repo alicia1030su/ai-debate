@@ -39,6 +39,10 @@ export interface Layout {
    */
   readonly instanceFile: string
   readonly controlFile: string
+  /** Monitoring targets and their cursors (v0.2.0). */
+  readonly monitorsFile: string
+  /** Background task ledger for the monitoring pipeline (v0.2.0). */
+  readonly autoTasksFile: string
 }
 
 /** The platform default data directory. */
@@ -87,6 +91,8 @@ export function layoutOf(dataDir: string): Layout {
     pidFile: join(dir, 'run', 'server.pid'),
     runFile: join(dir, 'run', 'server.json'),
     instanceFile: join(dir, 'run', 'instance.lock'),
+    monitorsFile: join(dir, 'monitors.json'),
+    autoTasksFile: join(dir, 'auto-tasks.json'),
     controlFile: join(dir, 'run', 'control.json'),
   }
 }

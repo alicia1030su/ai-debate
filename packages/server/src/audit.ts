@@ -28,6 +28,12 @@ export type AuditEvent =
   | 'legacy.imported'
   | 'autostart.changed'
   | 'settings.write_failed'
+  | 'monitor.created'
+  | 'monitor.updated'
+  | 'monitor.removed'
+  | 'monitor.toggled'
+  | 'automation.paused'
+  | 'automation.resumed'
 
 export interface Auditor {
   write(event: AuditEvent, detail?: Record<string, unknown>): void

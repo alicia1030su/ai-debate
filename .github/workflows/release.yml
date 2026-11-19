@@ -52,6 +52,8 @@ jobs:
       - run: node --experimental-transform-types --test --test-concurrency=2 "packages/server/test/**/*.test.ts"
       - run: node --test packages/web/test/*.test.mjs
       - run: node --experimental-transform-types test/acceptance/standalone.ts
+      - run: node --experimental-transform-types test/acceptance/automation.ts
+      - run: node --experimental-transform-types test/acceptance/recovery.ts
       - run: node scripts/assert-no-dsh.mjs
 
   windows:
