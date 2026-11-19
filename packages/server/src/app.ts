@@ -368,7 +368,10 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
   if (options.scheduleBackups !== false) {
     const schedule = (): void => {
       try {
-        queue.enqueue({ type: 'backup.create', key: `auto-backup-${new Date().toISOString().slice(0, 10)}` })
+        // `payload.auto` is what makes this one eligible for rotation. The key alone
+        // could not be trusted for that: a user may queue their own backup with any
+        // key they like, and a manual backup must never be pruned automatically.
+        queue.enqueue({ type: 'backup.create', key: `auto-backup-${new Date().toISOString().slice(0, 10)}`, payload: { auto: true } })
       } catch (error) {
         log.warn(`自动备份排队失败：${error instanceof Error ? error.message : String(error)}`)
       }
@@ -521,7 +524,12 @@ interface JobDeps {
 function registerJobHandlers(deps: JobDeps): void {
   const { queue, layout, config, credentials, log, version, audit } = deps
 
-  queue.register('backup.create', async ({ note }) => {
+  queue.register('backup.create', async ({ payload, note }) => {
+    // A scheduled backup and an owner-requested one are the same file, but only the
+    // scheduled ones are subject to rotation. Without this distinction the auto
+    // backup taken at 03:00 would delete the copy the owner took before restoring a
+    // bad config — the one backup in the set they actually need.
+    const auto = payload.auto === true
     const dir = join(layout.backupsDir, stamp())
     mkdirSync(dir, { recursive: true })
     const files = ['config.json', 'state.json', 'jobs.json']
@@ -535,21 +543,38 @@ function registerJobHandlers(deps: JobDeps): void {
     }
     writeFileSync(
       join(dir, 'manifest.json'),
-      `${JSON.stringify({ version, createdAt: new Date().toISOString(), files: entries, note: '不含凭据、口令与会话' }, null, 2)}\n`,
+      `${JSON.stringify(
+        { version, createdAt: new Date().toISOString(), auto, files: entries, note: '不含凭据、口令与会话' },
+        null,
+        2,
+      )}\n`,
       'utf8',
     )
-    note('info', `备份完成：${dir}（${Object.keys(entries).length} 个文件）`)
-    audit.write('backup.created', { dir, files: Object.keys(entries).length })
-    pruneAutoBackups()
+    note('info', `备份完成：${dir}（${Object.keys(entries).length} 个文件${auto ? '，自动备份' : ''}）`)
+    audit.write('backup.created', { dir, files: Object.keys(entries).length, auto })
+    if (auto) pruneAutoBackups()
   })
 
+  /** Keep the newest N *scheduled* backups; manual ones are never deleted. */
   function pruneAutoBackups(): void {
     try {
-      const dirs = readdirSync(layout.backupsDir)
-        .filter((name) => /^\d{4}-\d{2}-\d{2}T/.test(name))
-        .sort()
-      for (const name of dirs.slice(0, Math.max(0, dirs.length - KEEP_AUTO_BACKUPS))) {
+      const auto: string[] = []
+      for (const name of readdirSync(layout.backupsDir)) {
+        if (!/^\d{4}-\d{2}-\d{2}T/.test(name)) continue
+        try {
+          const manifest = JSON.parse(readFileSync(join(layout.backupsDir, name, 'manifest.json'), 'utf8')) as {
+            auto?: unknown
+          }
+          if (manifest.auto === true) auto.push(name)
+        } catch {
+          // A directory without a readable manifest cannot be proven automatic, so
+          // it is left alone: deleting the wrong backup is unrecoverable.
+        }
+      }
+      auto.sort()
+      for (const name of auto.slice(0, Math.max(0, auto.length - KEEP_AUTO_BACKUPS))) {
         rmSync(join(layout.backupsDir, name), { recursive: true, force: true })
+        log.info(`自动备份超过 ${KEEP_AUTO_BACKUPS} 份，已删除最旧的一份：${name}`)
       }
     } catch {
       // Pruning is housekeeping; failing it only means the disk keeps more copies.

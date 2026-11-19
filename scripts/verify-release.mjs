@@ -23,7 +23,7 @@ function check(name, ok, detail) {
 const exe = join(root, 'dist', 'AI-Debate-windows-x64.exe')
 const tgz = join(root, 'dist', 'ai-debate-linux-x64.tgz')
 
-check('版本号是 0.1.0', version === '0.1.0', version)
+check('版本号是语义化版本', /^\d+\.\d+\.\d+$/.test(version), version)
 check('LICENSE 存在且是 AGPL', existsSync(join(root, 'LICENSE')) && readFileSync(join(root, 'LICENSE'), 'utf8').includes('GNU AFFERO GENERAL PUBLIC LICENSE'))
 check('NOTICE 记录了来源', existsSync(join(root, 'NOTICE')) && readFileSync(join(root, 'NOTICE'), 'utf8').includes('dsh-ai-debate'))
 
@@ -34,7 +34,7 @@ if (process.platform === 'win32') {
     check('Windows EXE 体积合理（>50MB，含 Node 运行时）', size > 50 * 1024 * 1024, `${(size / 1024 / 1024).toFixed(1)} MB`)
     const run = spawnSync(exe, ['--version'], { encoding: 'utf8', timeout: 30_000 })
     check('Windows EXE 可运行', run.status === 0, (run.stdout ?? '').trim())
-    check('Windows EXE 报出的版本正确', (run.stdout ?? '').includes('0.1.0'))
+    check('Windows EXE 报出的版本与 package.json 一致', (run.stdout ?? '').includes(version), version)
     const sha = createHash('sha256').update(readFileSync(exe)).digest('hex')
     const sidecar = existsSync(`${exe}.sha256`) ? readFileSync(`${exe}.sha256`, 'utf8') : ''
     check('EXE 有配套 SHA256 且一致', sidecar.includes(sha), sha.slice(0, 32))
