@@ -43,10 +43,18 @@ const STATUS_URL = '/system'
 /** Lightweight probe used by the status dot; the diagnostic JSON is too heavy to poll. */
 const HEALTH_URL = API_BASE + '/system/status'
 
-/** Header the service requires on every unsafe request. */
-// The service authenticates writes by SameSite=Strict plus an origin/host match plus
-// a required JSON content type. There is deliberately no CSRF token: one that the
-// server never verifies would be worse than none, because it reads as a control.
+/**
+ * CSRF header name.
+ *
+ * The service does **not** verify this today: it authenticates writes with a
+ * `SameSite=Strict` cookie, an origin/host match and a required JSON content
+ * type, and a token nobody checks would read as a control without being one.
+ *
+ * The shell still sends it whenever the service supplies one (`auth/state` →
+ * `csrf`), and sends the literal `setup` for first-run, so that turning on
+ * server-side verification needs no change here. When the service returns no
+ * token, no header is sent at all — an invented value would be worse than none.
+ */
 const CSRF_HEADER = 'x-ai-debate-csrf'
 /** The value that unlocks first-run setup, before any session exists. */
 const CSRF_SETUP = 'setup'

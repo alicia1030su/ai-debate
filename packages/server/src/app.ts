@@ -119,7 +119,7 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
 
   const registry = new WebServerRegistry()
   const host = createStandaloneHost({
-    trustedHosts: trustedHostsFor(options.host),
+    trustedHosts: options.trustedHosts ?? trustedHostsFor(options.host),
     serverInfo: () => ({
       listen: options.host,
       port: actualPort,

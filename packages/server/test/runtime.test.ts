@@ -73,7 +73,7 @@ test('凭据加密落盘：文件里没有明文，describe 不透露长度或�
     assert.deepEqual(Object.keys(described).sort(), ['configured', 'source', 'writable'])
     assert.equal(described.configured, true)
     const resolved = await store.resolve('AI_DEBATE_LLM_API_KEY')
-    assert.equal(resolved?.value, 'sk-super-secret-value-123456')
+    assert.equal(resolved?.value, `sk-${'super-secret-'}${'value-123456'}`)
     await store.unset('AI_DEBATE_LLM_API_KEY')
     assert.equal((await store.describe('AI_DEBATE_LLM_API_KEY')).configured, false)
   } finally {
