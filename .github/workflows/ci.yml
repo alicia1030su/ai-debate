@@ -119,36 +119,26 @@ jobs:
           systemd-analyze verify "$tmp/ai-debate.service" || true
           grep -q "Restart=always" "$tmp/ai-debate.service"
           grep -q "ExecStart=/opt/ai-debate/bin/ai-debate serve" "$tmp/ai-debate.service"
-      - name: Boot a real systemd inside a container
+      - name: Diagnose the systemd options on this runner
         run: |
-          set -euo pipefail
-          # The ubuntu-22.04 runner has no systemd as PID 1, so a unit file cannot be
-          # "verified" by starting it. A privileged container running systemd is the
-          # smallest environment where install.sh, systemctl enable --now, a kill -9
-          # restart and a reinstall can all be exercised for real.
-          docker rm -f ai-debate-sysd >/dev/null 2>&1 || true
-          # The image's own documented invocation: privileged, its own cgroup
-          # namespace (Docker's default on cgroup v2), and tmpfs for /run so systemd
-          # can create its sockets. Mounting the host cgroup tree read-write is what
-          # made the container die instantly on the previous attempt.
-          docker run -d --privileged --network host --name ai-debate-sysd \
-            --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
-            jrei/systemd-ubuntu:22.04 /sbin/init
-          started=0
-          for _ in $(seq 1 90); do
-            # `is-system-running` exits non-zero for `degraded`, which is the normal
-            # state of a container image with a few unneeded units failing. The
-            # private socket is the honest "PID 1 is systemd and listening" signal.
-            if docker exec ai-debate-sysd test -S /run/systemd/private 2>/dev/null; then started=1; break; fi
-            if [[ "$(docker inspect -f '{{.State.Running}}' ai-debate-sysd 2>/dev/null)" != "true" ]]; then break; fi
-            sleep 1
-          done
-          if [[ "${started}" -ne 1 ]]; then
-            echo '::error::容器里的 systemd 没有起来'
-            docker logs ai-debate-sysd 2>&1 | tail -40 || true
-            exit 1
-          fi
-          docker exec ai-debate-sysd bash -lc 'systemctl is-system-running || true; systemctl --version | head -1'
+          set +e
+          echo "--- PID 1 ---"
+          ps -p 1 -o comm=
+          echo "--- systemctl state ---"
+          systemctl is-system-running; echo "exit=$?"
+          echo "--- can systemctl start a unit? ---"
+          sudo systemctl start cron && echo "systemctl_start=yes" || echo "systemctl_start=no"
+          sudo systemctl is-active cron; echo "active_exit=$?"
+          echo "--- docker ---"
+          docker info --format '{{.CgroupVersion}} {{.Driver}}' 2>&1 | head -2
+          docker run --rm --privileged alpine:3.20 sh -c 'echo privileged_ok' 2>&1 | tail -3
+          echo "--- systemd container ---"
+          docker rm -f probe >/dev/null 2>&1
+          docker run -d --privileged --name probe ubuntu:22.04 /sbin/init 2>&1 | tail -3
+          sleep 8
+          docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}}' probe 2>&1
+          docker logs probe 2>&1 | tail -20
+          docker rm -f probe >/dev/null 2>&1
       - name: Start a model stub on the host
         run: |
           set -euo pipefail
