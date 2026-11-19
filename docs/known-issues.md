@@ -6,9 +6,11 @@
 
 首次运行可能被 SmartScreen 或第三方杀毒软件提示「未知发布者」。核对 Release 页的 SHA256 后自行决定放行。没有做签名是因为 v0.1.0 没有代码签名证书，伪造一个签名更糟。
 
-## 2. systemd 单元未在真实 systemd 上启停验证
+## 2. systemd 验收只在 GitHub 的 ubuntu runner 上完成
 
-CI 的 ubuntu runner 里没有运行中的 systemd，所以安装脚本会走「无 systemd」分支：程序与配置照常安装，服务用直接启动的方式跑完 14 项验收（启动、登录、导入、生成、批准、重启后状态保留）。`ai-debate.service` 模板另外用 `systemd-analyze verify` 校验过语法与 `ExecStart` 路径，但**没有**在真实机器上执行过 `systemctl enable --now`。首次在真机上安装时请确认 `systemctl status ai-debate` 为 active。这不是代码缺陷，是验证环境缺项。
+v0.2.0 起，CI 在 `ubuntu-22.04` runner 上跑完整生命周期（runner 的 PID 1 就是 systemd）：`install.sh` 安装 → `systemctl enable --now` → 页面工作流 → `kill -9` 后由 systemd 拉起 → 卸载保留数据 → 重装保留历史，22 项全过。
+
+**没有**在独立的 Ubuntu 24.04 / Debian 12 虚拟机上验证。这两个发行版的 systemd 版本更高，unit 里用到的 `ProtectSystem` / `ReadWritePaths` / `Restart=always` 在两者上都已存在多年，但不能据此声称「已验证」。
 
 ## 3. Linux 只发布 x64
 
