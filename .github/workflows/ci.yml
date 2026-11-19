@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22.18.0'
+
+jobs:
+  secrets-scan:
+    name: Credential and privacy scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Scan tracked files for credentials
+        run: node scripts/scan-secrets.mjs
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build core, web and server bundle
+        run: npm run build && npm run bundle
+      - name: Core tests
+        shell: bash
+        run: npm run test:core
+      - name: Server tests
+        shell: bash
+        run: node --experimental-transform-types --test --test-concurrency=2 "packages/server/test/**/*.test.ts"
+      - name: Web tests
+        shell: bash
+        run: node --test packages/web/test/*.test.mjs
+      - name: End-to-end acceptance
+        shell: bash
+        run: node --experimental-transform-types test/acceptance/standalone.ts
+      - name: No DSH dependency
+        shell: bash
+        run: node scripts/assert-no-dsh.mjs
+
+  package-windows:
+    name: Package Windows executable
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run package:windows
+      - name: Launch the packaged executable
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path dist/AI-Debate-windows-x64.exe
+          & $exe --version
+          & $exe --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: |
+            dist/AI-Debate-windows-x64.exe
+            dist/AI-Debate-windows-x64.exe.sha256
+            dist/AI-Debate-windows-x64.sha256.txt
+          if-no-files-found: error
+
+  package-linux:
+    name: Package Linux archive
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run package:linux
+      - name: Install into a scratch root and start the service binary
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/aitest
+          tar -xzf dist/ai-debate-linux-x64.tgz -C /tmp/aitest
+          /tmp/aitest/ai-debate-linux-x64/bin/ai-debate --version
+          AI_DEBATE_HOME=/tmp/aitest/data /tmp/aitest/ai-debate-linux-x64/bin/ai-debate serve --port 17861 &
+          pid=$!
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:17861/healthz >/dev/null; then break; fi
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:17861/healthz
+          kill $pid || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tgz
+          path: |
+            dist/ai-debate-linux-x64.tgz
+            dist/ai-debate-linux-x64.tgz.sha256
+          if-no-files-found: error

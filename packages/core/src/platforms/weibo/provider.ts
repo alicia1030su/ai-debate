@@ -1,0 +1,1301 @@
+/**
+ * The Weibo provider: link routing, capability declaration, adapter construction.
+ *
+ * ## What changed in v0.2.12
+ *
+ * v0.2.11 shipped a CLI layer (`cli.ts`) that nothing called, and an adapter whose every
+ * read threw. Installing the CLI and logging in would have changed nothing, because there
+ * was no code path from the probe to `getThread`.
+ *
+ * v0.2.12 wires them together: the adapter resolves a **read plan** by probing the CLI,
+ * discovering the catalog, and validating each candidate command's required parameters
+ * before deciding whether a read may run. The projection from Weibo's payloads to
+ * `Thread`/`Floor`/`NestedReply` lives in `projection.ts` so it is testable without a CLI.
+ *
+ * ## What is still claimed and what is not
+ *
+ * - A read that has never run is **not** `supported`. It is `unverified` at best: the code
+ *   exists, no real account proved it.
+ * - A command is only used after `inspectCommand` confirms we can fill its required
+ *   parameters. A name that matches a regex is a *candidate*, not a permission.
+ * - `publishReply` always throws. There is no Weibo write path in this build; the platform
+ *   requires an explicit AI-content label plus a write scope this plugin does not request.
+ * - Nothing here buys credit, runs a face scan, or starts an OAuth flow. Those need a human.
+ */
+
+import type {
+  Floor,
+  NestedReply,
+  PlatformAdapter,
+  PlatformCapabilities,
+  PlatformId,
+  Thread,
+  ThreadRef,
+} from '../../types.js'
+import type {
+  CapabilityDeclaration,
+  CapabilityName,
+  PlatformCapabilityMatrix,
+  PlatformContext,
+  PlatformProvider,
+} from '../contracts.js'
+import {
+  buildDiagnosticLines,
+  createDiagnosticRecorder,
+  diagnosisOfStatus,
+  type WeiboDiagnostics,
+  type WeiboDiagnosticRecorder,
+} from './diagnostics.js'
+import {
+  buildReadiness,
+} from './readiness.js'
+import { probeCredentialPresence } from './credential-state.js'
+import { probeAuthHostReachability } from './network-state.js'
+import {
+  inspectCommand,
+  listAvailableCommands,
+  probeWeiboCli,
+  runReadCommand,
+  cliMetrics,
+  type WeiboCliCommand,
+  type WeiboCliReadiness,
+} from './cli.js'
+import { createReadTrace, type ReadTraceSnapshot } from './trace.js'
+import {
+  projectCommentAsFloor,
+  projectCommentAsNested,
+  projectThread,
+  unwrapComments,
+  unwrapStatus,
+} from './projection.js'
+import { buildInvocationPlan, type CommandInvocationPlan } from './invocation-plan.js'
+import { createPlanCache } from './plan-cache.js'
+import { matchReturnedStatus } from './target-match.js'
+import { parseWeiboUrl, weiboCanHandleUrl } from './url.js'
+
+const PLATFORM: PlatformId = 'weibo'
+
+/**
+ * Translate a classified CLI failure into a throw.
+ *
+ * Every status keeps its own identity: `cli_missing` tells the owner to install something,
+ * `not_authenticated` to log in, `service_inactive` to activate the service, and
+ * `quota_exhausted` to top up. Merging them would hide the only actionable information.
+ */
+function guardRead(status: string, message: string): void {
+  if (status === 'ok') return
+  throw new WeiboCliError(status, message)
+}
+
+/** Honour an abort signal between steps; the CLI call itself is not cancellable. */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    const error = new Error('微博读取已被取消。')
+    error.name = 'AbortError'
+    throw error
+  }
+}
+
+/**
+ * Why the read rows say what they say.
+ *
+ * 静态声明描述**这份构建的代码状态**，不描述**这台机器此刻的状态**。两者必须分开：
+ *
+ * - 代码状态是版本级的：这一版有没有写好 CLI 探测、命令校验、JSON 投影、失败分类、
+ *   凭据擦除、超时；
+ * - 机器状态是时刻级的：这台机器上 CLI 装没装、登录没登录、服务开没开。
+ *
+ * ## v0.2.32 修正的一处「说假话」
+ *
+ * 原来这段文案写的是「本机构建尚未安装 CLI、也没有开发者认证与 OAuth 登录」。
+ * 那句话在写下的当天是真的，之后主人完成了开发者认证与登录，它就成了假话——
+ * 而且是最坏的一类假话：它出现在**能力矩阵**里，正是用户用来判断「能不能用」的地方。
+ *
+ * 现在静态声明只说代码状态（`unverified` = 这份构建从未记录过一次真实读取），
+ * 机器状态交给运行时探测：`checkAuthentication()` 与 `getCapabilities()` 探测之后
+ * 会覆盖这里的结论，页面读到的是事实而不是模板。
+ *
+ * 这也是 v0.2.31 那条教训的另一半：**别把会过期的观测写成静态结论**。
+ */
+const READ_REASON =
+  '微博只读接入走官方 weibo-cli：探测、命令 schema 校验、JSON 投影、失败分类、' +
+  '凭据擦除与超时都有实现和测试。但这份构建没有附带任何一次真实读取的记录，' +
+  '所以静态声明停在「已实现、未验证」；本机此刻到底能不能读，以运行时探测为准。'
+
+/** Why nothing can be written: no write scope, and the AI-content labelling rule. */
+const WRITE_REASON =
+  '微博的写能力需要评论写入授权，且平台要求对 AI 生成内容做显式标识；' +
+  '本版明确不开放微博真实发表。'
+
+function row(state: CapabilityDeclaration['state'], reason: string, extra: Partial<CapabilityDeclaration> = {}): CapabilityDeclaration {
+  return { state, reason, ...extra }
+}
+
+/**
+ * The capability matrix.
+ *
+ * ## The four distinct states now in use
+ *
+ * - `unverified` — code exists (a CLI adapter plus projection), never run against the
+ *   platform. The honest label for every read row.
+ * - `permission_required` — nothing can be done from code alone: a developer
+ *   qualification and a service entitlement are required first.
+ * - `unavailable` — the platform genuinely does not expose it to third parties.
+ * - `degraded` — would work, but returns less than the platform has.
+ *
+ * Nothing is `supported`. That word has one meaning in this project — exercised against
+ * the real platform — and no Weibo call has been.
+ */
+/**
+ * The evidence level in words a reader can act on.
+ *
+ * These strings are the difference between "it works" and "it looks like it might work", which is
+ * the whole point of §三. `schema_only` is the most common state in this build and it must never
+ * sound like success.
+ */
+export function describeEvidenceLevel(
+  level: 'schema_only' | 'live_call' | 'fully_verified' | 'unavailable',
+): string {
+  switch (level) {
+    case 'fully_verified':
+      return '真实调用成功且父子关系已核对'
+    case 'live_call':
+      return '真实调用成功，但父子关系未核对'
+    case 'schema_only':
+      return '仅参数 schema 吻合，尚未在真实平台调用'
+    case 'unavailable':
+      return '平台 schema 明确不支持'
+  }
+}
+
+function describeCapabilities(): PlatformCapabilityMatrix {
+  const capabilities: Record<CapabilityName, CapabilityDeclaration> = {
+    'thread.read': row('unverified', `${READ_REASON}读取单条微博正文是第一步。`, {
+      requiredPermissions: ['weibo-cli OAuth 登录', '开发者认证 + 服务开通（体验或积分包）'],
+      limits: ['体验服务按接口限次（读取类通常 5 次/接口），正式服务按积分计费'],
+    }),
+    'comment.list': row('unverified', `${READ_REASON}评论列表读取同样只到代码层。`, {
+      requiredPermissions: ['weibo-cli OAuth 登录', '服务开通'],
+      limits: ['体验服务读取类通常 5 次/接口'],
+    }),
+    'comment.paginate': row('unverified', `${READ_REASON}分页逻辑按官方 CLI 的 page/cursor 语义实现。`, {
+      requiredPermissions: ['weibo-cli OAuth 登录', '服务开通'],
+      limits: ['官方说明：关系类分页不是快照，total_number 不等于去重后可见条数；必须按 idstr 去重'],
+    }),
+    'comment.nested': row('unverified', `${READ_REASON}评论下的回复读取依赖同一条命令的回复参数。`, {
+      requiredPermissions: ['weibo-cli OAuth 登录', '服务开通'],
+    }),
+    'comment.locate': row('unverified', `${READ_REASON}按 id 定位单条评论依赖读取命令的筛选参数。`, {
+      requiredPermissions: ['weibo-cli OAuth 登录', '服务开通'],
+    }),
+    'identity.verify': row(
+      'unverified',
+      '确认登录账号走 weibo-cli 的账号命令。静态声明不猜测本机登录状态——那由运行时探测回答。',
+      { requiredPermissions: ['weibo-cli OAuth 登录'] },
+    ),
+    'event.mentions': row('unavailable', '微博的艾特通知不对外开放给第三方读取；请让主人手动提供微博链接。'),
+    'comment.publish': row('permission_required', `${WRITE_REASON}评论发表本版不开放。`, {
+      requiredPermissions: ['评论写入授权', 'AI 生成内容标识'],
+      limits: ['未经授权时不会尝试任何发送'],
+    }),
+    'comment.reply': row('permission_required', `${WRITE_REASON}回复评论本版同样不开放。`, {
+      requiredPermissions: ['评论写入授权', 'AI 生成内容标识'],
+    }),
+    'publish.verify': row('unavailable', `${WRITE_REASON}没有写入能力，回读验证无从谈起。`),
+    'media.read': row('unavailable', '本构建不解析图片与视频内容，只保留它们的地址。'),
+    'user.profile': row('unverified', `${READ_REASON}作者资料读取走同一条 CLI 链路。`, {
+      requiredPermissions: ['weibo-cli OAuth 登录', '服务开通'],
+    }),
+  }
+  return { platform: PLATFORM, declaredAt: new Date().toISOString(), capabilities }
+}
+
+/** The error every unimplemented read throws. Named so callers can branch on it. */
+export class WeiboNotAuthorisedError extends Error {
+  readonly code = 'weibo_not_authorised'
+  constructor(what: string) {
+    super(
+      `微博的「${what}」需要开放平台授权，本构建没有可用凭据，因此不会尝试请求。` +
+        '这不是网络故障：授权到位之前，插件不会读取也不会发表任何微博内容。',
+    )
+    this.name = 'WeiboNotAuthorisedError'
+  }
+}
+
+function notAuthorised(what: string): never {
+  throw new WeiboNotAuthorisedError(what)
+}
+
+/**
+ * A CLI-backed read failed, with the reason preserved.
+ *
+ * ## Why this is a separate error class from `WeiboNotAuthorisedError` (v0.2.12)
+ *
+ * v0.2.11 threw `weibo_not_authorised` for everything, including "the CLI is not
+ * installed". Those two states need different actions from the owner — install a tool
+ * versus obtain a grant — and collapsing them meant the actionable one was hidden behind
+ * a message that said "go get authorisation" when no authorisation would help.
+ *
+ * The `code` is the CLI's own status, so a caller can branch without parsing prose.
+ */
+export class WeiboCliError extends Error {
+  readonly code: string
+  /** The next steps for the owner, when this failure has a known remedy. */
+  readonly steps: readonly string[]
+  constructor(status: string, message: string, steps: readonly string[] = []) {
+    super(message)
+    this.name = 'WeiboCliError'
+    this.code = status
+    this.steps = steps
+  }
+}
+
+/** Thrown when the account is authorised but lacks the specific read command. */
+export class WeiboCommandUnavailableError extends Error {
+  readonly code = 'command_unavailable'
+  constructor(message: string) {
+    super(message)
+    this.name = 'WeiboCommandUnavailableError'
+  }
+}
+
+/**
+ * Page size requested when the comment command declares a `count` flag.
+ *
+ * 20 is the value the official manual documents for the read commands that cap it, so asking for
+ * more would be rejected with `COUNT_EXCEEDS_MAX`. When the command has no `count` flag this is
+ * never sent and the server's own default applies — which this code does not assume.
+ */
+const COMMENT_PAGE_SIZE = 20
+
+/**
+ * How many comment pages `getReplyContext` will walk looking for one id.
+ *
+ * ## Why a bound exists, and why it is small
+ *
+ * There is no verified "get comment by id" command. Locating a post therefore means
+ * paging the same list the collector pages, and an unbounded walk is a scrape: on a
+ * post with thousands of comments it would issue hundreds of authorised requests to
+ * answer one question.
+ *
+ * Five pages at 20 per page is 100 comments — far more than the workbench ever
+ * displays, so the normal case (the owner picked a comment they were just shown) is
+ * always inside the window. When an id is *not* found, the error says the search was
+ * bounded rather than claiming the post does not exist. Those are different claims
+ * and only one of them is true.
+ */
+const LOCATE_PAGE_LIMIT = 5
+
+/**
+ * Present a thread body as a `Floor`.
+ *
+ * ## Why this is a projection and not a fake floor
+ *
+ * `ReplyContext.floor` requires a `Floor`, and on Weibo the opening post *is* the
+ * first-level post every comment hangs under — it has no 楼层 number, which is why
+ * `floorNumber` is left out rather than set to 1. Everything else here is the
+ * thread's own data, copied, not invented.
+ *
+ * The alternative was to make `ReplyContext.floor` optional, which would have rippled
+ * through the publisher, the target resolver and every adapter to fix a shape problem
+ * that only exists on one platform.
+ */
+function threadAsFloor(thread: Thread): Floor {
+  return {
+    platform: thread.platform,
+    postId: thread.id,
+    ...(thread.authorId === undefined ? {} : { authorId: thread.authorId }),
+    ...(thread.authorName === undefined ? {} : { authorName: thread.authorName }),
+    ...(thread.authorNumericUid === undefined ? {} : { authorNumericUid: thread.authorNumericUid }),
+    ...(thread.authorNumericUidKind === undefined
+      ? {}
+      : { authorNumericUidKind: thread.authorNumericUidKind }),
+    ...(thread.authorSource === undefined ? {} : { authorSource: thread.authorSource }),
+    content: thread.content,
+    ...(thread.createdAt === undefined ? {} : { createdAt: thread.createdAt }),
+    images: thread.images,
+  }
+}
+
+/**
+ * One resolved read plan: which command to call, and whether we may claim completeness.
+ *
+ * Built once per adapter so a single read does not re-validate the catalog on every page.
+ */
+interface WeiboReadPlan {
+  readonly readiness: WeiboCliReadiness
+  /**
+   * The verified invocation plan for the thread read (v0.2.14).
+   *
+   * v0.2.13 stored a loose bag of flag names here and reassembled the argv at each call site,
+   * which is how `getReplies` came to send a `--page` the command never declared. There is now
+   * one authority per command and no other way to produce an argument.
+   */
+  readonly threadPlan?: CommandInvocationPlan
+  /** The verified invocation plan for the comment read. */
+  readonly commentPlan?: CommandInvocationPlan
+  /** How many candidates were inspected before a choice was made, for the diagnostic panel. */
+  readonly selectionNotes: readonly string[]
+  /** Why a given read is unavailable, when it is. */
+  readonly threadProblem?: string
+  readonly commentProblem?: string
+  /**
+   * 命令清单的结果（v0.2.30）。
+   *
+   * 单独记一份，是因为 `threadPlan` / `commentPlan` 只覆盖「我们认得的那两个命令」，
+   * 而八项诊断里的「命令清单」这一项问的是「这个账号到底有没有可用命令」。
+   * 用 `threadPlan === undefined` 去推断那件事，会在「有命令但没有能读正文的命令」
+   * 时给出错误答案。
+   */
+  readonly commandsRead?: { readonly ok: true; readonly count: number } | { readonly ok: false; readonly reason: string }
+}
+
+/**
+ * Resolve which catalog entry drives which read, by validating each candidate.
+ *
+ * ## Why the candidate is inspected rather than accepted
+ *
+ * The task book forbids "name looks right → assume we have the permission". A catalog
+ * entry is a *listing*: it can be present while the entitlement behind it is inactive, and
+ * its required parameters may not be ones we can supply. So every candidate goes through
+ * `inspectCommand`, and only a candidate whose required parameters we can actually fill
+ * becomes a plan.
+ */
+async function resolveReadPlan(): Promise<WeiboReadPlan> {
+  /**
+   * ## 两条互不依赖的探测同时跑（v0.2.33 §七）
+   *
+   * `probeWeiboCli()`（`version` + `doctor`）与 `listAvailableCommands()` 之间**没有**
+   * 数据依赖：前者回答「装没装、登录没登录」，后者回答「这个账号有哪些命令」。
+   * 顺序执行时，两个子进程各要 3 秒以上（本机实测 `doctor` 3.6s、`commands list`
+   * 3.4s），加起来就是 7 秒；并发之后是 3.6 秒。
+   *
+   * 这不会掩盖失败：任一条失败，它的结果照旧带着自己的状态进入下面的分支，
+   * 只是两条路径同时走完而已。
+   */
+  const readinessPromise = probeWeiboCli()
+  const listedPromise = listAvailableCommands()
+  const [readiness, listed] = await Promise.all([readinessPromise, listedPromise])
+
+  /**
+   * ## 命令清单一律读，早退之后也要读（v0.2.30，真实 CLI 实测发现）
+   *
+   * v0.2.29 在 `doctor` 未通过时直接 `return`，命令清单一次都没读。于是诊断面板
+   * 报「命令清单：本次没有读取」——那是 `unknown`，而当时**完全读得到**。
+   *
+   * 真实输出（本机实测，登录已完成、认证与服务未完成）：
+   *
+   * ```json
+   * { "service_status": "none", "total": 75, "available_count": 0, "commands": [] }
+   * ```
+   *
+   * 这条请求成功、不花额度、也不需要服务开通——它是一份本地目录。不读它，
+   * 面板就只能说「不知道有几条可用命令」，而这是用户在排查时最想知道的一个数
+   * （0 条 = 权限没到，75 条 = 权限到了但命令选错了）。
+   *
+   * 所以它提前到这里：无论 `canRead` 真假，都读一次。
+   */
+  if (!readiness.canRead) {
+    return {
+      readiness,
+      selectionNotes: [],
+      ...(listed.status === 'ok' && listed.data !== undefined
+        ? { commandsRead: { ok: true as const, count: listed.data.length } }
+        : { commandsRead: { ok: false as const, reason: listed.message } }),
+      // 命令清单为空本身就是「为什么读不了」的一条证据，写进 selectionNotes 让面板能解释。
+      ...(listed.status === 'ok' && listed.data !== undefined && listed.data.length === 0
+        ? {
+            selectionNotes: [
+              '本账号当前可用命令为 0 条：这是开发者认证与服务未开通的结果，不是命令名选错。',
+            ],
+          }
+        : {}),
+    }
+  }
+
+  if (listed.status !== 'ok' || listed.data === undefined) {
+    return {
+      readiness,
+      selectionNotes: [],
+      threadProblem: listed.message,
+      commentProblem: listed.message,
+      commandsRead: { ok: false, reason: listed.message },
+    }
+  }
+
+  const plan: {
+    readiness: WeiboCliReadiness
+    threadPlan?: CommandInvocationPlan
+    commentPlan?: CommandInvocationPlan
+    selectionNotes: string[]
+    threadProblem?: string
+    commentProblem?: string
+    commandsRead?: { readonly ok: true; readonly count: number } | { readonly ok: false; readonly reason: string }
+  } = { readiness, selectionNotes: [], commandsRead: { ok: true, count: listed.data.length } }
+
+  // ## Candidate selection (v0.2.14 §五)
+  //
+  // The catalog's spelling is server-owned, so a regex picks *candidates* — never a winner.
+  // Each candidate is then inspected in turn, and the first one whose verified schema can
+  // actually drive the read wins. Two rules make this safe:
+  //
+  //   - **locked rows are skipped outright.** A locked entry means "listed, not entitled"; calling
+  //     it would burn a request to learn what the listing already said.
+  //   - **the number of inspections is capped.** Each `commands show` is a real invocation, so a
+  //     pathological catalog must not turn into dozens of them.
+  const MAX_INSPECTIONS = 4
+
+  const candidatesFor = (family: 'thread' | 'comments'): { rows: WeiboCliCommand[]; notes: string[] } => {
+    const rows = listed.data!
+    const notes: string[] = []
+    const matches =
+      family === 'thread'
+        ? rows.filter(
+            (row) =>
+              /status|weibo|post/i.test(row.group) &&
+              /show|get|read|detail|batch/i.test(row.action),
+          )
+        : rows.filter(
+            (row) => /comment/i.test(row.group) && /list|show|get|read/i.test(row.action),
+          )
+    // Unlocked first, then locked ones are dropped: never called, per §五.2.
+    const unlocked = matches.filter((row) => row.access !== 'locked')
+    const lockedCount = matches.length - unlocked.length
+    if (lockedCount > 0) {
+      notes.push(
+        `${family === 'thread' ? '正文' : '评论'}候选里有 ${lockedCount} 条被标记为 locked，已排除（不探测未授权命令）。`,
+      )
+    }
+    return { rows: unlocked, notes }
+  }
+
+  /** Inspect candidates until one yields a verified plan that can drive `kind`. */
+  const choose = async (
+    family: 'thread' | 'comments',
+    kind: 'thread' | 'comments',
+    capability: 'readThread' | 'readComments',
+  ): Promise<{ plan?: CommandInvocationPlan; problem?: string; notes: string[] }> => {
+    /**
+     * 每条链带自己的 `notes`。
+     *
+     * 两条链现在并发跑，如果都直接往 `plan.selectionNotes` 里 push，面板上
+     * 说明的顺序会随调度变化——同一台机器两次诊断给出不同的文字顺序，会让人
+     * 以为状态变了。所以各自收集，最后按「正文在前、评论在后」固定合并。
+     */
+    const notes: string[] = []
+    const listedCandidates = candidatesFor(family)
+    notes.push(...listedCandidates.notes)
+    const candidates = listedCandidates.rows
+    if (candidates.length === 0) {
+      return {
+        notes,
+        problem:
+          family === 'thread'
+            ? '当前账号的可用命令里没有能读取微博正文的命令。'
+            : '当前账号的可用命令里没有能读取评论的命令。',
+      }
+    }
+
+    const tried: string[] = []
+    for (const candidate of candidates.slice(0, MAX_INSPECTIONS)) {
+      const schema = await inspectCommand({ group: candidate.group, action: candidate.action })
+      if (schema.status !== 'ok' || schema.data === undefined) {
+        tried.push(`${candidate.name}（无法读取 schema：${schema.message}）`)
+        continue
+      }
+      const invocation = buildInvocationPlan({
+        group: candidate.group,
+        action: candidate.action,
+        name: candidate.name,
+        schemaVerified: schema.data.evidence === 'parsed',
+        parameters: schema.data.typedParameters,
+        kind,
+      })
+      const claim = invocation.capabilities[capability]
+      if (!claim.available) {
+        tried.push(`${candidate.name}（${claim.reason}）`)
+        continue
+      }
+      // Record why this one won, so the diagnostic panel can explain the choice.
+      notes.push(
+        candidates.length === 1
+          ? `选用 ${candidate.name}：${claim.reason}`
+          : `选用 ${candidate.name}（共 ${candidates.length} 个候选，前 ${tried.length} 个不适用）：${claim.reason}`,
+      )
+      return { plan: invocation, notes }
+    }
+
+    return {
+      notes,
+      problem:
+        tried.length === 0
+          ? '目录里有候选命令，但没有任何一条通过校验。'
+          : `检查了 ${tried.length} 个候选，都不适用：${tried.join('；')}`,
+    }
+  }
+
+  /**
+   * ## 正文与评论的候选并行探测（v0.2.33 §七）
+   *
+   * 这两条链互不依赖：正文候选只看 `status*` 组，评论候选只看 `comment*` 组，
+   * 各自的 `commands show` 是独立子进程。顺序执行时最坏情况是 4+4 次调用
+   * （每次 3 秒以上），并发之后是「两边各自的最坏值」而不是两者之和。
+   *
+   * 并发不改变判定：每条链仍然在自己的候选上顺序 `inspectCommand`，因为
+   * 「第一个可用即胜出」这件事本身需要顺序。改变的只是两条链之间的等待。
+   *
+   * 失败也照旧各自报告：一边没有可用命令时另一边仍然可以是好的，
+   * 这正是「正文能读、评论不能读」这种真实处境需要被说清楚的地方。
+   */
+  const [threadChoice, commentChoice] = await Promise.all([
+    choose('thread', 'thread', 'readThread'),
+    choose('comments', 'comments', 'readComments'),
+  ])
+  // 固定顺序合并：正文在前、评论在后。并发不改变面板上的阅读顺序。
+  plan.selectionNotes.push(...threadChoice.notes, ...commentChoice.notes)
+  plan.threadPlan = threadChoice.plan
+  if (threadChoice.problem !== undefined) plan.threadProblem = threadChoice.problem
+  plan.commentPlan = commentChoice.plan
+  if (commentChoice.problem !== undefined) plan.commentProblem = commentChoice.problem
+
+  return plan
+}
+
+/**
+ * The stateful adapter.
+ *
+ * ## What changed in v0.2.12
+ *
+ * v0.2.11 threw `WeiboNotAuthorisedError` from every method, unconditionally. The CLI layer
+ * existed but was never called, so installing the CLI and logging in would have changed
+ * nothing.
+ *
+ * Now the adapter resolves a **read plan** on first use: probe the CLI, discover the
+ * catalog, validate the candidates' argument shapes, and only then decide whether
+ * `getThread`/`getReplies` can run. Every failure keeps its own code so the owner can tell
+ * "install it" from "log in" from "buy credit".
+ *
+ * ## What is still refused
+ *
+ * `publishReply` throws, always. There is no Weibo write path in this build: the platform
+ * requires an explicit AI-content label and a write scope this plugin does not request.
+ */
+function createAdapter(context: PlatformContext): PlatformAdapter {
+  // `context` is not used yet on purpose: Weibo's read path needs no secret of its own,
+  // because the official CLI owns its OAuth session on disk and this plugin never reads it.
+  // Keeping the parameter documents that the adapter receives platform-scoped settings
+  // without pretending to consume them.
+  void context
+  // The plan is resolved lazily and shared across calls, with a **bounded** lifetime.
+  //
+  // v0.2.12 cached the first probe's promise forever, so a `cli_missing` reported before the
+  // owner installed the CLI stayed cached until the process restarted. The cache now has a
+  // TTL for success, a short backoff for recoverable failures, a forced-refresh path, and a
+  // generation guard so a slow outdated probe cannot overwrite a newer verdict.
+  const diagnostics: WeiboDiagnosticRecorder = createDiagnosticRecorder()
+  /**
+   * 最近一次读取的分阶段耗时（v0.2.33 §七）。
+   *
+   * 只记最后一次，不记历史：诊断面板回答的是「刚才那次为什么慢」，而一份
+   * 越来越长的耗时列表没有比一行更有用。存的是快照，不是记账器——快照不可变，
+   * 页面读到的数字不会在渲染途中被下一次读取改掉。
+   */
+  let lastTrace: ReadTraceSnapshot | undefined
+  const planCache = createPlanCache<WeiboReadPlan>(async () => {
+    const plan = await resolveReadPlan()
+    return { plan, status: plan.readiness.status }
+  })
+  /**
+   * Drop the cache without probing.
+   *
+   * Called when something outside the probe proves the plan stale. Kept as a named local so
+   * the intent is recorded even though the only current caller is the handler below — the
+   * alternative was exporting a mutator that any module could call.
+   */
+  const invalidatePlan = (): void => planCache.invalidate()
+  // `invalidatePlan` is reachable through the adapter's optional member below; referencing it
+  // here keeps the wiring explicit rather than reaching into `planCache` from outside.
+  void invalidatePlan
+
+  /**
+   * Capabilities reflect what was *measured*, not what was hoped.
+   *
+   * Before the first read the plan is unknown, so everything that depends on the CLI is
+   * reported false with a note saying it has not been probed yet. `getCapabilities()` is
+   * synchronous by contract, so it cannot wait for a probe — the first async call fills the
+   * cache and later calls see the real answer.
+   */
+  let cached: PlatformCapabilities | undefined
+  const capabilities = (): PlatformCapabilities => {
+    if (cached !== undefined) return cached
+    return {
+      thread: false,
+      replies: false,
+      nestedReplies: false,
+      userProfile: false,
+      mentions: false,
+      publish: false,
+      authCheck: false,
+      notes: {
+        thread: '尚未探测微博 CLI 状态；第一次读取时会自动探测。',
+        replies: '尚未探测微博 CLI 状态。',
+        publish: '本版不开放微博真实发表（需要写入授权与 AI 生成内容标识）。',
+        mentions: '微博的艾特通知不对外开放给第三方读取。',
+      },
+    }
+  }
+
+  /**
+   * Refresh the cached capabilities from a resolved plan.
+   *
+   * Called after every plan resolution so `getCapabilities()` — which the settings page and
+   * the registry's gate read — tells the truth once a probe has run.
+   */
+  const remember = (resolved: WeiboReadPlan): void => {
+    const ready = resolved.readiness.canRead
+    // ## Each capability is asked separately (v0.2.14 §四)
+    //
+    // v0.2.13 derived all three from "is there a comment command", so a command with no
+    // parent-scoping parameter still produced `nestedReplies: true` while the read refused.
+    // The plan answers each question from the verified schema, and its `unverified` state is
+    // preserved: the page must show "we do not know", not a yes.
+    const threadClaim = resolved.threadPlan?.capabilities.readThread
+    const commentClaim = resolved.commentPlan?.capabilities.readComments
+    const nestedClaim = resolved.commentPlan?.capabilities.readNested
+    cached = {
+      thread: threadClaim?.available === true,
+      replies: commentClaim?.available === true,
+      // ## Claimed only after a real platform call (v0.2.15 §三)
+      //
+      // v0.2.14 used `nestedClaim.available`, which is true as soon as the *schema* looks right
+      // — so a command declaring `cid` + `count` made the page say "子评论可读" while no read
+      // had ever run. A parameter name is not a platform capability.
+      //
+      // The bar now is `fully_verified`: a real call succeeded **and** the returned parent/child
+      // link was checked against the requested comment id. A bare successful call (`live_call`)
+      // only proves the command runs, not that the replies hang off the right comment.
+      nestedReplies: nestedClaim?.evidence.level === 'fully_verified',
+      userProfile: false,
+      mentions: false,
+      publish: false,
+      authCheck: ready,
+      notes: {
+        ...(resolved.threadProblem === undefined ? {} : { thread: resolved.threadProblem }),
+        ...(resolved.commentProblem === undefined ? {} : { replies: resolved.commentProblem }),
+        // The nested answer always carries a reason: "no" without one is indistinguishable
+        // from "we did not look", and the page renders this text. The level is spelled out so
+        // "schema only" can never be read as "it works".
+        ...(nestedClaim === undefined
+          ? {}
+          : {
+              nestedReplies:
+                `${nestedClaim.reason}（证据层次：${describeEvidenceLevel(nestedClaim.evidence.level)}）`,
+            }),
+        ...(ready ? {} : { authCheck: resolved.readiness.message }),
+        publish: '本版不开放微博真实发表（需要写入授权与 AI 生成内容标识）。',
+        mentions: '微博的艾特通知不对外开放给第三方读取。',
+      },
+    }
+  }
+
+  /**
+   * Resolve the plan **without throwing**, for callers that report state rather than read.
+   *
+   * `requirePlan` exists for reads: "cannot read" is an error there. A diagnostic is the
+   * opposite — its entire job is to say *why* reads cannot run, so throwing would replace the
+   * answer with an exception. Same cache, same probe, different contract.
+   */
+  const observePlan = async (force = false): Promise<WeiboReadPlan> => {
+    const result = await planCache.get(force ? { force: true } : {})
+    remember(result.plan)
+    return result.plan
+  }
+
+  /** Resolve the plan, cache the capabilities, and translate a refusal into a throw. */
+  const requirePlan = async (force = false): Promise<WeiboReadPlan> => {
+    const result = await planCache.get(force ? { force: true } : {})
+    const resolved = result.plan
+    remember(resolved)
+    if (!resolved.readiness.canRead) {
+      throw new WeiboCliError(
+        resolved.readiness.status,
+        resolved.readiness.message,
+        resolved.readiness.steps,
+      )
+    }
+    return resolved
+  }
+
+  return {
+    id: PLATFORM,
+    displayName: '微博',
+    getCapabilities: capabilities,
+    /**
+     * The Weibo-specific diagnostic (v0.2.12 §二, extended in v0.2.13 §四).
+     *
+     * Exposed as an optional member rather than part of `PlatformAdapter`: the generic
+     * interface describes what every platform must do, and a diagnostic that only Weibo can
+     * produce does not belong there. The settings page probes for it.
+     *
+     * ## `options.refresh` is the controlled re-probe
+     *
+     * The settings page's refresh button calls this with `refresh: true`. It runs **one**
+     * probe, ignores any cached verdict, and does nothing else — no login, no purchase, no
+     * account operation. Without this the page could only ever show whatever the first probe
+     * of the process concluded, which is precisely the v0.2.12 defect.
+     */
+    describeDiagnostics: async (options: { readonly refresh?: boolean } = {}): Promise<WeiboDiagnostics> => {
+      const resolved = await observePlan(options.refresh === true)
+      remember(resolved)
+
+      // "Installed" is only true when the binary answered `version`; a missing binary has an
+      // empty stderr, so the readiness status is the authority here.
+      const cliInstalled = resolved.readiness.status !== 'cli_missing'
+      const cliVersion = resolved.readiness.version
+      const oauthLoggedIn =
+        resolved.readiness.status !== 'cli_missing' &&
+        resolved.readiness.status !== 'not_authenticated'
+      const serviceActive = resolved.readiness.canRead
+      const history = diagnostics.snapshot()
+
+      /**
+       * 本机凭据记录与授权主机可达性（v0.2.31 §六 / v0.2.33 §六）。
+       *
+       * 顺序上有依赖：只有「有记录但拿不到令牌」才需要探测网络。探测本身有
+       * 2.5 秒硬上限，且不带任何凭据，所以它不会拖慢读取路径——它根本不在
+       * 读取路径上，只在诊断面板请求时跑。
+       */
+      const credential = probeCredentialPresence()
+      const needsNetworkProbe = credential.state === 'recorded' && !resolved.readiness.canRead
+      const network = needsNetworkProbe ? await probeAuthHostReachability() : undefined
+
+      const lines = buildDiagnosticLines({        cliInstalled,
+        ...(cliVersion === undefined ? {} : { cliVersion }),
+        oauthLoggedIn,
+        serviceActive,
+        ...(resolved.threadPlan === undefined ? {} : { threadCommand: resolved.threadPlan.name }),
+        ...(resolved.commentPlan === undefined ? {} : { commentCommand: resolved.commentPlan.name }),
+        ...(resolved.threadProblem === undefined ? {} : { threadProblem: resolved.threadProblem }),
+        ...(resolved.commentProblem === undefined ? {} : { commentProblem: resolved.commentProblem }),
+        readinessState: diagnosisOfStatus(resolved.readiness.status),
+        readinessMessage: resolved.readiness.message,
+        readinessSteps: resolved.readiness.steps,
+        selectionNotes: resolved.selectionNotes,
+        ...(resolved.commentPlan === undefined
+          ? {}
+          : {
+              nestedCapability: {
+                available: resolved.commentPlan.capabilities.readNested.available,
+                state: resolved.commentPlan.capabilities.readNested.state,
+                reason: resolved.commentPlan.capabilities.readNested.reason,
+              },
+            }),
+        ...history,
+      })
+
+      return {
+        cliInstalled,
+        ...(cliVersion === undefined ? {} : { cliVersion }),
+        oauthLoggedIn,
+        serviceActive,
+        ...(resolved.threadPlan === undefined ? {} : { threadCommand: resolved.threadPlan.name }),
+        ...(resolved.commentPlan === undefined ? {} : { commentCommand: resolved.commentPlan.name }),
+        // ## Why quota is `not_implemented` rather than a number
+        //
+        // Reading the credit balance means calling a billing command (`me`, the credit
+        // ledger). That is account management, not a read of the thread, and the task book
+        // forbids automating account operations. Reporting `not_implemented` with the reason
+        // is honest; showing a fake or stale number would not be.
+        quota: {
+          state: 'not_implemented',
+          message:
+            '本版不读取积分余额或套餐信息：那需要调用官方的账户/计费命令，属于账户管理操作，' +
+            '插件不代为执行。需要查看余额时请在控制台「我的信息」页或运行 weibo-cli me。',
+          steps: ['在微博控制台「我的信息」页查看积分余额', '或自行运行 weibo-cli me --output table'],
+        },
+        ...history,
+        lines,
+        /**
+         * 八项就绪诊断（v0.2.30 §三）。
+         *
+         * ## 为什么它和 `lines` 并存而不是取代 `lines`
+         *
+         * `lines` 是「按顺序读一遍」的叙述，适合事后排查；八项是「现在的授权链条
+         * 走到哪一步」的快照，适合事前决定。两者服务不同时刻，且 `lines` 里有
+         * 命令选择理由之类八项表达不了的内容。
+         *
+         * 八项里每一项的 `state` 只看它自己，`blocking` 取第一个阻断项——
+         * 这样「已安装但没登录」会指出登录，而不会把开发者认证也标红，
+         * 后者在没登录的时候根本无从判断。
+         */
+        readiness: buildReadiness({
+          cliInstalled,
+          ...(cliVersion === undefined ? {} : { cliVersion }),
+          ...(resolved.commandsRead === undefined ? {} : { commands: resolved.commandsRead }),
+          ...(resolved.readiness.doctorSteps === undefined
+            ? {}
+            : { doctorSteps: resolved.readiness.doctorSteps }),
+          ...(resolved.readiness.doctorExitCode === undefined
+            ? {}
+            : {
+                doctorRaw: {
+                  code: resolved.readiness.doctorExitCode,
+                  output: resolved.readiness.message,
+                },
+              }),
+          /**
+           * 本机凭据记录的**存在性**（v0.2.31 §六）。
+           *
+           * 只看磁盘上那个指向保管库的引用文件，不读保管库、不读令牌。
+           * 它存在的唯一作用是让「从没登录过」与「登录过但令牌失效」分开显示——
+           * `doctor` 对这两种情况给的是同一个 `×`。
+           */
+          credential,
+          /**
+           * 授权主机可达性（v0.2.33 §六）。
+           *
+           * ## 为什么只在一种情况下探测
+           *
+           * 它是一次外部网络调用，不能出现在读取路径上。只有「有登录记录、但 CLI
+           * 拿不到令牌」这一种处境才值得花 2.5 秒去区分「网络」和「令牌」——
+           * 因为只有这里的两种原因对应完全相反的下一步。
+           *
+           * 其余情况（没装、没登录、正常）探测都得不到新信息，只会让面板变慢。
+           */
+          ...(network === undefined ? {} : { network }),
+          // 额度：本进程不查，理由随快照带出去（`unknown` 而不是 `unavailable`）。
+          quota: {
+            known: false,
+            reason:
+              '本进程没有查询额度：那需要调用官方的账户/计费命令，属于账户管理操作，' +
+              '插件不代为执行。面板上显示「未知」是因为没查，不是因为查不到。',
+          },
+          ...(history.lastRead === undefined ? {} : { lastRead: history.lastRead }),
+          ...(history.lastError === undefined ? {} : { lastError: history.lastError }),
+        }),
+        ...(lastTrace === undefined ? {} : { readTrace: lastTrace }),
+      }
+    },
+    checkAuthentication: async () => {
+      // A read-only probe of the local CLI. It answers `false` with a reason rather than
+      // throwing, because "am I logged in?" has a useful negative answer.
+      const resolved = await observePlan(false)
+      remember(resolved)
+      return {
+        authenticated: resolved.readiness.canRead,
+        ...(resolved.readiness.canRead ? {} : { reason: resolved.readiness.message }),
+      }
+    },
+    getThread: async (ref, signal) => {
+      /**
+       * ## 一次读取的时间账（v0.2.33 §七）
+       *
+       * 这三个阶段是「一次 `getThread` 到 40 秒」这个观测里能拆开的部分：
+       * 计划解析（`probe`，可能命中缓存）、真实调用（`read`）、投影（`project`）。
+       * 拆开之后，「慢在探测」和「慢在平台」不再是同一个数字。
+       */
+      const trace = createReadTrace(cliMetrics)
+      const resolved = await trace.run('probe', () => requirePlan())
+      const plan = resolved.threadPlan
+      if (plan === undefined) {
+        const message = resolved.threadProblem ?? '当前账号没有可用的微博正文读取命令。'
+        diagnostics.recordError('permission_insufficient', message)
+        lastTrace = trace.snapshot()
+        throw new WeiboCommandUnavailableError(message)
+      }
+      throwIfAborted(signal)
+      const invocation = plan.argsFor({ threadId: ref.threadId, page: 1 })
+      const read = await trace.run('read', () => runReadCommand<unknown>(plan, invocation.args), plan.name)
+      if (read.status !== 'ok') {
+        diagnostics.recordError(diagnosisOfStatus(read.status), read.message)
+        lastTrace = trace.snapshot()
+        guardRead(read.status, read.message)
+      }
+
+      // ## Identity is decided before shape is judged (v0.2.14 §二)
+      //
+      // The order matters. \`unwrapStatus\` answers "is there something projectable here" and
+      // returns the first readable object — which for a batch answer is the first post, not the
+      // target. Asking it first made a batch read fail as \`malformed_response\` whenever the
+      // envelope was a list, and made a wrong-but-well-formed answer look perfectly fine.
+      //
+      // So the target is located by id first, and whatever *that* object contains is what gets
+      // shape-checked. A payload that identifies the requested post is, by definition, the post;
+      // a payload that does not is refused here rather than after projection.
+      const match = matchReturnedStatus(read.data, ref.threadId)
+      if (!match.ok) {
+        const shown = match.observed.length === 0 ? '（没有可识别的 id）' : match.observed.join('、')
+        const message =
+          `平台返回的微博不是请求的那一条：请求 ${ref.threadId}，返回 ${shown}。` +
+          `${match.reason}这次读取没有被当成目标微博，分析也不会继续。`
+        diagnostics.recordError('target_mismatch', message)
+        lastTrace = trace.snapshot()
+        throw new WeiboCliError('target_mismatch', message)
+      }
+
+      // The matched object is the target; shape is checked here, where a failure means the
+      // *right* post had an unreadable body rather than the wrong post being readable.
+      const payload = unwrapStatus(match.status)
+      if (payload === undefined) {
+        const message =
+          `${plan.name} 返回了目标微博（id ${ref.threadId}），但它的正文结构无法解析。`
+        diagnostics.recordError('failed', message)
+        lastTrace = trace.snapshot()
+        throw new WeiboCliError('malformed_response', message)
+      }
+
+      const projected = await trace.run('project', async () => projectThread(payload, ref.threadId, ref.url))
+      diagnostics.recordRead(true, 'thread', `${plan.name} 返回了正文`)
+      lastTrace = trace.snapshot()
+      return projected
+    },
+    getReplies: async (ref, page, signal) => {
+      const trace = createReadTrace(cliMetrics)
+      const resolved = await trace.run('probe', () => requirePlan())
+      const plan = resolved.commentPlan
+      if (plan === undefined) {
+        lastTrace = trace.snapshot()
+        throw new WeiboCommandUnavailableError(
+          resolved.commentProblem ?? '当前账号没有可用的微博评论读取命令。',
+        )
+      }
+      throwIfAborted(signal)
+
+      // ## Pagination comes from the plan, never from a guess (v0.2.14 §三)
+      //
+      // Reproduced in v0.2.13 both ways:
+      //   - command declares `id`+`count` → we sent `--page 2` (undeclared → CLI hard-errors);
+      //   - command declares `id`+`page`  → we sent no `--page` at all, silently re-reading
+      //     page 1 while the caller believed it had advanced.
+      //
+      // The plan sends `--page` iff the schema declares a page flag, and `--count` iff it
+      // declares a count flag. Neither implies the other.
+      const invocation = plan.argsFor({
+        threadId: ref.threadId,
+        page,
+        pageSize: COMMENT_PAGE_SIZE,
+      })
+
+      // ## A page this command cannot express is not silently downgraded
+      //
+      // If the caller asked for page 2 and the command has no page flag, sending the page-1
+      // request and reporting success would be the "read page 1 and claim it is everything"
+      // failure the task book names. We fail instead, with a message the caller can act on.
+      // ## A page the command cannot express degrades; it does not explode (§三.10 / §三.11)
+      //
+      // The first version of this fix threw, which looks safe and is not: a throw tells the
+      // collector the *whole floor* is unreadable, so a floor whose first page is perfectly
+      // readable would report zero comments. That is worse than the bug.
+      //
+      // The rule from the task book is "read what you can confirm, and say it is incomplete".
+      // So: page 1 is read for real, and the result is flagged so nobody claims it walked the
+      // conversation. If the caller asked for page > 1 we return an empty page with
+      // `incomplete`, because repeating page 1 and calling it page 2 is the specific lie the
+      // requirement forbids.
+      if (invocation.pagingUnsupported) {
+        const reason =
+          invocation.omitted.find((entry) => entry.name === 'page')?.reason ??
+          `命令 ${plan.name} 无法表达页码。`
+        diagnostics.recordError('permission_insufficient', reason)
+        lastTrace = trace.snapshot()
+        return {
+          floors: [],
+          page,
+          // More may exist; we simply cannot ask. `hasMore: true` with `incomplete` makes the
+          // collector stop at its own cap and report a truncated range rather than a clean end.
+          hasMore: true,
+          incomplete: true,
+          /**
+           * `partial` 而不是 `more`：这条命令**没有**表达下一页的能力，
+           * 所以「还有下一页」不是平台的声明，是这个插件无法再问下去。
+           * 两者在采集器里都会继续翻页，但面板上必须能区分「平台说还有」
+           * 与「我们没法问」——否则用户会以为是平台在拖延。
+           */
+          pagingState: 'partial',
+        }
+      }
+
+      const read = await trace.run('read', () => runReadCommand<unknown>(plan, invocation.args), plan.name)
+      if (read.status !== 'ok') {
+        diagnostics.recordError(diagnosisOfStatus(read.status), read.message)
+        lastTrace = trace.snapshot()
+      }
+      guardRead(read.status, read.message)
+      const page1 = await trace.run('parse', async () => unwrapComments(read.data))
+      const floors: Floor[] = []
+      for (const comment of page1.comments) {
+        const floor = projectCommentAsFloor(comment)
+        if (floor !== undefined) floors.push(floor)
+      }
+      // ## An unparseable paging state is reported, not smoothed over (v0.2.12 audit)
+      //
+      // When the payload carries neither `has_more` nor a cursor, we do not know whether more
+      // comments exist. `pagingState === 'unknown'` therefore produces no `declaredTotal` and
+      // no claim of completeness — the collector will see `hasMore: true` and either keep
+      // paging or stop at its own cap, which ends as `inconsistent_pagination` rather than a
+      // false `confirmed_end`.
+      /**
+       * ## 空列表不是「读完了」（v0.2.33 §六）
+       *
+       * 平台可以在 `total_number` 非零的情况下返回一页 0 条：可能是这一页的窗口
+       * 落在已删除的区间，也可能是接口自己的缺陷。无论哪种，把它当成 `done` 都是
+       * 在声称「这帖子没有评论」——而平台刚刚说了有。
+       *
+       * 所以这里把「空页 + 声明总数非零 + 没有明确的结束信号」判成 `unknown`，
+       * 让采集器继续按自己的上限翻，最终以 `empty_page` 而不是 `confirmed_end` 收尾。
+       */
+      const declaredNonZero = page1.declaredTotal !== undefined && page1.declaredTotal > 0
+      const suspiciousEmpty = page1.comments.length === 0 && declaredNonZero
+      const state = suspiciousEmpty && page1.pagingState === 'done' ? 'unknown' : page1.pagingState
+      lastTrace = trace.snapshot()
+      return {
+        floors,
+        page,
+        hasMore: page1.hasMore || suspiciousEmpty,
+        ...(page1.declaredTotal === undefined ? {} : { declaredTotal: page1.declaredTotal }),
+        pagingState: state,
+        ...(state === 'unknown'
+          ? {
+              incomplete: true,
+            }
+          : {}),
+      }
+    },
+    getNestedReplies: async (ref, floor, page, signal) => {
+      const resolved = await requirePlan()
+      // `ref` is not sent: the official nested read is scoped by the parent comment id alone and
+      // a comment id is globally unique. Adding the thread id would need a flag the catalog may
+      // not declare, and an undeclared flag is a hard error in this CLI.
+      void ref
+      const plan = resolved.commentPlan
+      if (plan === undefined) {
+        throw new WeiboCommandUnavailableError(
+          resolved.commentProblem ?? '当前账号没有可用的微博评论读取命令。',
+        )
+      }
+
+      // ## Nested reads require a *verified* parent flag (v0.2.14 §四)
+      //
+      // v0.2.13 advertised `nestedReplies: true` whenever a comment command existed, then
+      // refused the read. The claim now comes from the same place as the refusal, so the two
+      // cannot disagree: if `readNested` is not `available`, this method throws with the
+      // plan's own reason and the capability table already said false.
+      const nestedClaim = plan.capabilities.readNested
+      if (!nestedClaim.available) {
+        diagnostics.recordError('permission_insufficient', nestedClaim.reason)
+        throw new WeiboCommandUnavailableError(nestedClaim.reason)
+      }
+
+      throwIfAborted(signal)
+      // ## Two different ids, and they must not be conflated (v0.2.14)
+      //
+      // The command is \`comments show/biz --id <微博id> --cid <评论id>\`: \`--id\` scopes the read to
+      // one *post*, \`--cid\` to one *comment under it*. Passing the comment id as the post id (as
+      // the first version of this rewrite did) asks the wrong question and gets top-level
+      // comments back — which then get projected as replies, inventing a conversation tree.
+      const invocation = plan.argsFor({
+        threadId: ref.threadId,
+        parentCommentId: floor.postId,
+        page,
+        pageSize: COMMENT_PAGE_SIZE,
+      })
+      if (invocation.pagingUnsupported) {
+        const reason =
+          invocation.omitted.find((entry) => entry.name === 'page')?.reason ??
+          `命令 ${plan.name} 无法表达页码。`
+        diagnostics.recordError('permission_insufficient', reason)
+        throw new WeiboCommandUnavailableError(reason)
+      }
+
+      const read = await runReadCommand<unknown>(plan, invocation.args)
+      guardRead(read.status, read.message)
+      const nestedPage = unwrapComments(read.data)
+      const replies: NestedReply[] = []
+      for (const comment of nestedPage.comments) {
+        const nested = projectCommentAsNested(comment, floor.postId)
+        if (nested !== undefined) replies.push(nested)
+      }
+      // ## `incomplete` means "this page is a degraded subset", NOT "there is another page"
+      //
+      // v0.2.11 set it whenever `hasMore` was true, which is just normal pagination. The
+      // collector reads `incomplete` as *degradation*, so every multi-page floor was reported
+      // as "楼中楼不完整" even after a clean full walk. It is now reserved for a payload whose
+      // paging state could not be read at all.
+      return {
+        replies,
+        page,
+        hasMore: nestedPage.hasMore,
+        ...(nestedPage.pagingState === 'unknown' ? { incomplete: true } : {}),
+      }
+    },
+    /**
+     * Locate one post by id, using only commands that have been verified.
+     *
+     * ## What this replaces (v0.2.28)
+     *
+     * It used to throw `本版未接入按 id 定位单条微博评论的命令`. That was honest about the
+     * missing command but wrong about the consequence: `resolveTarget` calls this method
+     * **before every generation**, so the whole workbench stopped at 「生成」 with a
+     * message about a command. The read path was implemented; the target check was not.
+     *
+     * ## How it works without inventing a command
+     *
+     * There is no verified "get comment by id" command, and this module will not guess
+     * that one exists. What *is* verified is the two reads already implemented above:
+     * the status body and the paged comment list. So the id is located the only honest
+     * way available — by walking the same pages the collector walks, in the same order,
+     * and stopping when the id appears.
+     *
+     * Two properties matter and are stated rather than implied:
+     *
+     * - **A miss is bounded, and says so.** The walk stops at `LOCATE_PAGE_LIMIT` pages.
+     *   Not finding the id inside that window means "not in the pages this build can
+     *   afford to read", which is a *different* claim from "does not exist" — and the
+     *   thrown error says which one it is making.
+     * - **The floor is reported as the platform reports it.** A Weibo comment has no 楼层,
+     *   so `floorNumber` is absent rather than filled with the comment's ordinal, and the
+     *   container for the thread body is the body itself (`isThreadBody`).
+     */
+    getReplyContext: async (ref, postId, signal) => {
+      const resolved = await requirePlan()
+      throwIfAborted(signal)
+
+      // The body itself. Its author is the post's author and it has no ancestors; this is
+      // the case that used to be unrepresentable because every context needed a floor.
+      if (postId === ref.threadId) {
+        const threadPlan = resolved.threadPlan
+        if (threadPlan === undefined) {
+          throw new WeiboCommandUnavailableError(
+            resolved.threadProblem ?? '当前账号没有可用的微博正文读取命令。',
+          )
+        }
+        const invocation = threadPlan.argsFor({ threadId: ref.threadId, page: 1 })
+        const read = await runReadCommand<unknown>(threadPlan, invocation.args)
+        guardRead(read.status, read.message)
+        const match = matchReturnedStatus(read.data, ref.threadId)
+        const payload = match.ok ? unwrapStatus(match.status) : undefined
+        if (payload === undefined) {
+          throw new WeiboCliError(
+            'target_mismatch',
+            `读取正文时没有拿到 ${ref.threadId}，无法确认这个目标。`,
+          )
+        }
+        const thread = projectThread(payload, ref.threadId, ref.url)
+        return {
+          thread,
+          floor: threadAsFloor(thread),
+          ancestors: [],
+          siblings: [],
+        }
+      }
+
+      const plan = resolved.commentPlan
+      if (plan === undefined) {
+        throw new WeiboCommandUnavailableError(
+          resolved.commentProblem ?? '当前账号没有可用的微博评论读取命令。',
+        )
+      }
+      // The thread is needed for the context's `thread` field, and reading it first is also
+      // what proves the id belongs to *this* thread rather than to another one.
+      const threadPlan = resolved.threadPlan
+      if (threadPlan === undefined) {
+        throw new WeiboCommandUnavailableError(
+          resolved.threadProblem ?? '当前账号没有可用的微博正文读取命令。',
+        )
+      }
+      const threadRead = await runReadCommand<unknown>(
+        threadPlan,
+        threadPlan.argsFor({ threadId: ref.threadId, page: 1 }).args,
+      )
+      guardRead(threadRead.status, threadRead.message)
+      const threadMatch = matchReturnedStatus(threadRead.data, ref.threadId)
+      const threadPayload = threadMatch.ok ? unwrapStatus(threadMatch.status) : undefined
+      if (threadPayload === undefined) {
+        throw new WeiboCliError(
+          'target_mismatch',
+          `读取正文时没有拿到 ${ref.threadId}，无法确认目标 ${postId} 属于这条微博。`,
+        )
+      }
+      const thread = projectThread(threadPayload, ref.threadId, ref.url)
+
+      for (let page = 1; page <= LOCATE_PAGE_LIMIT; page += 1) {
+        throwIfAborted(signal)
+        const invocation = plan.argsFor({ threadId: ref.threadId, page, pageSize: COMMENT_PAGE_SIZE })
+        if (invocation.pagingUnsupported) {
+          // Page 1 only. The id may still be on it, so it is read; if the id is not there
+          // the caller is told the search was cut short rather than that the post is gone.
+          if (page > 1) break
+        }
+        const read = await runReadCommand<unknown>(plan, invocation.args)
+        guardRead(read.status, read.message)
+        const payloads = unwrapComments(read.data)
+
+        for (const payload of payloads.comments) {
+          const floor = projectCommentAsFloor(payload)
+          if (floor === undefined) continue
+          if (floor.postId === postId) {
+            return { thread, floor, ancestors: [], siblings: [] }
+          }
+        }
+        // Nested replies are read under a floor the platform states as a parent. The paged
+        // top-level list does not contain them, so a reply id can only be found by asking
+        // the parent — and the parent is not known from the id alone. Rather than probing
+        // every floor (a request per floor, indistinguishable from a scrape), this reports
+        // the honest outcome: the id was not among the comments this read saw.
+        if (!payloads.hasMore || payloads.comments.length === 0) break
+      }
+
+      throw new WeiboCliError(
+        'not_found',
+        `在 ${ref.threadId} 的前 ${LOCATE_PAGE_LIMIT} 页评论里没有找到 ${postId}。` +
+          '它可能是这条微博下的楼中楼回复（本版没有按 id 直接定位的命令），' +
+          '也可能已被删除或不在可读范围内。为免把回复发到错误的位置，本次不会继续。',
+      )
+    },
+
+    /**
+     * Reading another account's profile is not implemented (v0.2.14 §四).
+     *
+     * The catalog may list a `users` command, but nothing here has verified that its shape
+     * returns a profile this plugin can use, and the task book is explicit that an unverified
+     * capability must not be advertised. Refusing says exactly that; returning a partial
+     * object would let a caller treat "we guessed some fields" as a profile.
+     */
+    getUserProfile: async (ref) => {
+      void ref
+      throw new WeiboCommandUnavailableError(
+        '本版未接入微博用户资料读取：命令形状尚未核对，不声明可用。',
+      )
+    },
+    /**
+     * Mentions are not readable through this CLI at all.
+     *
+     * The manual documents no 艾特 endpoint for third parties, so this is not "not yet" like the
+     * profile above — there is nothing to implement.
+     */
+    getMentions: async () => {
+      throw new WeiboCommandUnavailableError('微博的艾特通知不对第三方开放，本插件不读取。')
+    },
+    publishReply: async () => notAuthorised('发表评论'),
+    // Present so a caller can parse a Weibo link through the adapter itself, the same
+    // way a bare single-platform deployment does. This is pure and offline.
+    parseUrl: (input: string): ThreadRef => {
+      const ref = parseWeiboUrl(input)
+      return { platform: PLATFORM, threadId: ref.threadId, url: ref.url }
+    },
+  } as PlatformAdapter
+}
+
+/** The provider the registry holds. */
+export const weiboProvider: PlatformProvider = {
+  id: PLATFORM,
+  displayName: '微博',
+  shape: 'microblog',
+  canHandleUrl: weiboCanHandleUrl,
+  parseUrl: (input: string): ThreadRef => {
+    const ref = parseWeiboUrl(input)
+    return { platform: PLATFORM, threadId: ref.threadId, url: ref.url }
+  },
+  describeCapabilities,
+  createAdapter,
+}
