@@ -969,13 +969,14 @@ graph LR
 | G15 | `static/manifest.json` 过期且被跟踪 | **已修**：该文件已删除（`git status` 显示 `D`）；manifest 只剩 `dist/web/manifest.json`（6 项 + `version`） | `npm run build && npm run bundle` 后 `dist/web/manifest.json` 是唯一一份 |
 | G9-residual | `npm start` 空转（`runCli` 无模块级调用） | **已修**：既有独立的 `packages/server/src/main.ts`（`runCli(process.argv.slice(2))`），`cli.ts` 也加了 `INVOKED_DIRECTLY` 守卫（按 `process.argv[1]` 是否指向 cli 脚本决定自执行，被 import 时不执行） | `AI_DEBATE_HOME=<tmp> npm start` → `/healthz` **200**，日志「9 个工具、7 条路由」（实测） |
 | G17 | `differences.md` 测试数字略旧 | **已修**：现为「核心 113 + 服务端 20 + 前端 6 + 端到端 25 项」 | `grep -n "核心" docs/differences.md` 与实际测试数一致 |
+| G16 | `packages/web/static/assets/` 的产物被跟踪 | **已修**：`.gitignore` 加了 `packages/web/static/assets/`；`git ls-files packages/web/static` 现在只剩 `index.html` 与 `theme.css`（源文件） | `git ls-files packages/web/static` 只列 2 个源文件；`git status` 不再出现 MB 级产物 diff |
+| G8-residual | `known-issues.md` 差「限流计数在内存」一条 | **已修**：新增第 8 条「登录限流计数在内存里」，写明「重启后清零、不是可绕过漏洞、未落盘是因为写盘会成为登录路径的放大点」 | `grep -n 限流 docs/known-issues.md` 命中第 8 条 |
 
 #### 仍然开着的（发布前判断）
 
 | # | 缺口 | 实测证据 | 影响 | 处理建议 |
 |---|------|----------|------|----------|
-| **G16** | `packages/web/static/assets/` 的产物仍被跟踪 | `git ls-files packages/web/static` 仍列出 `assets/app.js`(318 KB)、`assets/app.js.map`(873 KB)、`assets/theme.css`；`.gitignore` 里两条 `packages/web/static/app.js*` 已失效（产物进了 `assets/` 子目录） | 每改一次前端就产生 ~1 MB 的 diff；「产物入库」与「CI 构建后打包」重复 | 二选一：① `.gitignore` 改成 `packages/web/static/assets/` 并 `git rm --cached`（推荐）；② 保留入库但删掉两条失效 ignore 规则 |
 | **G18** | **干净克隆里 `npm test` 直接失败**（测试依赖 `lib`，而 `lib` 不入库） | `git archive HEAD` 出来的树里跑 `test:core` → 首条就 `ERR_MODULE_NOT_FOUND: packages/core/lib/analyzer.js`；本地能过是因为之前 build 过。改测试去 import `../src/*` **不可行**（实测 `src/schema.js` 找不到，NodeNext 说明符不会被改写） | README 的「`npm test`」在新环境里不可信；新人第一次跑就红，会怀疑仓库坏了 | 加 `"pretest": "node scripts/build-core.mjs"`（改动一行，自动覆盖 `npm test`）；或把 `test:core` 前置 build。详见 `task-plan.md` WP8.4 |
-| **G8-residual** | `known-issues.md` 已覆盖「单实例」「审计不防篡改」，**只差「限流计数在内存」一条** | 现文 11 条；`grep -n 限流 docs/known-issues.md` 无命中 | 用户不知道「重启服务可以重置登录锁定」 | 补一条：「登录限流按 IP 与用户名计数，保存在内存；重启服务会清零——能重启本机服务的人可以重置锁定」 |
 
-**验收建议**：只剩 **3 项**——**G18**（干净克隆 `npm test` 失败，阻断级但一行可修）、**G16**（仓库里 ~1 MB 的构建产物，发布级）、**G8-residual**（`known-issues.md` 补一条，质量级）。其余 12 项（G3/G4/G6/G9/G9-residual/G10/G11/G12/G13/G14/G15/G17）都已修并有复现记录（见上表）。`task-plan.md` 的 WP8 相应为 4 个开发步骤 + 验收。
+
+**验收建议**：只剩 **1 项**——**G18**（干净克隆 `npm test` 失败，阻断级，一行可修）。其余 **14 项**（G3/G4/G6/G8-residual/G9/G9-residual/G10/G11/G12/G13/G14/G15/G16/G17）都已修并有复现记录（见上表）。`task-plan.md` 的 WP8 相应只剩 WP8.4 一个开发步骤 + 验收。

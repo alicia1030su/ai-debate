@@ -44,36 +44,17 @@
 | WP6 | CI 与发布 | ✅ `ci.yml`（secrets-scan → test 矩阵 → 两个打包 job，均 `needs: test`）；`release.yml`（`guard` 拒绝覆盖已存在 Release → `verify` → 两平台构建 → `publish` 生成 `SHA256SUMS` 并复验资产名，无 `--clobber`）；`scan-secrets.mjs`；`assert-no-dsh.mjs`（四查，含「打包二进制在无 DSH 环境下可 `--version`」） | `.github/workflows/**`、`scripts/{scan-secrets,assert-no-dsh}.mjs` |
 | 文档 | 用户文档 | ✅ `README.md`、`NOTICE`（上游 AGPL 来源）、`security.md`（保护/不保护都写明）、`install-windows.md`、`install-linux.md`、`migration.md`、`release-notes-v0.1.0.md` | `docs/**` |
 
-**自测状态（逐条实跑，2026-11-19 定时复核）**：`typecheck` ✅｜`build`（core+web）✅｜`bundle` ✅（`dist/ai-debate.cjs` 1127 KB + `dist/web` 6 资源）｜`package:windows` ✅（89.5 MB，`--version` 正常）｜`npm test` ✅（core **113**、server **20**、web **6**、acceptance **25/25**）｜`scan-secrets` ✅（exit 0，**182** 个受版本控制的文件）｜`assert-no-dsh` ✅（106 源文件 / 4 清单 / 91 线路）。**已修并复验**：G3、G4（第二个 `serve` exit 3）、G6、G9（入口文件已建）、G10、G11（含 fail-closed 对照）、G12、G13、G14、G15。**仍开 3 项**：静态产物入库与 gitignore 不一致（G16）｜known-issues 待补（G8-residual）｜干净克隆 `npm test` 失败（G18）。
+**自测状态（逐条实跑，2026-11-19 定时复核）**：`typecheck` ✅｜`build`（core+web）✅｜`bundle` ✅（`dist/ai-debate.cjs` 1127 KB + `dist/web` 6 资源）｜`package:windows` ✅（89.5 MB，`--version` 正常）｜`npm test` ✅（core **113**、server **20**、web **6**、acceptance **25/25**）｜`scan-secrets` ✅（exit 0，**182** 个受版本控制的文件）｜`assert-no-dsh` ✅（106 源文件 / 4 清单 / 91 线路）。**已修并复验**：G3、G4（第二个 `serve` exit 3）、G6、G8-residual、G9、G10、G11（含 fail-closed 对照）、G12、G13、G14、G15、G16、G17。**仍开 1 项**：干净克隆 `npm test` 失败（G18，见 WP8.2）。G16 与 G8-residual 已在本轮修掉。
 
 ---
 
-## 第二部分：剩余工作（4 个开发步骤 + 验收）
+## 第二部分：剩余工作（2 个开发步骤 + 验收）
 
 > 实测基线（本机 Node 22.22.2）：`typecheck` ✅｜`build` ✅｜`bundle` ✅（`dist/ai-debate.cjs` ~1127 KB + `dist/web` 6 资源）｜`package:windows` ✅（89.5 MB，`--version` → `AI Debate 0.1.0 (win32-x64)`）｜`npm test` ✅（core **113** + server **20** + web **6** + acceptance **25/25**）｜`scan-secrets` ✅｜`assert-no-dsh` ✅（108 源文件 / 4 清单 / 91 线路）｜`npm start` → `/healthz` **200** ✅。
 > 已修并复验：G3、G4、G6、G9、G9-residual、G10、G11、G12、G13、G14、G15、G17。
-> 仍开：G16（构建产物入库）、G8-residual（known-issues 一条）、**G18（干净克隆 `npm test` 失败，阻断级，见 WP8.4）**。
+> 仍开：**G18（干净克隆 `npm test` 失败，阻断级，见 WP8.2）**。
 
-### WP8.1 `[release]` 静态产物与 `.gitignore` 对齐（G16）
-
-| 项 | 内容 |
-|----|------|
-| 现状 | `git ls-files packages/web/static` 仍有 `assets/app.js`(318 KB)、`assets/app.js.map`(873 KB)、`assets/theme.css`；`.gitignore` 里两条 `packages/web/static/app.js*` 已失效（产物在 `assets/` 子目录） |
-| 做法（推荐） | ① `.gitignore` 改成 `packages/web/static/assets/`（删掉两条失效规则）；② `git rm --cached -r packages/web/static/assets`；③ 确认管线：`build-web.mjs` 写 `static/assets/`，`bundle-server.mjs` 复制到 `dist/web/`，CI 先 build 再 package（已是这个顺序） |
-| 备选 | 保留产物入库，但删掉失效 ignore 规则并让 `build-web.mjs` 同时写 `static/manifest.json`，使两份一致 |
-| 验收 | ① 干净状态下 `npm run build && npm run bundle` 只改 `dist/`；② 打包出的 EXE 仍能加载页面（`curl /` → 200）；③ `git status` 不再出现 1 MB 级产物 diff |
-| 依赖 | 无 |
-
-### WP8.2 `[quality]` 补齐 `known-issues.md`（G8-residual）
-
-| 项 | 内容 |
-|----|------|
-| 现状 | 已有 11 条（未签名、ARM64、无 TLS、单实例、多用户、微博 CLI、审计不防篡改等）；`grep -n 限流 docs/known-issues.md` 无命中 |
-| 补 | 一条：「登录限流按 IP 与用户名计数，保存在内存；重启服务会清零——能重启本机服务的人可以重置锁定」 |
-| 验收 | 每条都写明「现在是什么行为」与「缓解方式」，不写「可能会」 |
-| 依赖 | 无 |
-
-### WP8.3 `[quality]` 给队列红线补一条运行时反例测试（ADR-018 建议项）
+### WP8.1 `[quality]` 给队列红线补一条运行时反例测试（ADR-018 建议项）
 
 | 项 | 内容 |
 |----|------|
@@ -83,7 +64,7 @@
 | 验收 | 新测试红→绿：先故意把 publish 塞进队列能跑通（证明测试有效），再断言它不能 |
 | 依赖 | 无 |
 
-### WP8.4 `[blocked]` 让 `npm test` 在干净克隆里能跑（测试依赖 `lib` 的隐性前置）
+### WP8.2 `[blocked]` 让 `npm test` 在干净克隆里能跑（测试依赖 `lib` 的隐性前置）
 
 | 项 | 内容 |
 |----|------|
@@ -94,7 +75,7 @@
 | 验收 | ① 删掉 `packages/core/lib` 后 `npm test` 仍全绿（pretest 自动构建）；② 干净树（`git archive HEAD`）里 `npm install && npm test` 全绿；③ 总时长增加 ≤3s |
 | 依赖 | 无 |
 
-### WP8.5 `[release]` 双平台真机验收（收口）
+### WP8.3 `[release]` 双平台真机验收（收口）
 
 | # | 检查 | 通过标准 |
 |---|------|----------|
@@ -121,13 +102,11 @@
 
 ```mermaid
 graph TD
-  WP81[WP8.1 静态产物与 gitignore] --> WP85[WP8.5 双平台验收]
-  WP82[WP8.2 补 known-issues] --> WP85
-  WP83[WP8.3 队列反例测试] --> WP85
-  WP84[WP8.4 npm test 的 lib 前置] --> WP85
+  WP81[WP8.1 队列反例测试] --> WP83[WP8.3 双平台验收]
+  WP82[WP8.2 npm test 的 lib 前置] --> WP83
 ```
 
-**关键路径**：`WP8.1 / WP8.2 / WP8.3 / WP8.4 → WP8.5`。四步互相独立，可并行。
+**关键路径**：`WP8.1 / WP8.2 → WP8.3`。两步互相独立，可并行。
 
 ## 第四部分：提交约定
 

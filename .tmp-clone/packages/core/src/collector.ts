@@ -1,0 +1,1422 @@
+/**
+ * Context collection: turn a thread reference into a complete, structured
+ * conversation graph.
+ *
+ * Design rule this module exists to enforce: **the model never reads raw HTML
+ * and never sees a page it was not given**. Collection happens first, in code,
+ * and everything afterwards works on typed records. That is what lets a small
+ * model succeed — it receives a compact, already-correct structure instead of
+ * being asked to reconstruct who replied to whom from a wall of text.
+ *
+ * Pagination lives here, on the *generic* adapter interface, not inside the
+ * Tieba adapter. A second platform then gets correct paging, deduplication and
+ * partial-result reporting for free, and cannot quietly implement "read page 1
+ * and call it done".
+ */
+
+import {
+  PlatformError,
+  type Floor,
+  type IdentitySource,
+  type NestedReply,
+  type NumericUidNamespace,
+  type PlatformAdapter,
+  type PlatformId,
+  type ReplyContext,
+  type Thread,
+  type ThreadRef,
+} from './types.js'
+import {
+  assuranceOf,
+  conflictBetween,
+  corroborationOf,
+  corroborationReason,
+  type CorroborationReason,
+  type CorroborationVerdict,
+  type IdentityObservation,
+  type AuthorIdentity,
+  type IdentityAssurance,
+  type IdentityConflictReport,
+} from './identity.js'
+
+/** How much of a thread to collect. */
+export interface CollectOptions {
+  /** Hard cap on floor pages walked. */
+  readonly maxPages?: number
+  /** Safety cap on floors kept. */
+  readonly maxFloors?: number
+  /** How many floors get their nested replies fetched. */
+  readonly nestedFloorLimit?: number
+  /** Fetch nested replies only for floors this predicate accepts. */
+  readonly wantNested?: (floor: Floor) => boolean
+  readonly signal?: AbortSignal
+  readonly onProgress?: (progress: CollectProgress) => void
+}
+
+/** Progress of a collection run. */
+export interface CollectProgress {
+  readonly stage: 'thread' | 'floors' | 'nested' | 'done'
+  readonly message: string
+  readonly current?: number
+  readonly total?: number
+}
+
+/**
+ * The four independent things "complete" used to mean, separated.
+ *
+ * v0.2.1 had one boolean `complete`, and it answered every question at once. The
+ * problem is that they genuinely differ: a thread can be read perfectly from the
+ * platform and then trimmed to the first floor by `maxFloors`, and the old flag
+ * stayed `true` — the data handed to the model was *not* the thread, while the
+ * plugin said the read was complete.
+ *
+ * Reproduced before this change: a platform returns 3 floors, `maxFloors: 1`, and
+ * `complete` was still `true`.
+ *
+ * Keeping them apart is what lets each one be honest:
+ *
+ * | field | question it answers |
+ * | --- | --- |
+ * | `sourceComplete` | did the platform's own evidence prove we saw all of it? |
+ * | `retainedComplete` | did we *keep* everything we read? |
+ * | `analysisComplete` | is the dispute chain we need actually present? |
+ * | `nestedComplete` | were the sub-comments under each floor fully read? |
+ *
+ * `sourceComplete` can be true while `retainedComplete` is false (read 3, kept 1
+ * by cap) — that combination is exactly what v0.2.1 could not express, and it is
+ * the one that matters most: the model must be told that replies exist which it
+ * has not seen, so it cannot invent them.
+ */
+export interface CompletenessReport {
+  /** The platform's evidence proves the floor list was read in full. */
+  readonly sourceComplete: boolean
+  /** Everything read was kept; no cap, trim or sampling dropped anything. */
+  readonly retainedComplete: boolean
+  /** The argument chain needed to answer is present, so publishing is safe. */
+  readonly analysisComplete: boolean
+  /** Every floor's nested replies were read to the platform's declared count. */
+  readonly nestedComplete: boolean
+  /** Floors the platform declares that could not be read (usually deleted). */
+  readonly missingCount?: number
+  /** Floors dropped locally by `maxFloors`, stated so nothing is silently lost. */
+  readonly droppedByCap?: number
+  /** Fraction of declared floors retained, when a total was declared. */
+  readonly retainedRatio?: number
+  /** Why any of the above is false, phrased for a human. */
+  readonly reasons: readonly string[]
+}
+
+/** Everything collected for one thread. */
+export interface CollectedThread {
+  readonly thread: Thread
+  readonly floors: readonly FloorWithNested[]
+  /**
+   * True when every declared floor was read *and* kept.
+   *
+   * Kept as a single flag for v0.2.x callers. v0.2.2 made it strictly stronger
+   * than before: it is now the conjunction of `sourceComplete` and
+   * `retainedComplete`, so a capped read no longer reports `true`. New code
+   * should read {@link completeness} instead, which says which part failed.
+   */
+  readonly complete: boolean
+  /** The separated verdicts. Always present on a v0.2.2 or later read. */
+  readonly completeness: CompletenessReport
+  /**
+   * How well each post's identity was corroborated (v0.2.23 patch 5).
+   *
+   * Separate from `assurance` because the two answer different questions: assurance
+   * says "is this enough to act on", corroboration says "was it checked twice".
+   * Merging them is how a single-source match ends up described as cross-verified.
+   */
+  readonly corroboration?: ReadonlyMap<string, CorroborationVerdict>
+  /**
+   * Why each corroboration verdict came out that way.
+   *
+   * Carried alongside rather than recomputed by the consumer: the collector is the
+   * only place that saw the per-surface observations, and a second derivation could
+   * disagree with the first.
+   */
+  readonly corroborationReasons?: ReadonlyMap<string, CorroborationReason>
+  /**
+   * Every identity sighting per post id, including ones whose comment was
+   * de-duplicated away (v0.2.23 patch 8).
+   *
+   * Exposed so a caller can audit *why* a verdict came out the way it did, and so
+   * the fact that two surfaces spoke about one comment survives anywhere the raw
+   * collection is inspected.
+   */
+  readonly identityObservations?: ReadonlyMap<string, readonly IdentityObservation[]>
+  /** Post ids whose distinct sightings exceeded the retention cap. */
+  readonly observationOverflow?: readonly string[]
+  /** Floors the platform declares but that were not readable (usually deleted). */
+  readonly missingCount?: number
+  /** Why the floor walk stopped, so callers can distinguish causes. */
+  readonly stopReason?: StopReason
+  /**
+   * True when more pages were **known** to remain when the walk stopped.
+   *
+   * Known means positive evidence: the platform declared more pages or floors
+   * than were read, or the last page it served said `hasMore: true`. A failure on
+   * page 1 satisfies none of those, so it stays false there — the failure is
+   * reported through `stopReason` instead. See {@link FloorWalk.truncated}.
+   */
+  readonly truncated?: boolean
+
+  /** True when any floor's nested replies were read incompletely. */
+  readonly nestedIncomplete?: boolean
+  /**
+   * Proven cross-source authorship disagreements found while collecting
+   * (v0.2.23).
+   *
+   * A non-empty list means at least one post id was described by two surfaces
+   * with identities that cannot both be true. Owner resolution and publishing
+   * must refuse while this is non-empty for the affected post — see
+   * `analyzer.resolveOwnerKey` and `safety.checkPublishPolicy`.
+   */
+  readonly identityConflicts?: readonly IdentityConflictReport[]
+  /** Non-fatal problems, phrased for a human. */
+  readonly issues: readonly string[]
+  /** Floors the platform declared for the whole thread, when it said (v0.2.24). */
+  readonly declaredTotal?: number
+  /** Floor pages actually fetched (v0.2.24). */
+  readonly pagesRead?: number
+}
+
+/** A floor plus whatever nested replies were collected under it. */
+export interface FloorWithNested {
+  readonly floor: Floor
+  readonly nested: readonly NestedReply[]
+  /** True when the platform's own count was reached. */
+  readonly nestedComplete: boolean
+}
+
+/**
+ * Why a walk stopped.
+ *
+ * These are deliberately distinct: "the platform says that was the last page" and
+ * "I hit my own page cap" produce the same short floor list but mean opposite
+ * things about trustworthiness, and the UI has to be able to say which happened.
+ *
+ * **Only `confirmed_end` is positive evidence that the read is complete.** Every
+ * other value means the walk ended without proving there was nothing more —
+ * including `empty_page` and `repeated_page`, which v0.2.0 treated as a normal
+ * end. That was the bug: a platform that returned nothing on page 1, or repeated
+ * the same rows until the walk gave up, produced `complete: true` on the strength
+ * of having read no data at all.
+ */
+export type StopReason =
+  /** The platform stated this was the last page, or the declared total was reached. */
+  | 'confirmed_end'
+  /** A page came back empty, with no declared total to corroborate it. */
+  | 'empty_page'
+  /** A page contained only rows already seen, with no declared total to corroborate it. */
+  | 'repeated_page'
+  /** The walk's own `maxPages` was reached while more pages existed. */
+  | 'page_cap'
+  /** A request failed outright. */
+  | 'request_error'
+  /** The platform rate-limited the channel. */
+  | 'rate_limited'
+  /** A degraded source returned fewer rows than it claimed. */
+  | 'degraded'
+  /** The platform reports the content as deleted or unavailable. */
+  | 'deleted_or_unavailable'
+  /**
+   * The platform's own pagination signals contradict each other.
+   *
+   * v0.2.2: a platform that declares `declaredTotalPages: 8` and then answers
+   * page 1 with `hasMore: false` used to be taken at its word — the walk stopped
+   * with `pagesRead: 1, complete: true, stopReason: 'confirmed_end'`. Two
+   * mutually exclusive claims ("there are 8 pages" / "page 1 was the last") were
+   * resolved in favour of whichever field the code happened to read first.
+   *
+   * Neither claim can be trusted alone once they conflict, so the read is neither
+   * complete nor failed: it is *inconsistent*, and saying so is the only honest
+   * answer. The data read so far is kept.
+   */
+  | 'inconsistent_pagination'
+  /** The walk ended for a reason this module cannot classify. */
+  | 'unknown'
+
+/** The outcome of walking every floor page. */
+export interface FloorWalk {
+  readonly floors: readonly Floor[]
+  readonly declaredTotal?: number
+  readonly totalPages?: number
+  readonly pagesRead: number
+  readonly complete: boolean
+  readonly missingCount?: number
+  readonly error?: string
+  /** Why the walk ended; `page_cap` means the read is incomplete by definition. */
+  readonly stopReason: StopReason
+  /**
+   * True when more pages were known to remain when the walk stopped.
+   *
+   * "Known" means the walk holds positive evidence, not a guess: the platform
+   * declared more pages than were read, declared more floors than were seen, or
+   * the last page it served said `hasMore: true`. A failure on page 1 satisfies
+   * none of those — nothing was promised, so `truncated` stays false there, and
+   * `stopReason` carries the only claim the walk can make.
+   *
+   * v0.2.22: this used to be set only by `page_cap`. A 403 on page 2 of a
+   * five-page thread therefore reported `truncated: false` next to a
+   * `deleted_or_unavailable` stop, which reads as "the thread ended" rather than
+   * "five pages existed and two were read".
+   */
+  readonly truncated: boolean
+  /**
+   * True when a page said it was a degraded subset of itself.
+   *
+   * Distinct from `truncated`: `truncated` is "the platform promised more and we
+   * did not get it"; `degraded` is "this page does not know what it does not
+   * know". v0.2.33: the weibo adapter reports `incomplete: true` when the paging
+   * cursor is missing or unrecognisable — the platform answered, but its answer
+   * carries no statement about whether the list ends here.
+   *
+   * Without this field the walk reported `repeated_page` + `complete: false` +
+   * `truncated: false` + **no issues at all** for that case: it knew it had not
+   * finished, and could not say why. Callers reading `truncated` alone saw
+   * "nothing is missing".
+   */
+  readonly degraded?: boolean
+  /**
+   * Human-readable notes about coverage, including signal contradictions.
+   *
+   * v0.2.2: the walk can end while platform signals disagree, and that fact is
+   * worth keeping even though `stopReason` already names it, because the caller
+   * has to be able to tell the user *which* numbers disagreed.
+   */
+  readonly issues: readonly string[]
+}
+
+/** Append a note without repeating one that is already there. */
+function appendIssue(issues: readonly string[], note: string): string[] {
+  return issues.includes(note) ? [...issues] : [...issues, note]
+}
+
+/**
+ * Walk every floor page of a thread through the generic adapter interface.
+ *
+ * Stops on any of: an error, an empty page, a page of only already-seen floors,
+ * the declared last page, or the page cap. Deduplication is by post id, so a
+ * platform that repeats the last floor on every page cannot inflate the count.
+ */
+export async function walkFloors(
+  adapter: PlatformAdapter,
+  ref: ThreadRef,
+  options: { maxPages?: number; signal?: AbortSignal; onPage?: (page: number, collected: number) => void } = {},
+): Promise<FloorWalk> {
+  const maxPages = options.maxPages ?? 60
+  const seen = new Map<string, Floor>()
+  let declaredTotal: number | undefined
+  let totalPages: number | undefined
+  let pagesRead = 0
+  let page = 1
+  let failed: string | undefined
+  // Tracked separately from `page` because the loop can end for several reasons
+  // at the same page number, and only some of them mean "nothing left to read".
+  let stopped: StopReason = 'unknown'
+  let truncated = false
+  /**
+   * The last page that was read successfully said "there is more after me".
+   *
+   * Kept because the failure branch cannot recompute it: once `getReplies`
+   * throws, the only evidence about unread pages is what earlier responses
+   * already promised. v0.2.21 read this as `truncated: false` for a 403 on page
+   * 2 — the walk knew page 1 had `hasMore: true`, reported the failure honestly
+   * in `stopReason`, and then contradicted itself one field over.
+   */
+  let sawMorePages = false
+  /**
+   * Any page declared itself a degraded subset (`incomplete: true`).
+   *
+   * Kept separate from `truncated` for the reason on {@link FloorWalk.degraded}:
+   * the two answer different questions, and collapsing them is how "we don't
+   * know" turns into "nothing is missing".
+   */
+  let degraded = false
+  /** Only the first degraded page gets a note; 60 identical notes help nobody. */
+  let degradedNoted = false
+  // Contradictions and coverage notes found while walking. Kept here rather than
+  // in `collectThread` because the walk is what observes them, and a caller that
+  // reads `stopReason` needs the explanation next to it.
+  let issues: string[] = []
+
+  while (page <= maxPages) {
+    let result
+    try {
+      result = await adapter.getReplies(ref, page, options.signal)
+    } catch (error) {
+      failed = (error as Error).message
+      // A rate-limit is not the same fact as a transport error: one says "slow
+      // down and the data is still there", the other says "the read failed".
+      const code = (error as { code?: unknown }).code
+      stopped =
+        code === 'rate_limited'
+          ? 'rate_limited'
+          : code === 'not_found' || code === 'forbidden'
+            ? 'deleted_or_unavailable'
+            : 'request_error'
+      // The failure is the *reason* the walk stopped — it is not evidence about
+      // what was left. Two independent facts, answered separately:
+      //
+      // - `complete` stays false in every branch below, because an error cannot
+      //   prove the thread was read in full;
+      // - `truncated` is true only when the walk has positive evidence that
+      //   unread pages exist. A 403 on page 1 is "I know nothing"; a 403 on page
+      //   2 after page 1 said `hasMore: true`, or with `declaredTotalPages: 5`,
+      //   is "there are pages I did not read".
+      //
+      // Saying `truncated: false` for the second case is not caution, it is a
+      // false statement: it claims the walk stopped because there was nothing
+      // left. That is the state a caller would render as "read it all".
+      const declaredPagesRemaining = totalPages !== undefined && pagesRead < totalPages
+      const declaredFloorsRemaining =
+        declaredTotal !== undefined && declaredTotal > 0 && seen.size < declaredTotal
+      const promisedPages = sawMorePages && pagesRead > 0
+      if (declaredPagesRemaining || declaredFloorsRemaining || promisedPages) {
+        truncated = true
+        issues = appendIssue(
+          issues,
+          `分页在第 ${page} 页中断（${failed}），` +
+            (declaredPagesRemaining
+              ? `平台声明共 ${totalPages} 页，只读到 ${pagesRead} 页`
+              : declaredFloorsRemaining
+                ? `平台声明共 ${declaredTotal} 楼，只读到 ${seen.size} 楼`
+                : '上一页明确表示还有更多内容') +
+            '：已读取的部分保留，但这不是完整结果。',
+        )
+      } else {
+        // v0.2.23: a failure with no evidence of more pages is still a failure,
+        // and the reason must survive. v0.2.22 left `issues` empty here, so the
+        // only thing a caller could report was "no floors" — which the tool
+        // turned into "the post may be deleted or require login", even when the
+        // platform had answered with a security-verification page.
+        issues = appendIssue(
+          issues,
+          `第 ${page} 页读取失败（${failed}）：没有读到任何内容，` +
+            '这不是「读完了」，是「没有开始」。',
+        )
+      }
+      break
+    }
+    pagesRead += 1
+    /**
+     * ## 一页自己说「我不完整」时，必须记下来（v0.2.33）
+     *
+     * 微博的 `pagingState: 'unknown'`（游标缺失或认不出）走的就是这条路：
+     * 平台答了话，但它的话里没有「后面还有没有」。此前 `walkFloors` 完全没读
+     * 这个字段，于是这种读法停在 `repeated_page`，`truncated` 仍是 `false`，
+     * `issues` 是空的——三样加在一起读起来像「读完了，只是碰巧重复了一页」。
+     *
+     * 现在它是一条明确的降级：`degraded: true`，外加一句写清「不知道」的话。
+     */
+    if (result.incomplete === true) {
+      degraded = true
+      if (!degradedNoted) {
+        degradedNoted = true
+        issues = appendIssue(
+          issues,
+          `第 ${page} 页没有说明后面还有没有内容（分页信号缺失或无法识别）：` +
+            `已读取的 ${seen.size + result.floors.length} 条保留，但无法据此断定讨论已读完。`,
+        )
+      }
+    }
+    // The platform declares the thread's full floor count and page count; keep
+    // the first values reported, since later pages repeat them.
+    declaredTotal ??= result.declaredTotal
+    totalPages ??= result.declaredTotalPages
+
+    let added = 0
+    for (const floor of result.floors) {
+      if (!seen.has(floor.postId)) {
+        seen.set(floor.postId, floor)
+        added += 1
+      }
+    }
+    options.onPage?.(page, seen.size)
+
+    // Remember the platform's own promise about what comes next. Only a page we
+    // actually read can make this promise; a page that failed says nothing.
+    if (result.hasMore) sawMorePages = true
+
+    // A declared total is corroboration: when the platform tells us how many
+    // floors exist, reaching that number is proof, and falling short is evidence
+    // of a gap. Without one, an empty or repeating page proves only that the walk
+    // has stopped producing new data — not that there is none.
+    //
+    // `>` rather than `===` because over-running the declared total is its own
+    // contradiction: a platform that says "10 floors" and then serves 12 has
+    // demonstrated that its own count is wrong, so that count cannot be used to
+    // certify anything. Treating "≥ declared" as proof of completeness would let
+    // the very number that just proved unreliable certify the read.
+    const declaredTotalOverrun =
+      declaredTotal !== undefined && declaredTotal > 0 && seen.size > declaredTotal
+    if (declaredTotalOverrun) {
+      stopped = 'inconsistent_pagination'
+      issues = appendIssue(
+        issues,
+        `平台分页信号自相矛盾：声明共 ${declaredTotal} 楼，实际读到 ${seen.size} 楼。` +
+          '平台给出的楼层总数已经不可信，无法据此断言已读完整；数据保留，完整性不成立。',
+      )
+      break
+    }
+    const reachedDeclaredTotal =
+      declaredTotal !== undefined && declaredTotal > 0 && seen.size === declaredTotal
+
+    if (result.floors.length === 0) {
+      stopped = reachedDeclaredTotal ? 'confirmed_end' : 'empty_page'
+      break
+    }
+    if (added === 0) {
+      // The page held rows, but every one was already seen. That is the "platform
+      // repeats the last page forever" case.
+      stopped = reachedDeclaredTotal ? 'confirmed_end' : 'repeated_page'
+      break
+    }
+    // The two "declared limits reached" branches below are the *reverse* of the
+    // `hasMore: false` conflict further down, and v0.2.2 initially missed them:
+    // the platform says `hasMore: true` ("there is another page") while its own
+    // count says this was the last one. Stopping there and calling it
+    // `confirmed_end` silently dropped the page the platform just promised.
+    //
+    // `hasMore: true` is the more direct claim — it is about the data that
+    // exists right now, whereas a declared total is a summary that can go stale.
+    // So a contradiction is reported rather than resolved: neither signal is
+    // trusted to certify completeness.
+    if (reachedDeclaredTotal || (totalPages !== undefined && page >= totalPages)) {
+      if (result.hasMore) {
+        stopped = 'inconsistent_pagination'
+        issues = appendIssue(
+          issues,
+          `平台分页信号自相矛盾：${reachedDeclaredTotal ? `声明共 ${declaredTotal} 楼` : `声明共 ${totalPages} 页`}，` +
+            `按此已读到最后，但平台同时说还有更多内容。已读取的 ${seen.size} 条保留，` +
+            '但无法断定已读完整（平台承诺的下一页没有读取）。',
+        )
+        break
+      }
+      stopped = 'confirmed_end'
+      break
+    }
+    if (!result.hasMore) {
+      // `hasMore: false` is the platform's own word that this was the last page.
+      // But it can *contradict* its other declaration: v0.2.1 read this branch
+      // first and returned `complete: true` for a thread the platform had just
+      // described as 8 pages long. Two exclusive claims cannot both be evidence,
+      // so when they disagree the walk reports the disagreement instead of
+      // picking a winner.
+      const contradictsPageCount =
+        totalPages !== undefined && pagesRead < totalPages
+      if (contradictsPageCount) {
+        stopped = 'inconsistent_pagination'
+        issues = appendIssue(
+          issues,
+          `平台分页信号自相矛盾：声明共 ${totalPages} 页，但第 ${pagesRead} 页就报告没有更多了。` +
+            `已读取的 ${seen.size} 条保留，但无法据此断定已读完整。`,
+        )
+        break
+      }
+      // A declared floor total that has not been reached is the same kind of
+      // contradiction one level up: "there are N floors" versus "no more pages".
+      const contradictsFloorTotal =
+        declaredTotal !== undefined && declaredTotal > 0 && seen.size < declaredTotal
+      if (contradictsFloorTotal) {
+        stopped = 'inconsistent_pagination'
+        issues = appendIssue(
+          issues,
+          `平台分页信号自相矛盾：声明共 ${declaredTotal} 层，但读完后只有 ${seen.size} 层且平台说没有更多页了。` +
+            `可能是评论被删除，也可能是分页提前结束；已读取的数据保留，完整性不成立。`,
+        )
+        break
+      }
+      stopped = 'confirmed_end'
+      break
+    }
+    // The page cap is a self-imposed limit. Hitting it while the platform still
+    // reports more pages means the read is short, and saying "complete" would be
+    // a lie about coverage.
+    if (page >= maxPages) {
+      stopped = 'page_cap'
+      truncated = true
+      break
+    }
+    page += 1
+  }
+
+  /**
+   * ## 「没读到」与「读完了」之间还有第三种：平台承诺过、我们没拿到
+   *
+   * `empty_page` 与 `repeated_page` 这两个收尾都是「走不动了」，不是「没有了」。
+   * 如果此前的页面说过 `hasMore: true`，或者平台声明的总数还没读满，那么停止的
+   * 原因就不是「到底了」，而是「平台答应了更多，我们拿不到」——这正是
+   * `truncated` 的定义（有**正面证据**说明还有未读内容）。
+   *
+   * v0.2.33 之前这里只看 `page_cap` 与失败分支，于是「声明 9 条、读到 1 条、
+   * 第 2 页开始重复」会报 `truncated: false`——数据少读了 8 条，却告诉调用方
+   * 「没有漏」。同一族的错误在 v0.2.21 修过一次（403 那回），这里是它的另一半。
+   */
+  if (!truncated && (stopped === 'empty_page' || stopped === 'repeated_page')) {
+    const promisedByCursor = sawMorePages
+    const promisedByTotal = declaredTotal !== undefined && declaredTotal > 0 && seen.size < declaredTotal
+    if (promisedByCursor || promisedByTotal) {
+      truncated = true
+      issues = appendIssue(
+        issues,
+        promisedByTotal
+          ? `平台声明共 ${declaredTotal} 条，实际只读到 ${seen.size} 条，分页在第 ${pagesRead} 页走不动了：` +
+            '已读取的部分保留，但这不是完整结果。'
+          : `第 ${pagesRead} 页之后读不到新内容，而此前的页面明确表示还有更多：` +
+            `已读取的 ${seen.size} 条保留，但这不是完整结果。`,
+      )
+    }
+  }
+
+  const floors = [...seen.values()].sort((a, b) => (a.floorNumber ?? 0) - (b.floorNumber ?? 0))
+  const missingCount =
+    declaredTotal !== undefined && declaredTotal > floors.length ? declaredTotal - floors.length : undefined
+
+  // Completeness requires positive evidence, not merely the absence of an error.
+  //
+  // Every one of these must hold:
+  // 1. the walk ended because the platform said so (`confirmed_end`);
+  // 2. nothing failed on the way (`failed === undefined`);
+  // 3. where a total was declared, every declared floor is actually here;
+  // 4. the platform's own signals did not contradict each other.
+  //
+  // (4) is v0.2.2. `confirmed_end` used to be reachable through the `hasMore:
+  // false` branch *even when* the same response had declared eight pages, so a
+  // contradictory response still produced a confident "complete". A contradiction
+  // is now its own stop reason, which is not `confirmed_end`, so this expression
+  // already rejects it — the explicit check below documents the intent and keeps
+  // it from regressing if the branches are ever reordered.
+  const complete =
+    failed === undefined &&
+    stopped === 'confirmed_end' &&
+    missingCount === undefined &&
+    !truncated
+
+  return {
+    floors,
+    declaredTotal,
+    totalPages,
+    pagesRead,
+    complete,
+    missingCount,
+    error: failed,
+    stopReason: stopped,
+    truncated,
+    // 只有真发生过才写：`{ degraded: false }` 与「没有这个字段」在读者眼里
+    // 是两件事，前者断言「每一页都说得清」，而没能读到的页根本没资格这么说。
+    ...(degraded ? { degraded: true } : {}),
+    issues,
+  }
+}
+
+/**
+ * Distinct identity sightings kept per comment before the cap applies.
+ *
+ * Bounded because a hostile or broken page could otherwise enumerate handles for one
+ * post id indefinitely. Reachable combinations in practice are three origins times a
+ * handful of values, so this is far above normal and low enough to stay small.
+ */
+const MAX_OBSERVATIONS_PER_POST = 8
+
+/** Walk every page of nested replies under one floor. */
+export async function walkNested(
+  adapter: PlatformAdapter,
+  ref: ThreadRef,
+  floor: Floor,
+  options: { maxPages?: number; signal?: AbortSignal } = {},
+): Promise<{
+  replies: readonly NestedReply[]
+  complete: boolean
+  error?: string
+  degraded?: boolean
+  conflicts?: readonly IdentityConflictReport[]
+  assurance?: ReadonlyMap<string, IdentityAssurance>
+  /** How well each post's identity was corroborated (v0.2.23 patch 5). */
+  corroboration?: ReadonlyMap<string, CorroborationVerdict>
+  /** The reason behind each verdict, for user-facing text. */
+  corroborationReasons?: ReadonlyMap<string, CorroborationReason>
+  /** Every retained identity sighting, per post id. */
+  identityObservations?: ReadonlyMap<string, IdentityObservation[]>
+  /** Post ids that hit the retention cap. */
+  observationOverflow?: string[]
+}> {
+  const maxPages = options.maxPages ?? 10
+  const seen = new Map<string, NestedReply>()
+  /**
+   * The first sighting of each post id, kept so a later sighting can be compared
+   * against it instead of being discarded.
+   *
+   * v0.2.22 dropped the duplicate here with `if (!seen.has(...))`. That is the
+   * one place where a cross-source disagreement could have been noticed, and it
+   * was exactly the place that threw it away.
+   */
+  const firstSurface = new Map<string, NestedReply>()
+  /**
+   * Every identity sighting, kept per post id (v0.2.23 patch 8).
+   *
+   * ## Why this is separate from `seen`
+   *
+   * `seen` de-duplicates comments by post id, which is right for counting, for
+   * candidate generation and for publishing. But the corroboration verdict used to be
+   * computed from that same de-duplicated list, so `replies.filter(postId === x)`
+   * always returned a single row — one observation per post, forever. `corroborated`,
+   * `incomparable` and `inconsistent` were unreachable through the production path
+   * even though each had passing unit tests.
+   *
+   * This map is written *before* a duplicate is discarded, so the second sighting of
+   * a comment survives for identity analysis while the comment itself is still
+   * counted once.
+   */
+  const identityObservations = new Map<string, IdentityObservation[]>()
+  /** Post ids whose distinct observations exceeded the cap. Never silent. */
+  const observationOverflow = new Set<string>()
+  const record = makeRecorder(identityObservations, observationOverflow)
+  /**
+   * True when the walk stopped while the platform still claimed more replies.
+   *
+   * Distinct from `degraded` (a source that says it is incomplete) and from a short
+   * count: this is "the platform said there is more, and we could not get it".
+   */
+  let truncated = false
+  const conflicts: IdentityConflictReport[] = []
+  let page = 1
+  let error: string | undefined
+  let degraded = false
+
+  while (page <= maxPages) {
+    let result
+    try {
+      result = await adapter.getNestedReplies(ref, floor, page, options.signal)
+    } catch (failure) {
+      error = (failure as Error).message
+      break
+    }
+    if (result.incomplete) degraded = true
+    let added = 0
+    for (const reply of result.replies) {
+      // Recorded for *both* the first sighting and every later one, before the
+      // duplicate is discarded below.
+      record(reply)
+      const previous = firstSurface.get(reply.postId)
+      if (previous === undefined) {
+        seen.set(reply.postId, reply)
+        firstSurface.set(reply.postId, reply)
+        added += 1
+        continue
+      }
+      const conflict = conflictBetween({
+        platform: reply.platform,
+        postId: reply.postId,
+        first: identityOfReply(previous),
+        second: identityOfReply(reply),
+      })
+      if (conflict !== undefined) {
+        seen.set(reply.postId, {
+          ...previous,
+          identityConflict: {
+            code: 'identity_conflict',
+            summary: conflict.summary,
+            // Not `platform_contract`: an undeclared source is *unknown*, and naming
+            // it makes a reader think a surface was consulted.
+            firstSource: previous.authorSource ?? 'unknown',
+            secondSource: reply.authorSource ?? 'unknown',
+          },
+        })
+        if (!conflicts.some((entry) => entry.postId === reply.postId)) conflicts.push(conflict)
+      }
+    }
+    if (!result.hasMore || added === 0) {
+      // Record *why* the walk stopped. `hasMore === true` with no progress means the
+      // platform promised more replies and then served only ones we already had —
+      // the walk ends, but the floor is not complete.
+      //
+      // v0.2.23: this used to be indistinguishable from a clean end, so a rate-limited
+      // or truncated nested read reported `complete: true`. A reader that trusts that
+      // flag believes it has seen every reply the floor has, which is precisely the
+      // claim the "partial reads are never presented as complete" rule forbids.
+      if (result.hasMore) truncated = true
+      break
+    }
+    page += 1
+  }
+
+  const replies = [...seen.values()]
+  const declared = floor.nestedCount
+  /**
+   * Per-post assurance, so callers can tell "checked and agreed" from "only one
+   * surface spoke" (v0.2.23).
+   *
+   * Without this, an empty `conflicts` list reads as "authorship is fine", which
+   * is the misreading this map exists to prevent: on Tieba a normal read consults
+   * exactly one surface, so nothing was cross-checked at all.
+   */
+  const assurance = new Map<string, IdentityAssurance>()
+  /**
+   * How well each post's identity was corroborated (v0.2.23 patch 5).
+   *
+   * Computed from *per-surface observations*, not from the number of source names:
+   * "two surfaces were consulted" and "two surfaces agreed" are different claims,
+   * and only the second may be shown to the user as cross-checked.
+   */
+  const corroboration = new Map<string, CorroborationVerdict>()
+  const corroborationReasons = new Map<string, CorroborationReason>()
+  for (const [postId, reply] of firstSurface) {
+    // Every sighting of this post id, not just the first and one later one: the
+    // earlier code looked at two entries, so a third surface could never contribute
+    // to (or contradict) the verdict.
+    // From the retained observations, not from `replies`: that list is de-duplicated
+    // by post id, so filtering it always produced exactly one row and made every
+    // verdict but `single_source` unreachable.
+    // Already in observation shape, and already provenance-honest: an undeclared
+    // source stays absent so it cannot pose as an independent surface.
+    const observations = identityObservations.get(postId) ?? []
+    // Only declared origins. An undeclared row contributes nothing to the source
+    // list, which is what makes "two sources" mean two real surfaces.
+    const sources = new Set(
+      observations
+        .map((entry) => entry.source)
+        .filter((value): value is IdentitySource => value !== undefined),
+    )
+    const conflicted = conflicts.some((entry) => entry.postId === postId)
+    const sighting = {
+      ...(reply.authorNumericUid === undefined ? {} : { numericUid: reply.authorNumericUid }),
+      ...(reply.authorId === undefined ? {} : { handle: reply.authorId }),
+      sources: [...sources],
+      conflicted,
+      observations,
+    }
+    assurance.set(postId, assuranceOf(sighting))
+    corroboration.set(postId, corroborationOf(sighting))
+    corroborationReasons.set(postId, corroborationReason(sighting))
+  }
+
+  return {
+    replies,
+    // A page that declares itself incomplete (a degraded source) is never a
+    // complete read, even if the counts happen to line up. Neither is a read
+    // containing an unresolved authorship conflict: we cannot claim to have
+    // understood a floor we cannot attribute.
+    complete:
+      error === undefined &&
+      !degraded &&
+      conflicts.length === 0 &&
+      !truncated &&
+      (declared === undefined || replies.length >= declared),
+    error,
+    degraded,
+    ...(conflicts.length === 0 ? {} : { conflicts }),
+    ...(assurance.size === 0 ? {} : { assurance }),
+    ...(corroboration.size === 0 ? {} : { corroboration }),
+    ...(corroborationReasons.size === 0 ? {} : { corroborationReasons }),
+    ...(identityObservations.size === 0 ? {} : { identityObservations }),
+    ...(observationOverflow.size === 0 ? {} : { observationOverflow: [...observationOverflow] }),
+  }
+}
+
+/**
+ * Project a nested reply onto the identity fields the comparison needs.
+ *
+ * A record with no `authorSource` predates v0.2.23 and is returned as a legacy
+ * identity: its `authorId` is deliberately **not** promoted to a handle, because
+ * we know it was some account string but not which namespace it belonged to.
+ * That makes it compare as `unknown_legacy_record` rather than accidentally
+ * matching a handle today.
+ */
+function identityOfReply(reply: NestedReply): AuthorIdentity {
+  const legacy = reply.authorSource === undefined
+  // A value already declared as the numeric uid must not also be read as a
+  // handle: one string cannot belong to two namespaces at once.
+  const duplicated = reply.authorNumericUid !== undefined && reply.authorId === reply.authorNumericUid
+  return {
+    platform: reply.platform,
+    ...(reply.authorNumericUid === undefined ? {} : { numericUid: reply.authorNumericUid }),
+    ...(reply.authorNumericUidKind === undefined
+      ? {}
+      : { numericUidKind: reply.authorNumericUidKind }),
+    ...(legacy || reply.authorId === undefined || duplicated ? {} : { handle: reply.authorId }),
+    ...(reply.authorName === undefined ? {} : { displayName: reply.authorName }),
+    // Absent, not renamed: an unknown origin must not present itself as a surface.
+    ...(reply.authorSource === undefined ? {} : { source: reply.authorSource }),
+  }
+}
+
+/**
+ * Add one sighting, ignoring exact repeats and flagging any overflow.
+ *
+ * Two rules, both deliberate:
+ *
+ * - an **identical** sighting is dropped. The same surface answering twice is one
+ *   piece of evidence, and keeping both would let a retry look like corroboration.
+ * - a cap, but **not silent**: once exceeded, the post id is recorded in
+ *   `observationOverflow` and surfaced in the corroboration reason. Dropping a
+ *   conflicting sighting quietly is the one thing this must not do, because that is
+ *   exactly how a real disagreement disappears.
+ */
+function makeRecorder(
+  store: Map<string, IdentityObservation[]>,
+  overflow: Set<string>,
+): (reply: NestedReply) => void {
+  return (reply) => {
+    const observation = observationOf(reply)
+    const existing = store.get(reply.postId) ?? []
+    const key = (entry: IdentityObservation): string =>
+      `${entry.source ?? ''}|${entry.handle ?? ''}|${entry.numericUid ?? ''}|${entry.namespace ?? ''}`
+    if (existing.some((entry) => key(entry) === key(observation))) return
+    if (existing.length >= MAX_OBSERVATIONS_PER_POST) {
+      overflow.add(reply.postId)
+      return
+    }
+    existing.push(observation)
+    store.set(reply.postId, existing)
+  }
+}
+
+/**
+ * What one sighting says about the author, in the shape corroboration consumes.
+ *
+ * Kept separate from {@link identityOfReply} because that one deliberately hides a
+ * legacy row's `authorId` (it cannot prove it was a handle). Corroboration needs the
+ * raw value to notice that two sightings disagree, and the row is still `__unknown__`
+ * provenance so it never counts as an independent source.
+ */
+function observationOf(reply: NestedReply): IdentityObservation {
+  return {
+    ...(reply.authorSource === undefined ? {} : { source: reply.authorSource }),
+    ...(reply.authorId === undefined ? {} : { handle: reply.authorId }),
+    ...(reply.authorNumericUid === undefined ? {} : { numericUid: reply.authorNumericUid }),
+    ...(reply.authorNumericUidKind === undefined ? {} : { namespace: reply.authorNumericUidKind }),
+  }
+}
+
+/**
+ * Collect a thread: metadata, every floor page, then nested replies for the
+ * floors that matter.
+ *
+ * Partial success is a first-class outcome. A thread whose page 5 times out
+ * returns everything from pages 1–4 plus an `issue` saying so, because a model
+ * asked to help with an argument is better served by "here is most of it, and
+ * here is exactly what is missing" than by a hard failure.
+ */
+export async function collectThread(
+  adapter: PlatformAdapter,
+  ref: ThreadRef,
+  options: CollectOptions = {},
+): Promise<CollectedThread> {
+  const issues: string[] = []
+  options.onProgress?.({ stage: 'thread', message: '正在读取主题帖…' })
+
+  const thread = await adapter.getThread(ref, options.signal)
+
+  options.onProgress?.({ stage: 'floors', message: '正在读取楼层…' })
+  const all = await walkFloors(adapter, ref, {
+    maxPages: options.maxPages,
+    signal: options.signal,
+    onPage: (page, collected) => {
+      options.onProgress?.({
+        stage: 'floors',
+        message: `已读取第 ${page} 页，累计 ${collected} 楼`,
+        current: page,
+      })
+    },
+  })
+  if (all.totalPages !== undefined) {
+    options.onProgress?.({
+      stage: 'floors',
+      message: `共 ${all.totalPages} 页，已读到 ${all.floors.length} 楼`,
+      current: all.pagesRead,
+      total: all.totalPages,
+    })
+  }
+
+  if (all.error) {
+    issues.push(`楼层读取中断：${all.error}（已收集 ${all.floors.length} 楼）`)
+  }
+  if (all.truncated && all.error) {
+    // The walk stopped on a failure *and* had evidence that pages remained. The
+    // two facts belong in one sentence: "it broke" alone invites the reader to
+    // assume the rest was empty, which is the mistake this flag exists to stop.
+    // `page_cap` is excluded because its own message below is more specific.
+    issues.push(
+      `分页在还有未读取页面时中断：平台声明` +
+        (all.totalPages !== undefined
+          ? `共 ${all.totalPages} 页，只读到第 ${all.pagesRead} 页`
+          : all.declaredTotal !== undefined
+            ? `共 ${all.declaredTotal} 楼，只读到 ${all.floors.length} 楼`
+            : '更多内容尚未读取') +
+        '。这不是完整结果，回复所需的上下文可能缺失。',
+    )
+  }
+  if (all.stopReason === 'page_cap') {
+    // Say it plainly: this is the plugin's own limit, not a deleted floor.
+    issues.push(
+      `已到达分页上限（${all.pagesRead} 页），但平台还有更多页没有读：` +
+        `本次只读到 ${all.floors.length} 楼，不是完整结果。` +
+        '可以提高 maxFloorPages，或用更长的运行时间重试。',
+    )
+  }
+  if (all.missingCount !== undefined && all.missingCount > 0) {
+    issues.push(
+      `平台声明共 ${all.declaredTotal} 楼，实际可读 ${all.floors.length} 楼，` +
+        `缺少 ${all.missingCount} 楼（通常是已删除或不可访问的楼层）`,
+    )
+  }
+
+  let floors = [...all.floors]
+  if (options.maxFloors !== undefined && floors.length > options.maxFloors) {
+    issues.push(`楼层层数超过上限 ${options.maxFloors}，只保留了前面的 ${options.maxFloors} 楼`)
+    floors = floors.slice(0, options.maxFloors)
+  }
+
+  // Nested replies are the expensive part: one request per floor per page. Only
+  // floors that plausibly matter are fetched, and the caller decides which.
+  const wantNested = options.wantNested ?? ((floor: Floor) => (floor.nestedCount ?? 0) > 0)
+  const nestedTargets = floors.filter(wantNested)
+  const nestedLimit = options.nestedFloorLimit ?? nestedTargets.length
+  const withNested: FloorWithNested[] = []
+  let nestedDone = 0
+
+  let nestedIncomplete = false
+  /** Proven cross-source disagreements, accumulated across every floor. */
+  const identityConflicts: IdentityConflictReport[] = []
+  /**
+   * Per-post corroboration verdicts, accumulated across every floor.
+   *
+   * The same shape `walkNested` produces; folded here so the analyzer can say whether
+   * the owner's identity was checked once or twice. Keys are post ids, which are
+   * unique across floors, so a later floor cannot silently overwrite an earlier
+   * verdict with a different one.
+   */
+  const corroboration = new Map<string, CorroborationVerdict>()
+  /** Why each verdict came out that way, so callers can explain it without re-deriving. */
+  const corroborationReasons = new Map<string, CorroborationReason>()
+  const identityObservations = new Map<string, IdentityObservation[]>()
+  const observationOverflow = new Set<string>()
+  for (const floor of floors) {
+    const targetIndex = nestedTargets.indexOf(floor)
+    const shouldFetch = nestedLimit > 0 && targetIndex >= 0 && targetIndex < nestedLimit
+    if (!shouldFetch) {
+      // A floor whose replies were deliberately not fetched is *not* complete
+      // when the platform says it has some: the caller must not read "no nested
+      // data" as "no nested replies exist". This holds even when the limit is
+      // zero, because the argument may well live in those unread replies.
+      const declared = floor.nestedCount ?? 0
+      if (declared > 0) nestedIncomplete = true
+      withNested.push({ floor, nested: [], nestedComplete: declared === 0 })
+      continue
+    }
+    options.onProgress?.({
+      stage: 'nested',
+      message: `正在读取 ${floorLabel(floor.floorNumber, floor.postId)} 的楼中楼…`,
+      current: nestedDone,
+      total: Math.min(nestedTargets.length, nestedLimit),
+    })
+    const nested = await walkNested(adapter, ref, floor, { signal: options.signal })
+    // v0.2.23: a proven authorship disagreement makes the whole read untrustworthy
+    // for owner purposes. Collected here, reported upward, never resolved here.
+    if (nested.conflicts !== undefined) {
+      for (const conflict of nested.conflicts) {
+        identityConflicts.push(conflict)
+        issues.push(conflict.summary)
+      }
+    }
+    // Corroboration is per post id across all surfaces, so it is collected here and
+    // reported upward — the same way conflicts are.
+    if (nested.corroboration !== undefined) {
+      for (const [postId, verdict] of nested.corroboration) {
+        corroboration.set(postId, verdict)
+      }
+    }
+    if (nested.corroborationReasons !== undefined) {
+      for (const [postId, reason] of nested.corroborationReasons) {
+        corroborationReasons.set(postId, reason)
+      }
+    }
+    if (nested.identityObservations !== undefined) {
+      for (const [postId, sightings] of nested.identityObservations) {
+        identityObservations.set(postId, [...sightings])
+      }
+    }
+    if (nested.observationOverflow !== undefined) {
+      for (const postId of nested.observationOverflow) observationOverflow.add(postId)
+    }
+    if (nested.error) {
+      nestedIncomplete = true
+      issues.push(`${floorLabel(floor.floorNumber, floor.postId)} 楼中楼读取失败：${nested.error}`)
+    } else if (!nested.complete) {
+      nestedIncomplete = true
+      // Say which way it is incomplete: a degraded source read fewer replies from
+      // a working page, which is a different fact from a page that failed.
+      const reason = nested.degraded
+        ? '楼中楼分页接口被限流，使用了帖子页内联的不完整副本'
+        : '读取到的条数少于平台声明'
+      issues.push(
+        `${floorLabel(floor.floorNumber, floor.postId)} 楼中楼不完整（${reason}）：平台声明 ${floor.nestedCount ?? '?'} 条，` +
+          `读取到 ${nested.replies.length} 条`,
+      )
+    }
+    withNested.push({ floor, nested: nested.replies, nestedComplete: nested.complete })
+    nestedDone += 1
+  }
+
+  options.onProgress?.({ stage: 'done', message: '读取完成' })
+
+  const completeness = buildCompleteness({
+    all,
+    keptFloors: withNested.length,
+    droppedByCap: all.floors.length - withNested.length,
+    nestedIncomplete,
+  })
+
+  return {
+    thread,
+    floors: withNested,
+    // v0.2.2: strictly stronger than the old value. `complete` is now the
+    // conjunction of "the platform proved we saw it" and "we kept what we saw",
+    // so a `maxFloors` cap can no longer report `true` for a partial thread.
+    complete: completeness.sourceComplete && completeness.retainedComplete,
+    completeness,
+    missingCount: all.missingCount,
+    // v0.2.24: the walk's own accounting, surfaced for the workbench's read-quality
+    // line. Without these the page could show "219 floors" and leave the reader
+    // unable to tell whether the thread had 219 or 240.
+    ...(all.declaredTotal === undefined ? {} : { declaredTotal: all.declaredTotal }),
+    pagesRead: all.pagesRead,
+    stopReason: all.stopReason,
+    truncated: all.truncated,
+    nestedIncomplete,
+    ...(identityConflicts.length === 0 ? {} : { identityConflicts }),
+    ...(corroboration.size === 0 ? {} : { corroboration }),
+    ...(corroborationReasons.size === 0 ? {} : { corroborationReasons }),
+    ...(identityObservations.size === 0 ? {} : { identityObservations }),
+    ...(observationOverflow.size === 0 ? {} : { observationOverflow: [...observationOverflow] }),
+    issues,
+  }
+}
+
+/**
+ * Turn the walk facts into the four separate verdicts.
+ *
+ * Each line below is a distinct question, and the point of this function is that
+ * none of them is allowed to answer for another:
+ *
+ * - **source** asks what the *platform* proved. It is false whenever the walk
+ *   stopped without evidence of an end, including the v0.2.2
+ *   `inconsistent_pagination` case.
+ * - **retained** asks what *we kept*. Only our own trimming can fail it. This is
+ *   the one that was missing: reading 3 floors and cutting to 1 by `maxFloors`
+ *   left the old single `complete` flag at `true`.
+ * - **analysis** asks whether the chain needed to answer is present. It requires
+ *   the source to be complete *and* the floors that hold the dispute to have
+ *   their replies read — a truncated nested walk can hide the argument even when
+ *   every floor was read.
+ * - **nested** is the per-floor roll-up of the same nested facts.
+ */
+function buildCompleteness(input: {
+  all: FloorWalk
+  keptFloors: number
+  droppedByCap: number
+  nestedIncomplete: boolean
+}): CompletenessReport {
+  const { all, keptFloors, droppedByCap, nestedIncomplete } = input
+  const reasons: string[] = []
+
+  const sourceComplete = all.complete
+  if (!sourceComplete) {
+    reasons.push(
+      all.stopReason === 'inconsistent_pagination'
+        ? '平台分页信号自相矛盾，无法证明来源已读完整'
+        : all.degraded === true
+          ? '有页面没有说明后面还有没有内容（分页信号缺失或无法识别），来源未读完整'
+          : `来源未读完整（${all.stopReason}）`,
+    )
+  }
+
+  const retainedComplete = droppedByCap === 0
+  if (!retainedComplete) {
+    reasons.push(
+      `本地裁剪丢弃了 ${droppedByCap} 条（保留 ${keptFloors} 条）：模型没有看到这些内容，不能当作已读完`,
+    )
+  }
+
+  const nestedComplete = !nestedIncomplete
+  if (!nestedComplete) {
+    reasons.push('部分楼层的楼中楼未读全，争论可能就藏在没读到的回复里')
+  }
+
+  // Analysis completeness is deliberately the strictest of the three: the model
+  // is about to argue using this data, and "I read most of it" is not a basis for
+  // asserting what the opponent did and did not say.
+  const analysisComplete = sourceComplete && retainedComplete && nestedComplete
+  if (sourceComplete && retainedComplete && !nestedComplete) {
+    reasons.push('楼层已读全，但楼中楼缺失会影响对争论链的还原，发表前请确认')
+  }
+
+  const declared = all.declaredTotal
+  const retainedRatio =
+    declared !== undefined && declared > 0 ? Math.min(1, keptFloors / declared) : undefined
+
+  return {
+    sourceComplete,
+    retainedComplete,
+    analysisComplete,
+    nestedComplete,
+    ...(all.missingCount !== undefined ? { missingCount: all.missingCount } : {}),
+    ...(droppedByCap > 0 ? { droppedByCap } : {}),
+    ...(retainedRatio !== undefined ? { retainedRatio } : {}),
+    reasons,
+  }
+}
+
+/**
+ * Locate the exact post the owner pointed at, and return its neighbourhood.
+ *
+ * This is the entry point the trigger path uses: a URL with `?pid=` or an
+ * explicit reply id resolves here, and an id that cannot be found is an
+ * explicit error rather than a fallback to "the last floor".
+ */
+export async function locateReply(
+  adapter: PlatformAdapter,
+  ref: ThreadRef,
+  postId: string,
+  signal?: AbortSignal,
+): Promise<ReplyContext> {
+  return adapter.getReplyContext(ref, postId, signal)
+}
+
+/** Flatten a collected thread into one ordered timeline of posts. */
+export interface TimelineEntry {
+  /**
+   * What kind of node this is.
+   *
+   * - `root` — the thread's opening post, present only when the platform reports
+   *   the body as a post of its own ({@link ThreadBodyNode}). It is a participant
+   *   like any other: on a microblog the owner usually speaks *only* here.
+   * - `floor` / `nested` — the reply hierarchy, as before.
+   */
+  readonly kind: 'root' | 'floor' | 'nested'
+  readonly postId: string
+  /**
+   * Which platform this entry came from (v0.2.23).
+   *
+   * Needed by owner resolution: the meaning of a legacy `authorId` is a property
+   * of the platform's contract (Tieba: a login name; Weibo: a stable account id),
+   * not of the string's shape.
+   */
+  readonly platform: PlatformId
+  /**
+   * The floor this entry belongs to, by the floor post's stable id.
+   *
+   * v0.2.1: this is the grouping key. It used to be `floorNumber`, which forced
+   * any non-forum platform to invent a number so that a microblog post and its
+   * comments could be told apart from the next one. The post id already
+   * identifies the floor uniquely on every platform and needs no invention, so
+   * the core groups on it and `floorNumber` is left for display only.
+   */
+  readonly floorPostId: string
+  /** The number the platform displays for the floor, when it displays one. */
+  readonly floorNumber?: number
+  readonly authorId?: string
+  readonly authorName?: string
+  /**
+   * Numeric account id, when a surface stated one as a number (v0.2.23).
+   *
+   * Absent for WAP-floor and WAP-inline rows, which carry no uid at all. Its
+   * presence is what lets an owner configured with a numeric id be matched
+   * *provably* instead of by comparing that id against a login name.
+   */
+  readonly authorNumericUid?: string
+  /**
+   * Which namespace `authorNumericUid` belongs to (v0.2.23).
+   *
+   * Carried onto the timeline so the identity key can place the number. Tieba has
+   * two unrelated numeric namespaces; a number without one cannot be compared.
+   */
+  readonly authorNumericUidNamespace?: NumericUidNamespace
+  /** Which surface produced the author fields above (v0.2.23). */
+  readonly authorSource?: IdentitySource
+  /** Display order within the floor; floors use 0. */
+  readonly order: number
+  readonly content: string
+  readonly createdAt?: string
+  readonly replyToName?: string
+  readonly relationUncertain?: boolean
+}
+
+/**
+ * Build the ordered timeline the analyzer reads.
+ *
+ * ## The root entry (v0.2.28)
+ *
+ * When the platform reports its body as a post of its own (`bodyNode:
+ * 'standalone'`), the body is emitted first as a `root` entry. Without it a
+ * microblog thread has no record of the person who wrote the post being discussed:
+ * on Tieba the opening post is 1 楼 and therefore already on the timeline, but a
+ * Weibo 微博 is not any of its comments, so the owner — usually the *only* person
+ * who posted it — was reported as absent from their own thread.
+ *
+ * The entry is emitted only when the adapter says so, which keeps Tieba's timeline
+ * byte-identical: there the body and 1 楼 are the same post, and adding it again
+ * would count the owner's single statement twice.
+ */
+export function buildTimeline(collected: CollectedThread): readonly TimelineEntry[] {
+  const out: TimelineEntry[] = []
+  if (collected.thread.bodyNode === 'standalone') {
+    const thread = collected.thread
+    out.push({
+      kind: 'root',
+      postId: thread.id,
+      platform: thread.platform,
+      // The body is its own container: on a microblog nothing else groups under
+      // it as a 楼层, because there are no 楼层.
+      floorPostId: thread.id,
+      authorId: thread.authorId,
+      authorName: thread.authorName,
+      ...(thread.authorNumericUid === undefined ? {} : { authorNumericUid: thread.authorNumericUid }),
+      ...(thread.authorNumericUidKind === undefined
+        ? {}
+        : { authorNumericUidNamespace: thread.authorNumericUidKind }),
+      ...(thread.authorSource === undefined ? {} : { authorSource: thread.authorSource }),
+      order: 0,
+      content: thread.content,
+      createdAt: thread.createdAt,
+    })
+  }
+  for (const entry of collected.floors) {
+    out.push({
+      kind: 'floor',
+      postId: entry.floor.postId,
+      platform: entry.floor.platform,
+      floorPostId: entry.floor.postId,
+      floorNumber: entry.floor.floorNumber,
+      authorId: entry.floor.authorId,
+      authorName: entry.floor.authorName,
+      ...(entry.floor.authorNumericUid === undefined ? {} : { authorNumericUid: entry.floor.authorNumericUid }),
+      ...(entry.floor.authorNumericUidKind === undefined
+        ? {}
+        : { authorNumericUidNamespace: entry.floor.authorNumericUidKind }),
+      ...(entry.floor.authorSource === undefined ? {} : { authorSource: entry.floor.authorSource }),
+      order: 0,
+      content: entry.floor.content,
+      createdAt: entry.floor.createdAt,
+    })
+    entry.nested.forEach((reply, index) => {
+      out.push({
+        kind: 'nested',
+        postId: reply.postId,
+        platform: reply.platform,
+        floorPostId: entry.floor.postId,
+        floorNumber: entry.floor.floorNumber,
+        authorId: reply.authorId,
+        authorName: reply.authorName,
+        ...(reply.authorNumericUid === undefined ? {} : { authorNumericUid: reply.authorNumericUid }),
+        ...(reply.authorNumericUidKind === undefined
+          ? {}
+          : { authorNumericUidNamespace: reply.authorNumericUidKind }),
+        ...(reply.authorSource === undefined ? {} : { authorSource: reply.authorSource }),
+        order: index + 1,
+        content: reply.content,
+        createdAt: reply.createdAt,
+        replyToName: reply.replyToName,
+        relationUncertain: reply.relationUncertain,
+      })
+    })
+  }
+  return out
+}
+
+/**
+ * How to name a floor in human-facing text.
+ *
+ * v0.2.1: `floorNumber` is optional — a microblog has no 楼层 — so every message
+ * that used to interpolate `${floorNumber} 楼` could print "第 undefined 楼".
+ * One helper keeps that from coming back: the label is a number when the
+ * platform gives one, and the post id when it does not.
+ */
+export function floorLabel(floorNumber: number | undefined, postId: string): string {
+  return floorNumber === undefined ? postId : `第 ${floorNumber} 楼`
+}
+
+/** Find an entry in a timeline by post id. */
+export function findInTimeline(
+  timeline: readonly TimelineEntry[],
+  postId: string,
+): TimelineEntry | undefined {
+  return timeline.find((entry) => entry.postId === postId)
+}
+
+/**
+ * The discussion container a post belongs to.
+ *
+ * Renamed from `floorOf` in v0.2.28 because the answer is no longer always a 楼层.
+ * A microblog has none: its opening post is the container every comment hangs
+ * under, and before this the analyzer could only say 「触发回复 … 不属于任何已采集楼层」
+ * when the owner pointed at it.
+ *
+ * Returned shape is deliberately a small value object rather than a `Floor`:
+ * inventing a floor number (or a fake `Floor`) for a post that has none is the
+ * mistake v0.2.1 had to undo.
+ */
+export interface DiscussionContainer {
+  /** The post id that groups this discussion. */
+  readonly postId: string
+  /** The number the platform displays for it, when it displays one. */
+  readonly floorNumber?: number
+  /** True when the container is the thread body rather than one of its replies. */
+  readonly isThreadBody: boolean
+}
+
+export function containerOf(
+  collected: CollectedThread,
+  postId: string,
+): DiscussionContainer | undefined {
+  if (collected.thread.bodyNode === 'standalone' && postId === collected.thread.id) {
+    // The body has no floor number on purpose: a microblog does not number it, and
+    // supplying one would make the UI print 「第 0 楼」.
+    return { postId, isThreadBody: true }
+  }
+  const found = collected.floors.find(
+    (entry) => entry.floor.postId === postId || entry.nested.some((reply) => reply.postId === postId),
+  )
+  if (found === undefined) return undefined
+  return {
+    postId: found.floor.postId,
+    ...(found.floor.floorNumber === undefined ? {} : { floorNumber: found.floor.floorNumber }),
+    isThreadBody: false,
+  }
+}
+
+/** The floor that contains a timeline entry, when the platform has floors. */
+export function floorOf(
+  collected: CollectedThread,
+  postId: string,
+): FloorWithNested | undefined {
+  return collected.floors.find(
+    (entry) => entry.floor.postId === postId || entry.nested.some((reply) => reply.postId === postId),
+  )
+}
+
+/** Throw a normalized error when a thread could not be read at all. */
+export function assertCollected(collected: CollectedThread): void {
+  if (collected.floors.length === 0) {
+    // v0.2.23: carry the walk's own explanation instead of replacing it with a
+    // guess. "可能已删除或需要登录" was wrong for the most common real failure —
+    // an anti-bot page — and sent the owner looking for a deleted thread while
+    // the fix was to open a browser and clear the verification.
+    //
+    // The code is `not_found` only when the walk actually said the content is
+    // gone; a verification page or a transport error keeps its own code so the
+    // tool layer can word it correctly.
+    const reason = collected.issues[0]
+    const challenge = collected.issues.some((issue) => /安全验证|人机验证|验证码/.test(issue))
+    const gone = collected.stopReason === 'deleted_or_unavailable' && !challenge
+    throw new PlatformError(
+      reason === undefined
+        ? '没有读取到任何楼层，该帖子可能已删除或需要登录'
+        : `没有读取到任何楼层：${reason}`,
+      challenge ? 'captcha' : gone ? 'not_found' : 'unknown',
+    )
+  }
+}

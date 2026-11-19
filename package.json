@@ -27,7 +27,12 @@
     "smoke": "node --experimental-transform-types test/acceptance/standalone.ts",
     "acceptance": "node --experimental-transform-types test/acceptance/standalone.ts",
     "test:server": "node --experimental-transform-types --test --test-concurrency=2 \"packages/server/test/**/*.test.ts\"",
-    "test:web": "node --test packages/web/test/*.test.mjs"
+    "test:web": "node --test packages/web/test/*.test.mjs",
+    "pretest": "node scripts/build-core.mjs && node scripts/build-web.mjs && node scripts/bundle-server.mjs",
+    "pretest:core": "node scripts/build-core.mjs",
+    "pretest:server": "node scripts/build-core.mjs && node scripts/build-web.mjs && node scripts/bundle-server.mjs",
+    "pretest:web": "node scripts/build-web.mjs",
+    "preacceptance": "node scripts/build-core.mjs && node scripts/build-web.mjs && node scripts/bundle-server.mjs"
   },
   "devDependencies": {
     "@types/node": "~22.10.2",

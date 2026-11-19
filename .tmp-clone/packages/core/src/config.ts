@@ -1,0 +1,461 @@
+/**
+ * Application configuration schema.
+ *
+ * The schema is a *description*: field name, kind, default, bounds, and whether
+ * a value is secret. It is what the settings form renders from, and it is the
+ * one place a field is declared.
+ *
+ * The values themselves are normalised by {@link resolveConfig}, which is the
+ * real validation layer — it clamps numbers, rejects unknown enum members and
+ * applies defaults. Two layers that both "validate" would eventually disagree,
+ * and the disagreement would look like a form that refuses to save a value the
+ * runtime happily accepts.
+ *
+ * Every field is marked `.volatile()`: an edit takes effect on the next read
+ * rather than on a restart, because the runtime re-reads the resolved config per
+ * request. Secrets carry `role('secret')` so no surface can echo them back —
+ * they are reported as "configured, length N" and nothing more.
+ */
+
+import z from './schema.js'
+
+/** The plugin's configuration. */
+export const Config = z.object({
+  /** Master switch. */
+  enabled: z.boolean().default(true).volatile(),
+
+  // ---- owner and account binding -------------------------------------------
+  /**
+   * The owner's **numeric** Tieba account id.
+   *
+   * v0.2.23 keeps the field name so existing profiles keep working, but changes
+   * what it is compared against: `authorNumericUid` only. It is no longer
+   * compared against `authorId`, because on the WAP surface `authorId` holds a
+   * login name — and `348099763 === "银狐_玉耀"` can never be true.
+   *
+   * A profile that only sets this, reading a thread that exposes no numeric uid,
+   * is now told exactly that instead of being told the owner never posted.
+   */
+  ownerUserId: z.string().default('').volatile(),
+  /**
+   * The owner's **login name** (`un`), introduced in v0.2.23.
+   *
+   * This is the field that actually works against a WAP read: the WAP page
+   * publishes `un` and nothing numeric. It is separate from `ownerUserName`
+   * because a login name is not a nickname — it is the account's own name that
+   * the owner cannot change, whereas a nickname can be set to anything by
+   * anyone.
+   *
+   * Leave empty if you do not know it; the plugin will refuse to guess rather
+   * than fall back to a nickname.
+   */
+  ownerHandle: z.string().default('').volatile(),
+  /**
+   * The owner's Tieba username, used only when neither an id nor a handle is set.
+   *
+   * A nickname. It can be duplicated and changed, so a match on it is recorded
+   * as `display_name_match_only` and never treated as proof of identity.
+   */
+  ownerUserName: z.string().default('').volatile(),
+  /** The AI account's display name, for the summon hint. */
+  aiAccountName: z.string().default('').volatile(),
+  /** The AI account's user id, when known. */
+  aiAccountUserId: z.string().default('').volatile(),
+  /** Extra owner ids allowed to summon, comma separated. */
+  allowedOwnerIds: z.string().default('').volatile(),
+  /**
+   * Per-platform account bindings, as JSON.
+   *
+   * Empty means "derive from the legacy globals above", which keeps existing
+   * profiles working unchanged (the globals describe Tieba, which is what they
+   * always did). Setting it opts into the platform-scoped model, so a Weibo or
+   * Zhihu account can be bound without inventing a second set of global fields.
+   *
+   * Shape: `{ "owners": [...], "aiAccounts": [...] }` — see
+   * `platforms/accounts.ts`. Stored as a string rather than a nested schema
+   * because this field is edited by the settings page, and a malformed value must
+   * degrade to "unbound" rather than prevent the plugin from mounting.
+   */
+  platformAccounts: z.string().default('').volatile(),
+
+  // ---- security ------------------------------------------------------------
+  /**
+   * Master switch for injection protection.
+   *
+   * Defaults to `true`, and turning it off does **not** disable the deterministic
+   * checks (target identity, credential leakage, owner attack) — those are not
+   * configurable, because an option to disable them is an option an attacker only
+   * has to talk the owner into flipping.
+   */
+  securityProtection: z.boolean().default(true).volatile(),
+  /**
+   * How eagerly text-level injection evidence forces a human review.
+   *
+   * Only the *semantic* threshold moves. `strict` flags anything at all (use it if
+   * the account is being actively targeted), `relaxed` only high and critical.
+   */
+  securityStrictness: z
+    .union([z.const('strict'), z.const('standard'), z.const('relaxed')])
+    .default('standard')
+    .volatile(),
+  /**
+   * How many recent security events to keep for the settings page.
+   *
+   * Events store a redacted excerpt, never a whole post, so a large number is not
+   * a memory risk — but it is also not useful, and a long list makes the important
+   * ones harder to see.
+   */
+  securityEventLimit: z.number().min(0).max(200).default(50).volatile(),
+
+  // ---- credentials ---------------------------------------------------------
+  /** A Tieba cookie header copied from a logged-in browser. Never logged. */
+  tiebaCookie: z.string().role('secret').default('').volatile(),
+
+  /**
+   * A thread id used to read the login banner, when no better page is at hand.
+   *
+   * The adapter asks for a page to read `data_editor` from. Verification passes the thread
+   * the owner authorised, so this is only needed for callers that have no thread to name
+   * — but the option existed on the adapter with no way to set it, which made the
+   * "not configured" case the only case. Blank means "not configured".
+   */
+  authProbeThreadId: z.string().default('').volatile(),
+
+  // ---- persona -------------------------------------------------------------
+  /** Default persona style. */
+  personaStyle: z
+    .union([
+      z.const('tieba_veteran'),
+      z.const('soft_defensive'),
+      z.const('tsundere'),
+      z.const('aloof'),
+    ])
+    .default('tieba_veteran')
+    .volatile(),
+  /** 1 (mild) to 5 (sharp). */
+  intensity: z.number().min(1).max(5).default(3).volatile(),
+  /** Maximum reply length in Chinese characters. */
+  maxLength: z.number().min(20).max(600).default(150).volatile(),
+  /** Emoji usage, 0 to 3. */
+  emojiLevel: z.number().min(0).max(3).default(0).volatile(),
+  /** Sarcasm, 0 to 3. */
+  sarcasmLevel: z.number().min(0).max(3).default(2).volatile(),
+  /** Directness, 1 to 5. */
+  directness: z.number().min(1).max(5).default(4).volatile(),
+
+  // ---- model ---------------------------------------------------------------
+  /** OpenAI-compatible base URL, e.g. https://api.openai.com/v1. */
+  llmBaseUrl: z.string().default('').volatile(),
+  /** API key for that endpoint. Never logged. */
+  llmApiKey: z.string().role('secret').default('').volatile(),
+  /** Model name. */
+  llmModel: z.string().default('').volatile(),
+  /**
+   * 模型接口的请求形状（v0.2.34 §3.1）。
+   *
+   * `chat` = `/chat/completions`（读 `choices[0].message.content`）；
+   * `responses` = `/responses`（读 `output_text` 或 `output[].content[].text`）。
+   *
+   * 为什么要人填：同一个 Base URL 上两种协议都可能有，而它们的失败方式不同 ——
+   * 协议填错时对方通常返回 200 但结构不对，看起来像「模型没说话」。靠名字猜
+   * （例如「gpt-5 大概是 responses」）会在换模型的那天悄悄坏掉。
+   */
+  /**
+    * 模型来源（v0.2.36 §3.1）。
+    *
+    * - `auto` —— 自己配了 Base URL 与模型名就用自己那份；没配就看宿主有没有提供
+    *   模型服务，有就用宿主的。这是默认值：升级不该改变已有部署的行为，而在
+    *   什么都没配的新装环境里，它让「打开就能用」成为可能。
+    * - `host` —— 只用宿主模型服务。插件**不读、不存、不转发任何密钥**：请求由
+    *   宿主发出，插件只拿回文本与 token 数。
+    * - `custom` —— 只用插件自己的 OpenAI 兼容配置，等同于 v0.2.35 的行为。
+    *
+    * 为什么需要显式三态而不是一个布尔：宿主模型花的是宿主那边的额度，用户
+    * 有权要求「别用宿主的，只用我这个」。一个开关如果默认会切走，就不该默认开。
+    */
+  llmSource: z.union([z.const('auto'), z.const('host'), z.const('custom')]).default('auto').volatile(),
+  /**
+   * 出网策略（v0.2.36 §4）。
+   *
+   * `open` 是默认值，等同于 v0.2.35 的行为：平台读取与模型都可用。
+   * `manual` 只允许模型地址与回环，平台主机一律拒绝 —— 手动导入就该是这个语义。
+   * `offline` 除回环外全拒，用于离线验收与「拔网线也能用」。
+   *
+   * 为什么把模式做成显式配置而不是「检测到离线就自动切」：自动切换会在网络抖动
+   * 时让一次正常的微博读取突然被拒，而使用者看不出原因。模式是承诺，不是猜测。
+   */
+  egressMode: z.union([z.const('open'), z.const('manual'), z.const('offline')]).default('open').volatile(),
+  llmProtocol: z.union([z.const('chat'), z.const('responses')]).default('chat').volatile(),
+  /** Per-request timeout. */
+  llmTimeoutMs: z.number().min(1000).max(600000).default(120000).volatile(),
+  /**
+   * Extra attempts after a *transient* model failure (v0.2.27).
+   *
+   * Default 0, matching the transport's own default, because a generation is not free and
+   * a timeout may mean the provider is still working. When set, only failures that provably
+   * did not take effect are retried — connection errors, timeouts, 429 and 5xx. A rejected
+   * key, an exhausted quota, an over-long context and an explicit cancellation are never
+   * retried: repeating them produces the same answer and spends the budget twice.
+   */
+  llmRetries: z.number().min(0).max(4).default(0).volatile(),
+  /**
+   * Sampling temperature.
+   *
+   * Low by default: this task is precision, not creativity. Raise it only if the
+   * drafts read too stiffly and the model still returns valid JSON.
+   */
+  llmTemperature: z.number().min(0).max(2).default(0.4).volatile(),
+  /** Cap on the model's own answer; 0 leaves the size to the persona length. */
+  llmMaxOutputTokens: z.number().min(0).max(32000).default(0).volatile(),
+
+  // ---- context budget ------------------------------------------------------
+  /** Budget preset for the model's context. */
+  contextPreset: z
+    .union([z.const('small'), z.const('medium'), z.const('large')])
+    .default('small')
+    .volatile(),
+  /** Explicit token budget; overrides the preset when > 0. */
+  contextTokens: z.number().min(0).max(200000).default(0).volatile(),
+
+  // ---- interaction policy --------------------------------------------------
+  /**
+   * How much the plugin may do without a human click.
+   *
+   * ## v0.2.21 §二：三个模式都不再决定「要不要人工批准」
+   *
+   * 真实发表一律需要**该候选**的人工批准记录（见 `safety.ts` 的 `checkPublishPolicy`）。
+   * 这个字段只决定「除了批准之外还要不要额外的限制」：
+   *
+   * - `manual` —— 只有批准这一道
+   * - `single_shot` —— 同样只有批准这一道（一次性授权影响候选生成，不替代批准）
+   * - `limited_auto` —— **实验能力**：额外受会话条数与冷却限制。它比别的模式更严格，
+   *   不是更宽松；把它理解成「少点一次确认」是 v0.2.20 及以前的语义，已经结束
+   */
+  interactionMode: z
+    .union([z.const('manual'), z.const('single_shot'), z.const('limited_auto')])
+    .default('manual')
+    .volatile(),
+  /**
+   * How many approved publishes one session may make, and how often.
+   *
+   * v0.2.21 起这两个数字限的是**频率**，不是放行条件：它们只在 `limited_auto` 下检查，
+   * 而对已批准的发表同样生效。把额度当成「免批准次数」是旧语义。
+   */
+  maxAutoPerSession: z.number().min(0).max(50).default(0).volatile(),
+  /** Cooldown between automatic publishes, in seconds. */
+  cooldownSeconds: z.number().min(0).max(3600).default(60).volatile(),
+  /** Maximum publishes in one thread. */
+  maxPerThread: z.number().min(1).max(100).default(10).volatile(),
+
+  // ---- collection limits ---------------------------------------------------
+  /** Maximum floor pages read per thread. */
+  maxFloorPages: z.number().min(1).max(500).default(60).volatile(),
+  /** Pause between page requests, in milliseconds. */
+  pageDelayMs: z.number().min(0).max(5000).default(400).volatile(),
+  /** HTTP timeout for platform requests. */
+  requestTimeoutMs: z.number().min(1000).max(120000).default(20000).volatile(),
+  /** Extra attempts on transport failures. */
+  requestRetries: z.number().min(0).max(5).default(2).volatile(),
+
+  // ---- storage -------------------------------------------------------------
+  /** Override the store directory; empty means the profile default. */
+  storeDir: z.string().default('').volatile(),
+  /** Session retention in days. */
+  sessionTtlDays: z.number().min(1).max(365).default(7).volatile(),
+
+  // ---- misc ----------------------------------------------------------------
+  /** When true, a system-prompt section tells the agent the tools exist. */
+  announceToAgent: z.boolean().default(true).volatile(),
+  /** Log verbosity. */
+  logLevel: z
+    .union([z.const('debug'), z.const('info'), z.const('warn'), z.const('error')])
+    .default('info')
+    .volatile(),
+})
+
+/** Defaults mirroring the schema, for hand-built test contexts. */
+export const DEFAULT_CONFIG = {
+  enabled: true,
+  ownerUserId: '',
+  ownerHandle: '',
+  ownerUserName: '',
+  aiAccountName: '',
+  aiAccountUserId: '',
+  allowedOwnerIds: '',
+  platformAccounts: '',
+  securityProtection: true,
+  securityStrictness: 'standard' as 'strict' | 'standard' | 'relaxed',
+  securityEventLimit: 50,
+  tiebaCookie: '',
+  personaStyle: 'tieba_veteran' as const,
+  intensity: 3,
+  maxLength: 150,
+  emojiLevel: 0,
+  sarcasmLevel: 2,
+  directness: 4,
+  llmBaseUrl: '',
+  llmApiKey: '',
+  llmModel: '',
+  llmSource: 'auto' as 'auto' | 'host' | 'custom',
+  egressMode: 'open' as 'open' | 'manual' | 'offline',
+  llmProtocol: 'chat' as 'chat' | 'responses',
+  llmTimeoutMs: 120000,
+  llmRetries: 0,
+  llmTemperature: 0.4,
+  llmMaxOutputTokens: 0,
+  authProbeThreadId: '',
+  contextPreset: 'small' as const,
+  contextTokens: 0,
+  interactionMode: 'manual' as const,
+  maxAutoPerSession: 0,
+  cooldownSeconds: 60,
+  maxPerThread: 10,
+  maxFloorPages: 60,
+  pageDelayMs: 400,
+  requestTimeoutMs: 20000,
+  requestRetries: 2,
+  storeDir: '',
+  sessionTtlDays: 7,
+  announceToAgent: true,
+  logLevel: 'info' as const,
+}
+
+/** The resolved configuration shape. */
+export type ResolvedConfig = typeof DEFAULT_CONFIG
+
+/**
+ * Unwrap one volatile field.
+ *
+ * A `.volatile()` schema field arrives as a reference exposing `get()` rather
+ * than a bare value; plain values pass through so hand-built contexts work.
+ */
+function unwrap(field: unknown): unknown {
+  if (field === undefined || field === null) return undefined
+  const ref = field as { get?: () => unknown }
+  if (typeof ref.get === 'function') {
+    const value = ref.get()
+    return value === null ? undefined : value
+  }
+  return field
+}
+
+/** Read a string field with a fallback. */
+function readString(field: unknown, fallback: string): string {
+  const value = unwrap(field)
+  return typeof value === 'string' ? value : fallback
+}
+
+/** Read a number field with a fallback. */
+function readNumber(field: unknown, fallback: number): number {
+  const value = unwrap(field)
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  return fallback
+}
+
+/** Read a boolean field with a fallback. */function readBoolean(field: unknown, fallback: boolean): boolean {
+  const value = unwrap(field)
+  return typeof value === 'boolean' ? value : fallback
+}
+
+/** Normalize a raw config against the defaults. */
+export function resolveConfig(input: unknown): ResolvedConfig {
+  const raw = (input ?? {}) as Record<string, unknown>
+  const style = readString(raw.personaStyle, DEFAULT_CONFIG.personaStyle)
+  const preset = readString(raw.contextPreset, DEFAULT_CONFIG.contextPreset)
+  const mode = readString(raw.interactionMode, DEFAULT_CONFIG.interactionMode)
+  const level = readString(raw.logLevel, DEFAULT_CONFIG.logLevel)
+
+  return {
+    enabled: readBoolean(raw.enabled, DEFAULT_CONFIG.enabled),
+    ownerUserId: readString(raw.ownerUserId, '').trim(),
+    ownerHandle: readString(raw.ownerHandle, '').trim(),
+    ownerUserName: readString(raw.ownerUserName, '').trim(),
+    aiAccountName: readString(raw.aiAccountName, '').trim(),
+    aiAccountUserId: readString(raw.aiAccountUserId, '').trim(),
+    allowedOwnerIds: readString(raw.allowedOwnerIds, '').trim(),
+    platformAccounts: readString(raw.platformAccounts, '').trim(),
+    securityProtection: readBoolean(raw.securityProtection, DEFAULT_CONFIG.securityProtection),
+    securityStrictness: (['strict', 'standard', 'relaxed'] as const).includes(
+      readString(raw.securityStrictness, 'standard') as never,
+    )
+      ? (readString(raw.securityStrictness, 'standard') as ResolvedConfig['securityStrictness'])
+      : DEFAULT_CONFIG.securityStrictness,
+    securityEventLimit: readNumber(raw.securityEventLimit, DEFAULT_CONFIG.securityEventLimit),
+    tiebaCookie: readString(raw.tiebaCookie, '').trim(),
+    authProbeThreadId: readString(raw.authProbeThreadId, '').trim(),
+    personaStyle: (['tieba_veteran', 'soft_defensive', 'tsundere', 'aloof'] as const).includes(
+      style as never,
+    )
+      ? (style as ResolvedConfig['personaStyle'])
+      : DEFAULT_CONFIG.personaStyle,
+    intensity: readNumber(raw.intensity, DEFAULT_CONFIG.intensity),
+    maxLength: readNumber(raw.maxLength, DEFAULT_CONFIG.maxLength),
+    emojiLevel: readNumber(raw.emojiLevel, DEFAULT_CONFIG.emojiLevel),
+    sarcasmLevel: readNumber(raw.sarcasmLevel, DEFAULT_CONFIG.sarcasmLevel),
+    directness: readNumber(raw.directness, DEFAULT_CONFIG.directness),
+    llmBaseUrl: readString(raw.llmBaseUrl, '').trim(),
+    llmApiKey: readString(raw.llmApiKey, '').trim(),
+    llmModel: readString(raw.llmModel, '').trim(),
+    llmSource:
+      readString(raw.llmSource, DEFAULT_CONFIG.llmSource) === 'host'
+        ? ('host' as const)
+        : readString(raw.llmSource, DEFAULT_CONFIG.llmSource) === 'custom'
+          ? ('custom' as const)
+          : ('auto' as const),
+    egressMode:
+      readString(raw.egressMode, DEFAULT_CONFIG.egressMode) === 'offline'
+        ? ('offline' as const)
+        : readString(raw.egressMode, DEFAULT_CONFIG.egressMode) === 'manual'
+          ? ('manual' as const)
+          : ('open' as const),
+    llmProtocol: readString(raw.llmProtocol, DEFAULT_CONFIG.llmProtocol) === 'responses' ? ('responses' as const) : ('chat' as const),
+    llmTimeoutMs: readNumber(raw.llmTimeoutMs, DEFAULT_CONFIG.llmTimeoutMs),
+    llmRetries: clampNumber(readNumber(raw.llmRetries, DEFAULT_CONFIG.llmRetries), 0, 4, DEFAULT_CONFIG.llmRetries),
+    llmTemperature: clampNumber(
+      readNumber(raw.llmTemperature, DEFAULT_CONFIG.llmTemperature),
+      0,
+      2,
+      DEFAULT_CONFIG.llmTemperature,
+    ),
+    llmMaxOutputTokens: clampNumber(
+      readNumber(raw.llmMaxOutputTokens, DEFAULT_CONFIG.llmMaxOutputTokens),
+      0,
+      32000,
+      DEFAULT_CONFIG.llmMaxOutputTokens,
+    ),
+    contextPreset: (['small', 'medium', 'large'] as const).includes(preset as never)
+      ? (preset as ResolvedConfig['contextPreset'])
+      : DEFAULT_CONFIG.contextPreset,
+    contextTokens: readNumber(raw.contextTokens, 0),
+    interactionMode: (['manual', 'single_shot', 'limited_auto'] as const).includes(mode as never)
+      ? (mode as ResolvedConfig['interactionMode'])
+      : DEFAULT_CONFIG.interactionMode,
+    maxAutoPerSession: readNumber(raw.maxAutoPerSession, DEFAULT_CONFIG.maxAutoPerSession),
+    cooldownSeconds: readNumber(raw.cooldownSeconds, DEFAULT_CONFIG.cooldownSeconds),
+    maxPerThread: readNumber(raw.maxPerThread, DEFAULT_CONFIG.maxPerThread),
+    maxFloorPages: readNumber(raw.maxFloorPages, DEFAULT_CONFIG.maxFloorPages),
+    pageDelayMs: readNumber(raw.pageDelayMs, DEFAULT_CONFIG.pageDelayMs),
+    requestTimeoutMs: readNumber(raw.requestTimeoutMs, DEFAULT_CONFIG.requestTimeoutMs),
+    requestRetries: readNumber(raw.requestRetries, DEFAULT_CONFIG.requestRetries),
+    storeDir: readString(raw.storeDir, '').trim(),
+    sessionTtlDays: readNumber(raw.sessionTtlDays, DEFAULT_CONFIG.sessionTtlDays),
+    announceToAgent: readBoolean(raw.announceToAgent, DEFAULT_CONFIG.announceToAgent),
+    logLevel: (['debug', 'info', 'warn', 'error'] as const).includes(level as never)
+      ? (level as ResolvedConfig['logLevel'])
+      : DEFAULT_CONFIG.logLevel,
+  }
+}
+
+/** Split a comma-separated id list, dropping blanks. */
+export function splitIds(raw: string): readonly string[] {
+  return raw
+    .split(/[,，\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+/** Read a number and keep it inside a range, falling back on nonsense. */
+function clampNumber(value: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback
+  return Math.min(max, Math.max(min, value))
+}
