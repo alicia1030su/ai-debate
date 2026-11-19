@@ -126,12 +126,21 @@ jobs:
           # "verified" by starting it. A privileged container running systemd is the
           # smallest environment where install.sh, systemctl enable --now, a kill -9
           # restart and a reinstall can all be exercised for real.
-          docker run --rm -d --privileged --network host --name ai-debate-sysd jrei/systemd-ubuntu:22.04
+          docker rm -f ai-debate-sysd >/dev/null 2>&1 || true
+          docker run -d --privileged --cgroupns=host --network host --name ai-debate-sysd \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw jrei/systemd-ubuntu:22.04
+          started=0
           for _ in $(seq 1 60); do
-            if docker exec ai-debate-sysd systemctl is-system-running >/dev/null 2>&1; then break; fi
+            if docker exec ai-debate-sysd systemctl is-system-running >/dev/null 2>&1; then started=1; break; fi
+            if [[ "$(docker inspect -f '{{.State.Running}}' ai-debate-sysd 2>/dev/null)" != "true" ]]; then break; fi
             sleep 1
           done
-          docker exec ai-debate-sysd bash -lc 'systemctl is-system-running || true; systemctl --version | head -1'
+          if [[ "${started}" -ne 1 ]]; then
+            echo '::error::容器里的 systemd 没有起来'
+            docker logs ai-debate-sysd 2>&1 | tail -40 || true
+            exit 1
+          fi
+          docker exec ai-debate-sysd bash -lc 'systemctl is-system-running; systemctl --version | head -1'
       - name: Start a model stub on the host
         run: |
           set -euo pipefail
