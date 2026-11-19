@@ -21,7 +21,6 @@ import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { networkInterfaces } from 'node:os'
 import { AssetStore } from './assets.ts'
 import { AuthService, isLoopback } from './auth.ts'
 import { ConfigStore } from './config-store.ts'
@@ -44,6 +43,16 @@ export interface StartOptions {
   readonly webDir?: string | undefined
   /** Override for tests: do not schedule the periodic backup. */
   readonly scheduleBackups?: boolean
+  /**
+   * Hostnames this deployment answers to, when `--host` cannot express them.
+   *
+   * The default is {@link trustedHostsFor}(`host`), which is loopback plus the bind
+   * address plus whatever `AI_DEBATE_TRUSTED_HOSTS` names. A caller that already
+   * knows the list — a reverse-proxy deployment read from a config document, or an
+   * acceptance run that drives a `Host` header a loopback socket could not produce
+   * — passes it here instead of mutating the process environment.
+   */
+  readonly trustedHosts?: readonly string[]
 }
 
 export interface RunningServer {
@@ -367,30 +376,36 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
   }
 }
 
+/** The four names that always mean "this machine". */
+export const LOOPBACK_HOSTS: readonly string[] = Object.freeze(['127.0.0.1', 'localhost', '[::1]', '::1'])
+
 /**
  * Which Host header values this deployment answers to.
  *
  * The list is derived from the configured bind address — never from the request —
- * because a fence that trusts whatever the client claims is not a fence. A reverse
- * proxy in front of a loopback bind is the one case the bind address cannot
- * describe, and that is what `AI_DEBATE_TRUSTED_HOSTS` is for: an explicit,
- * operator-supplied list, comma separated.
+ * because a fence that trusts whatever the client claims is not a fence.
+ *
+ * ## Why an all-interfaces bind adds nothing
+ *
+ * `--host 0.0.0.0` means "reachable on some address of this machine", but it does
+ * not say *which* name the browser will use. Enumerating the local interfaces
+ * would answer that question by guessing: the set changes with DHCP, VPNs and
+ * container bridges, and an address that happens to exist is not a name the
+ * operator agreed to serve. A guessed entry also cannot be audited — the owner
+ * could not tell from the settings page why a particular Host was accepted. So
+ * the wildcard bind trusts only loopback, and a LAN or reverse-proxy deployment
+ * names its host explicitly through `AI_DEBATE_TRUSTED_HOSTS` (comma separated).
+ * That is one line of configuration in exchange for a fence whose contents are
+ * exactly what a human wrote down.
+ *
+ * @param host the address the listener is bound to
+ * @param env environment to read `AI_DEBATE_TRUSTED_HOSTS` from
+ * @returns the hostnames a request's `Host` header must match
  */
 export function trustedHostsFor(host: string, env: NodeJS.ProcessEnv = process.env): readonly string[] {
-  const hosts = new Set<string>(['127.0.0.1', 'localhost', '[::1]', '::1'])
-  if (host !== '0.0.0.0' && host !== '::' && host !== '') {
-    hosts.add(host)
-  } else {
-    // Binding every interface means the operator intends to be reached at one of
-    // this machine's own addresses. Those are facts about the host, not claims
-    // from a request, so they can be trusted — still no header sniffing.
-    for (const addresses of Object.values(networkInterfaces())) {
-      for (const address of addresses ?? []) {
-        if (address.family === 'IPv4') hosts.add(address.address)
-        else hosts.add(`[${address.address}]`)
-      }
-    }
-  }
+  const hosts = new Set<string>(LOOPBACK_HOSTS)
+  const wildcard = host === '0.0.0.0' || host === '::' || host === ''
+  if (!wildcard) hosts.add(host)
   const extra = env.AI_DEBATE_TRUSTED_HOSTS
   if (typeof extra === 'string') {
     for (const entry of extra.split(',')) {
