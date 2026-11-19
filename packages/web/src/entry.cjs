@@ -617,10 +617,12 @@ function installSessionGuard() {
     const isProductApi = url.indexOf(API_BASE + '/') !== -1
     const isAuthRoute = url.indexOf(API_BASE + '/auth/') !== -1
     const method = String((init && init.method) || 'GET').toUpperCase()
-    const nextInit = init
 
+    // Copy rather than mutate: `init` belongs to the caller, and a page that
+    // reuses one init object across requests must not accumulate headers.
+    let nextInit = init
     if (isProductApi && !isAuthRoute && method !== 'GET' && csrfToken !== '') {
-      nextInit.headers = withCsrfHeader(init && init.headers)
+      nextInit = Object.assign({}, init, { headers: withCsrfHeader(init && init.headers) })
     }
 
     return nativeFetch.call(this, input, nextInit).then((response) => {

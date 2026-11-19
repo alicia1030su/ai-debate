@@ -22,7 +22,7 @@
     "package:windows": "node packaging/windows/build.mjs",
     "package:linux": "node packaging/linux/build.mjs",
     "test": "node --experimental-transform-types --test --test-concurrency=4 \"test/**/*.test.ts\"",
-    "test:core": "node --experimental-transform-types --test --test-concurrency=4 \"packages/core/test/**/*.test.ts\"",
+    "test:core": "node scripts/build-core.mjs && node --experimental-transform-types --test --test-concurrency=4 \"packages/core/test/**/*.test.ts\"",
     "start": "node packages/server/src/main.ts --serve",
     "smoke": "node --experimental-transform-types test/acceptance/standalone.ts",
     "acceptance": "node --experimental-transform-types test/acceptance/standalone.ts",

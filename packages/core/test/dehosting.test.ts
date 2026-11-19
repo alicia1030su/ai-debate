@@ -35,6 +35,9 @@ import {
 import { candidateRefs, credentialRefFor, refBelongsToPlatform } from '../lib/platforms/credentials.js'
 import { APP_VERSION, PLUGIN_VERSION } from '../lib/diagnostics.js'
 import { DEFAULT_TRUSTED_HOSTS, ROUTE_PREFIX, isTrustedRequest } from '../lib/settings-routes.js'
+import { DEFAULT_CONFIG } from '../lib/config.js'
+import { chooseModelSource } from '../lib/model-source.js'
+import { hostLlmOf } from '../lib/host-llm.js'
 
 /** The smallest object `isTrustedRequest` reads. */
 function request(headers: Record<string, string>): IncomingMessage {
@@ -223,4 +226,32 @@ test('a zero-byte state file is refused before it can be overwritten', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('there is no host model service, so auto can only mean the configured endpoint', () => {
+  // A standalone context: the only services are the two the engine requires.
+  assert.equal(hostLlmOf({ tools: {}, systemPrompt: {} }), undefined)
+
+  const configured = {
+    ...DEFAULT_CONFIG,
+    llmBaseUrl: 'https://api.example.com/v1',
+    llmModel: 'example-model',
+  }
+  const auto = chooseModelSource(configured, { host: undefined })
+  assert.equal(auto.source, 'custom', '没有宿主时，auto 必须落到自己配置的接口')
+  assert.match(auto.reason, /example-model/)
+
+  const explicit = chooseModelSource({ ...configured, llmSource: 'custom' }, { host: undefined })
+  assert.equal(explicit.source, 'custom')
+
+  // Nothing configured at all is an honest refusal, not a client with an empty
+  // Base URL that fails on first use.
+  assert.throws(() => chooseModelSource({ ...DEFAULT_CONFIG }, { host: undefined }), /还没有可用的模型/)
+
+  // `host` survives as an explicit *error* rather than a silent no-op: a profile
+  // that still says "use the host" must be told why that cannot work here.
+  assert.throws(
+    () => chooseModelSource({ ...configured, llmSource: 'host' }, { host: undefined }),
+    /独立运行|没有宿主/,
+  )
 })

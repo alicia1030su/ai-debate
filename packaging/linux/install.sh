@@ -61,9 +61,12 @@ if [[ ! -x "${SCRIPT_DIR}/bin/ai-debate" ]]; then
   exit 1
 fi
 
-if ! command -v systemctl >/dev/null 2>&1; then
-  echo "这个安装脚本依赖 systemd。没有 systemd 的环境可以手动运行：bin/ai-debate serve" >&2
-  exit 1
+if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
+  echo "提示：这个环境没有运行中的 systemd。程序与配置会正常安装，但不会自动开机自启。"
+  echo "      在容器或 CI 里可以直接运行：${PREFIX}/bin/ai-debate serve"
+  HAS_SYSTEMD=0
+else
+  HAS_SYSTEMD=1
 fi
 
 echo "== 检查安装包 =="
@@ -84,7 +87,7 @@ install -d -m 0750 -o "${APP_USER}" -g "${APP_USER}" "${DATA_DIR}"
 install -d -m 0750 -o "${APP_USER}" -g "${APP_USER}" "${CONF_DIR}"
 
 echo "== 停止旧服务（如果存在）=="
-if systemctl is-active --quiet "${APP_NAME}" 2>/dev/null; then
+if [[ "${HAS_SYSTEMD}" -eq 1 ]] && systemctl is-active --quiet "${APP_NAME}" 2>/dev/null; then
   systemctl stop "${APP_NAME}"
 fi
 
@@ -105,17 +108,22 @@ EOF
   chown "${APP_USER}:${APP_USER}" "${CONF_DIR}/ai-debate.env"
 fi
 
-echo "== 安装 systemd 单元 =="
-install -m 0644 "${SCRIPT_DIR}/systemd/ai-debate.service" "${UNIT}"
-sed -i "s|@PREFIX@|${PREFIX}|g; s|@DATA_DIR@|${DATA_DIR}|g; s|@CONF_DIR@|${CONF_DIR}|g; s|@APP_USER@|${APP_USER}|g" "${UNIT}"
+if [[ "${HAS_SYSTEMD}" -eq 1 ]]; then
+  echo "== 安装 systemd 单元 =="
+  install -m 0644 "${SCRIPT_DIR}/systemd/ai-debate.service" "${UNIT}"
+  sed -i "s|@PREFIX@|${PREFIX}|g; s|@DATA_DIR@|${DATA_DIR}|g; s|@CONF_DIR@|${CONF_DIR}|g; s|@APP_USER@|${APP_USER}|g" "${UNIT}"
+  systemctl daemon-reload
 
-systemctl daemon-reload
-
-if [[ "${START}" -eq 1 ]]; then
-  echo "== 启动服务 =="
-  systemctl enable --now "${APP_NAME}"
-  sleep 2
-  systemctl --no-pager --full status "${APP_NAME}" || true
+  if [[ "${START}" -eq 1 ]]; then
+    echo "== 启动服务 =="
+    systemctl enable --now "${APP_NAME}"
+    sleep 2
+    systemctl --no-pager --full status "${APP_NAME}" || true
+  fi
+else
+  echo "== 没有 systemd：跳过服务单元，改为前台启动验证 =="
+  echo "   安装位置：${PREFIX}/bin/ai-debate"
+  echo "   手动启动：${PREFIX}/bin/ai-debate serve"
 fi
 
 cat <<EOF
