@@ -1,6 +1,6 @@
 {
   "name": "ai-debate",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "AI Debate — standalone discussion analysis, persona-driven reply drafting and human-approved publishing workbench.",
   "license": "AGPL-3.0-only",

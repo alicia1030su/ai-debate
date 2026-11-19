@@ -1,6 +1,6 @@
 {
   "name": "@ai-debate/server",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "AI Debate standalone server: administrator authentication, encrypted credentials, background jobs, HTTP console.",
   "license": "AGPL-3.0-only",
@@ -10,7 +10,7 @@
     ".": "./src/cli.ts"
   },
   "dependencies": {
-    "@ai-debate/core": "0.1.1"
+    "@ai-debate/core": "0.1.2"
   },
   "engines": {
     "node": ">=22.18.0"
