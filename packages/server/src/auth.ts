@@ -16,6 +16,7 @@
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { readJsonQuarantine, writeJson } from './atomic.ts'
+import type { Auditor } from './audit.ts'
 import { randomUUID } from 'node:crypto'
 
 const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64, saltBytes: 16 }
@@ -85,6 +86,7 @@ export class AuthService {
   readonly #adminFile: string
   readonly #sessionsFile: string
   readonly #log: { info(message: string): void; warn(message: string): void }
+  readonly #audit: Auditor | undefined
   #admin: AdminRecord | undefined
   #sessions: SessionRecord[] = []
   #attempts = new Map<string, { count: number; resetAt: number }>()
@@ -96,11 +98,13 @@ export class AuthService {
     adminFile: string
     sessionsFile: string
     log: { info(message: string): void; warn(message: string): void }
+    audit?: Auditor
     loopbackOnlySetup: boolean
   }) {
     this.#adminFile = options.adminFile
     this.#sessionsFile = options.sessionsFile
     this.#log = options.log
+    this.#audit = options.audit
     this.#allowLoopbackSetup = options.loopbackOnlySetup
   }
 
@@ -161,6 +165,7 @@ export class AuthService {
     }
     writeJson(this.#adminFile, this.#admin, { mode: 0o600 })
     this.#setupToken = undefined
+    this.#audit?.write('admin.created', { username: name })
     this.#log.info(`管理员账号已创建：${name}`)
   }
 
@@ -174,10 +179,12 @@ export class AuthService {
     if (admin === undefined) return { ok: false, status: 500, message: '还没有初始化管理员账号。' }
     const blocked = this.#blockedFor(meta.ip, username)
     if (blocked !== undefined) {
+      this.#audit?.write('auth.throttled', { ip: meta.ip, username })
       return { ok: false, status: 429, message: `登录尝试过多，请 ${blocked} 秒后再试。`, retryAfterSec: blocked }
     }
     if (username.trim() !== admin.username) {
       this.#countFailure(meta.ip, username)
+      this.#audit?.write('auth.login_failed', { ip: meta.ip, username })
       return { ok: false, status: 401, message: '用户名或密码不正确。' }
     }
     const salt = Buffer.from(admin.salt, 'base64')
@@ -185,12 +192,14 @@ export class AuthService {
     const actual = hashPassword(password, salt)
     if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
       this.#countFailure(meta.ip, username)
+      this.#audit?.write('auth.login_failed', { ip: meta.ip, username })
       return { ok: false, status: 401, message: '用户名或密码不正确。' }
     }
     this.#attempts.delete(`ip:${meta.ip}`)
     this.#attempts.delete(`user:${username}`)
     const token = this.#issue(admin.username, meta.userAgent)
     const record = this.#sessions.find((item) => item.idHash === sha256(token))
+    this.#audit?.write('auth.login', { username: admin.username, ip: meta.ip })
     this.#log.info(`管理员登录成功：${admin.username}`)
     return {
       ok: true,
@@ -225,6 +234,7 @@ export class AuthService {
 
   logout(token: string | undefined): void {
     if (typeof token !== 'string') return
+    this.#audit?.write('auth.logout', {})
     const idHash = sha256(token)
     const before = this.#sessions.length
     this.#sessions = this.#sessions.filter((item) => item.idHash !== idHash)
@@ -256,6 +266,7 @@ export class AuthService {
     }
     writeJson(this.#adminFile, this.#admin, { mode: 0o600 })
     this.logoutAll()
+    this.#audit?.write('auth.password_changed', { username: admin.username })
     this.#log.info('管理员密码已更新，所有会话已失效')
   }
 

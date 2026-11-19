@@ -449,9 +449,9 @@ export const DEBATE_GUIDANCE =
  *
  * Delegates to {@link resolveStoreDirStrict}, which prefers an explicit
  * `storeDir`, then `AI_DEBATE_HOME`, then the platform convention. The `get`
- * second argument the plugin build accepted is gone with the host probe it fed;
- * callers that still pass one keep working because an unused parameter costs
- * nothing, but it is not read.
+ * second argument the plugin build accepted is **gone**: there is no host
+ * directory service to probe, and keeping an ignored parameter would let a caller
+ * believe it still had a say in where state lands.
  *
  * @param config the resolved config
  * @returns the directory, created if absent

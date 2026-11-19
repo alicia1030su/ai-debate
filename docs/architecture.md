@@ -196,7 +196,7 @@ classDiagram
     -string hash
     -number revision
     +raw Record
-    +load(log) {loaded, corrupt}
+    +load(log) LoadResult
     +update(patch, log) void
     +unset(paths, log) void
     +replaceAll(values) void
@@ -207,9 +207,9 @@ classDiagram
   class CredentialStore {
     -Buffer key
     -Record entries
-    +load() {loaded, corrupt}
-    +describe(ref) Promise~{configured,source,writable}~
-    +resolve(ref) Promise~{value,source}~
+    +load() LoadResult
+    +describe(ref) Promise
+    +resolve(ref) Promise
     +set(ref, value) Promise
     +unset(ref) Promise
     +configuredRefs() string[]
@@ -224,7 +224,7 @@ classDiagram
     -Map attempts
     -string setupToken
     +initialized boolean
-    +load() {initialized}
+    +load() InitResult
     +setupAllowed(remote, token) Verdict
     +createAdmin(user, pass) void
     +login(user, pass, meta) Outcome
@@ -240,9 +240,9 @@ classDiagram
     -Map handlers
     -Map running
     +register(type, handler) void
-    +start() {recovered}
+    +start() RecoverReport
     +stop() Promise
-    +enqueue(input) {job, deduplicated}
+    +enqueue(input) EnqueueResult
     +pauseJob(id) boolean
     +resumeJob(id) boolean
     +cancelJob(id) boolean
@@ -255,7 +255,10 @@ classDiagram
   class Logger {
     -LogLevel minLevel
     -LogLine[] ring
-    +debug/info/warn/error(msg)
+    +debug(msg) void
+    +info(msg) void
+    +warn(msg) void
+    +error(msg) void
     +tail(lines, level) LogLine[]
     +redact(input) string
   }
@@ -263,12 +266,12 @@ classDiagram
   class AssetStore {
     -string diskRoot
     -string[] keys
-    +init() {source, keys}
+    +init() InitResult
     +read(pathname) Asset
   }
 
   class WebServerRegistry {
-    -entries
+    -RouteEntry[] entries
     +register(route) Disposer
     +match(pathname) WebRoute
     +paths() string[]
@@ -277,7 +280,7 @@ classDiagram
 
   class StandaloneHost {
     +ctx unknown
-    +tools {name}[]
+    +tools ToolName[]
     +routePaths() string[]
     +emitCredentialUpdate(ref) void
   }
@@ -296,7 +299,7 @@ classDiagram
   }
 
   class Engine {
-    <<core/index.ts>>
+    <<core-module>>
     +apply(ctx, config) Disposer
     +resolveConfig(raw) ResolvedConfig
     +buildTools(runtime, ctx) ToolDefinition[]
@@ -571,17 +574,17 @@ startServer(options)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> queued: enqueue（同 key 且已 queued/running/paused 时去重，返回既有 job）
-    queued --> running: tick（paused=false 且 nextRunAt<=now 且有并发槽）
+    [*] --> queued: enqueue 同 key 且已排队或运行中则去重
+    queued --> running: tick 且未暂停且到期且有并发槽
     running --> succeeded: handler resolve
-    running --> queued: handler throw 且 type 属 RETRYABLE 且 attempts<maxAttempts（退避 5s×2^n，上限 5min）
-    running --> failed: handler throw 且不可重试，或 attempts=maxAttempts
+    running --> queued: 可重试失败且 attempts 未达上限 退避 5s 起 上限 5min
+    running --> failed: 不可重试或 attempts 已达上限
     queued --> paused: pauseJob
     paused --> queued: resumeJob
     queued --> cancelled: cancelJob
-    running --> cancelled: cancelJob（AbortController）
-    running --> failed: 进程崩溃且 type=backup.restore（不可重跑，写明理由）
-    running --> queued: 进程崩溃且其它 type（attempts+1，interrupted）
+    running --> cancelled: cancelJob 触发 AbortController
+    running --> failed: 进程崩溃且类型为 backup.restore 不可重跑
+    running --> queued: 进程崩溃且其它类型 attempts 加一
     succeeded --> [*]
     failed --> [*]
     cancelled --> [*]
@@ -627,12 +630,12 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> 未初始化: admin.json 不存在（非回环监听时打印一次性 token）
-    未初始化 --> 已初始化: POST /auth/setup（用户名 3–64 [A-Za-z0-9_.@-] + 口令≥10 且非弱口令）→ 写 admin.json → 自动登录
-    已初始化 --> 已登录: POST /auth/login 成功（签发 sid + Set-Cookie）
-    已登录 --> 已登录: 任意请求（滑动 lastSeenAt；12h 空闲）
-    已登录 --> 已初始化: logout / 空闲 12h / 绝对 7d / 改密（撤销全部）
-    已初始化 --> 限流: 同 IP 或同名 15min 内 >8 次失败
+    [*] --> 未初始化: admin.json 不存在 非回环监听时打印一次性 token
+    未初始化 --> 已初始化: POST /auth/setup 通过强度校验后写 admin.json 并自动登录
+    已初始化 --> 已登录: POST /auth/login 成功 签发 sid 与 Set-Cookie
+    已登录 --> 已登录: 任意请求 滑动 lastSeenAt 12h 空闲
+    已登录 --> 已初始化: logout 或空闲 12h 或绝对 7d 或改密撤销全部
+    已初始化 --> 限流: 同 IP 或同名 15 分钟内超过 8 次失败
     限流 --> 已初始化: 窗口过去
 ```
 
@@ -643,15 +646,17 @@ stateDiagram-v2
 ### 9.1 切片与改写（`scripts/build-web.mjs`）
 
 - **切法**：`indexOf('factory: (require) => {')` 到 `lastIndexOf('return module.exports')`，用字符串偏移，**不用正则**——300 KB 里全是模板字符串，贪婪正则必然吃错区域。任一标记缺失 → 立刻失败，不写半成品。
-- **5 条改写**（每条带 `expected` 计数，命中数不符即整次失败）：
+- **7 条改写**（每条带 `expected` 计数，命中数不符即整次失败）：
 
 | # | 找 | 换成 | 次数 |
 |---|----|------|------|
 | 1 | `require('@deepseek-ai/dsh-client-store')` | `require('./snapshot-store.cjs')` | 1 |
 | 2 | `'/api/dsh-ai-debate'` | `'/api/ai-debate'` | 1 |
-| 3 | `dsh-ai-debate/card.css` | `ai-debate/card.css` | 2 |
-| 4 | `tag.dataset.plugin = 'dsh-ai-debate'` | `'ai-debate'` | 1 |
-| 5 | `[dsh-ai-debate]`（console 前缀） | `[ai-debate]` | 2 |
+| 3 | `'DSH_AI_DEBATE_TIEBA_COOKIE'` | `'AI_DEBATE_TIEBA_COOKIE'` | 1 |
+| 4 | `'DSH_AI_DEBATE_LLM_API_KEY'` | `'AI_DEBATE_LLM_API_KEY'` | 1 |
+| 5 | `dsh-ai-debate/card.css` | `ai-debate/card.css` | 2 |
+| 6 | `tag.dataset.plugin = 'dsh-ai-debate'` | `'ai-debate'` | 1 |
+| 7 | `[dsh-ai-debate]`（console 前缀） | `[ai-debate]` | 2 |
 
 - **语法校验**：`new Function('exports','require','module','__filename','__dirname', code)` 立刻解析整段，截断/改写出错在建包时失败，而不是在浏览器里白屏。
 - **输出**：`src/legacy-body.cjs`（`module.exports = __factory`），文件头写自动生成警示。**生成物入库**，构建可重复。
@@ -733,19 +738,19 @@ return readFileSync(join(diskRoot, relative))                  // 开发态：di
 
 ```mermaid
 graph LR
-  subgraph CI["ci.yml（push / PR / 手动）"]
+  subgraph CI["ci.yml push PR manual"]
     S[secrets-scan<br/>ubuntu] --> T
     subgraph T["test 矩阵 ubuntu-latest / windows-latest"]
       direction TB
-      T1[npm ci] --> T2[typecheck] --> T3[build + bundle] --> T4[test:core] --> T5[server tests] --> T6[web tests] --> T7[acceptance] --> T8[assert-no-dsh]
+      T1[npm ci] --> T2[typecheck] --> T3[build and bundle] --> T4[test:core] --> T5[server tests] --> T6[web tests] --> T7[acceptance] --> T8[assert-no-dsh]
     end
-    T --> W[package-windows<br/>needs: test<br/>打包 → --version/--help → upload]
-    T --> L[package-linux<br/>needs: test<br/>打包 → 解包 → serve → curl /healthz → upload]
+    T --> W[package-windows<br/>打包并校验 --version 与 --help<br/>上传产物]
+    T --> L[package-linux<br/>打包 解包 启动服务 curl healthz<br/>上传产物]
   end
-  subgraph REL["release.yml（tag v*）"]
-    G[guard：Release 已存在即失败] --> V[verify：scan/typecheck/build/test×3/acceptance/assert-no-dsh]
+  subgraph REL["release.yml tag v*"]
+    G[guard 若 Release 已存在则失败] --> V[verify 扫描 类型检查 构建 三套测试 验收 无依赖检查]
     V --> RW[windows 构建] & RL[linux 构建]
-    RW & RL --> P[publish：download → sha256sum → gh release create → 再验资产名]
+    RW & RL --> P[publish 下载产物 生成 SHA256SUMS 创建 Release 复验资产名]
   end
 ```
 
@@ -789,7 +794,7 @@ graph LR
 | 凭据加密 + 事件回推 | ✅ AES-256-GCM + `onChange → emitCredentialUpdate` |
 | 命名空间切换 | ✅ 路由前缀 `/api/ai-debate`；`AI_DEBATE_*`；`LEGACY_*` 仅保留常量供显式导入使用 |
 | 状态目录独立 | ✅ `--data-dir` / `AI_DEBATE_HOME` / 平台默认；旧目录只探测 |
-| 前端转换（ADR-002、ADR-014） | ✅ 切片 + 5 条改写 + `new Function` 校验 + 40 行快照库；11 页签与 502 条文案原样 |
+| 前端转换（ADR-002、ADR-014） | ✅ 切片 + **7 条**改写 + `new Function` 校验 + 40 行快照库；11 页签与 502 条文案原样 |
 | 主题令牌 | ✅ `theme.css` 补齐 14 个 `--dsw-alias-*`（浅/深色） |
 | SEA 打包（ADR-003） | ✅ 脚本齐备；`manifest.json` + `getAsset('web/…')` |
 | Linux 安装/卸载/systemd | ✅ `ProtectSystem=strict` 等加固；默认保留数据 |
@@ -819,7 +824,7 @@ graph LR
 | # | 缺口 | 实测证据 | 影响 | 处理 |
 |---|------|----------|------|------|
 | **G9** | **`npm start` 指向不存在的文件** | `package.json` 的 `start: node packages/server/src/main.ts --serve`；`ls` 确认该文件不存在；实际跑 `npm start` → `MODULE_NOT_FOUND`。README 也写了 `npm start` | 新人第一次按 README 操作就失败；这是唯一被文档承诺的「从源码跑起来」的方式 | 把 `start` 改成 `node --experimental-transform-types packages/server/src/cli.ts serve`（或新建 `packages/server/src/main.ts` 只做 `runCli(process.argv.slice(2))`——与 `apps/desktop/src/main.ts` 同构，推荐后者，因为它同时是文档里的「服务端入口」） |
-| **G10** | **`scan-secrets.mjs` 会被自己的测试夹具判死** | 实跑 `node scripts/scan-secrets.mjs` → **exit 1**，命中 `packages/server/test/runtime.test.ts:68`（`sk-super-secret-value-123456`）与 `:252`（`BDUSS=abcdefghijklmnop`）。这两处是**故意**用来验证「密文不落盘 / 日志打码」的假值 | CI 的 `secrets-scan` job 必红 → 整个 CI 红 → `release.yml` 的 `verify` 也红 → **永远发不出去** | 在脚本里排除**明确的测试夹具行**：文件名匹配 `**/test/**` 且行内含 `super-secret`/`hunter2`/`abcdefghijklmnop`/`sk-live-` 这类占位词则跳过，并在脚本里写清「只跳过占位值，不跳过真实形态」；或把这些夹具改成运行时拼接（`'sk-' + 'x'.repeat(24)`），让静态扫描永远看不到完整形态（**推荐后者**，不需要在扫描器里开洞） |
+| **G10** | **`scan-secrets.mjs` 会被自己的测试夹具判死** | 实跑 `node scripts/scan-secrets.mjs` → **exit 1**，命中 `packages/server/test/runtime.test.ts` 第 68 行与第 252 行 —— 一处是一个 `sk-` 前缀的假 key，一处是一段 `BDUSS=` 形态的假 cookie。这两处是**故意**用来验证「密文不落盘 / 日志打码」的夹具 | CI 的 `secrets-scan` job 必红 → 整个 CI 红 → `release.yml` 的 `verify` 也红 → **永远发不出去** | 在脚本里排除**明确的测试夹具行**：文件名匹配 `**/test/**` 且行内含 `super-secret`/`hunter2`/`abcdefghijklmnop`/`sk-live-` 这类占位词则跳过，并在脚本里写清「只跳过占位值，不跳过真实形态」；或把这些夹具改成运行时拼接（`'sk-' + 'x'.repeat(24)`），让静态扫描永远看不到完整形态（**推荐后者**，不需要在扫描器里开洞） |
 | **G11** | **远程绑定（`--host 0.0.0.0`）下核心 7 条路由全 403** | 实跑 `dist/ai-debate.cjs serve --host 0.0.0.0`，用原生 `http` 构造 `Host: 192.168.1.20:<port>` 与 `Host: debate.example.com` 请求 `/api/ai-debate/settings` → **均 403 `forbidden: origin`**；同一路径换成 `Host: 127.0.0.1:<port>` → 401（说明围栏放行、只是没会话）。原因：适配器没有提供 `appServer` 服务，核心 `appServerOf(ctx)` 拿不到 `trustedHosts`，于是回落到 `DEFAULT_TRUSTED_HOSTS`（仅 loopback 名） | `security.md` §6 与 `install-linux.md` 的 `--host 0.0.0.0` / 反代路径**实际不可用**：页面能打开、登录能成功，但一进设置页就 403。这是**文档承诺与实现不一致**，且是「远程访问」这个已发布特性的核心阻断 | 在 `standalone-host.ts` 的 `services` 里加 `appServer: { trustedHosts, info() }`：`trustedHosts` = 由 `--host` 推导（loopback 一律含 4 个默认名；绑具体地址时加该地址与 `localhost`；反代场景由 `AI_DEBATE_TRUSTED_HOSTS`（逗号分隔）显式追加，**永不从请求头推断**）；`info()` 返回 `{listen, port, dataDir, version, startedAt, pid}`（这与核心 `AppServerService` 的定义逐字段一致，同时补齐设置页缺失的「进程事实」块） |
 | **G12** | **根 `npm test` 静默跑 0 个测试** | 实跑 `npm test` → `1..0`、`# tests 0`、exit 0。原因是 glob 是 `test/**/*.test.ts`，而 `test/` 下只有 `acceptance/standalone.ts`（不是 `.test.ts`），真正的测试在 `packages/*/test/` | 「测试通过」的绿灯可能什么都没测；本地改坏了东西不会红 | 根 `test` 改成串行跑四条：`test:core`、`test:server`、`test:web`、`acceptance`；并让任一非零即整体非零。CI 已经分别跑这四条，所以只剩「本地体验」与「诚实性」问题 |
 | **G3** | core 仍有 DSH 命名残留（缩小到 1 处 + 文案） | `packages/core/src/store-dir.ts:144` 的 `legacyDshStoreDir` 返回 `~/.dsh/ai-debate`（**保留是对的**：导入功能需要它）；`store.ts` 的 `defaultStoreDir()` 仍返回 `~/.dsh/ai-debate`，**全仓库无调用方**；`tools.ts` 仍有 2 处 `loggerOf(ctx,'dsh-ai-debate')` 与 4 处「插件 → dsh-ai-debate → 配置」文案（工具结果里给模型看的提示，用户也会看到） | 用户按工具提示去找「插件 → dsh-ai-debate → 配置」，这个入口在本产品不存在 | 删 `store.ts` 的无用导出；`tools.ts` 文案改「管理后台 → 配置」，logger 名改 `ai-debate`；`legacyDshStoreDir` 保留并在 `assert-no-dsh` 白名单里显式列出 |

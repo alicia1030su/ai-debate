@@ -39,9 +39,14 @@ const AUTH_STATE_PATHS = [API_BASE + '/auth/state', API_BASE + '/auth/session']
 const AUTH_SETUP_URL = API_BASE + '/auth/setup'
 const AUTH_LOGIN_URL = API_BASE + '/auth/login'
 const AUTH_LOGOUT_URL = API_BASE + '/auth/logout'
-const STATUS_URL = API_BASE + '/status'
+const STATUS_URL = '/system'
+/** Lightweight probe used by the status dot; the diagnostic JSON is too heavy to poll. */
+const HEALTH_URL = API_BASE + '/system/status'
 
 /** Header the service requires on every unsafe request. */
+// The service authenticates writes by SameSite=Strict plus an origin/host match plus
+// a required JSON content type. There is deliberately no CSRF token: one that the
+// server never verifies would be worse than none, because it reads as a control.
 const CSRF_HEADER = 'x-ai-debate-csrf'
 /** The value that unlocks first-run setup, before any session exists. */
 const CSRF_SETUP = 'setup'
@@ -61,6 +66,23 @@ let csrfToken = ''
 
 /** How often the top-bar dot re-checks the service. */
 const STATUS_POLL_MS = 30000
+
+/**
+ * How long a `GET /status` may take before it is abandoned.
+ *
+ * The inherited page fetches `/settings` and `/status` together and waits for
+ * *both* before it leaves its "reading configuration" placeholder. A status
+ * probe that hangs — a platform adapter blocking on a network call, a credential
+ * store that never answers — therefore blanks the whole configuration form,
+ * which is the exact failure the page's own `Promise.allSettled` was written to
+ * avoid. A timeout here turns "hang forever" back into "that read failed", and
+ * `allSettled` then does its job.
+ *
+ * Only `GET /status` is capped. Action calls (`generate-candidates`,
+ * `publish-approved`, the manual-* family) are legitimately slow and must be
+ * allowed to finish.
+ */
+const STATUS_TIMEOUT_MS = 8000
 
 
 /**
@@ -658,6 +680,13 @@ function installSessionGuard() {
       nextInit = Object.assign({}, init, { headers: withCsrfHeader(init && init.headers) })
     }
 
+    // A hung status read must not hold the configuration form hostage. The
+    // caller's own signal (if any) stays in charge — this only adds one when
+    // there is nothing to abort with yet.
+    if (method === 'GET' && url.indexOf(API_BASE + '/status') !== -1 && !(nextInit && nextInit.signal)) {
+      nextInit = Object.assign({}, nextInit, { signal: AbortSignal.timeout(STATUS_TIMEOUT_MS) })
+    }
+
     return nativeFetch.call(this, input, nextInit).then((response) => {
       if (isProductApi && !isAuthRoute && (response.status === 401 || response.status === 403)) {
         onSessionExpired()
@@ -712,9 +741,9 @@ function onSessionExpired() {
 
 // ------------------------------------------------------------------- service dot
 
-/** Probe `/status` and paint the dot. */
+/** Probe the lightweight service route and paint the dot. */
 async function pollStatus() {
-  const result = await requestJson(STATUS_URL)
+  const result = await requestJson(HEALTH_URL)
   if (result.ok) setServiceState('ok', '服务正常')
   else if (result.network) setServiceState('bad', '服务不可达')
   else if (result.status === 401 || result.status === 403) setServiceState('bad', '登录已失效')

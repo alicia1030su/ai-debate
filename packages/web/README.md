@@ -59,17 +59,19 @@ packages/web/
 
 | 方法 | 路径 | 用途 |
 |------|------|------|
-| GET | `/api/ai-debate/auth/state` | 启动第一个调用。**别名**：`/api/ai-debate/auth/session`（§6.2 的名字）。外壳两者都试，先答非 404 的赢 |
-| POST | `/api/ai-debate/auth/setup` | 首启，`{username, password}` |
+| GET | `/api/ai-debate/auth/state` | 启动第一个调用（**服务端已实现**，见 `packages/server/src/http.ts:257`）。别名 `/api/ai-debate/auth/session`（§6.2 的名字）也试，先答非 404 的赢并记住 |
+| POST | `/api/ai-debate/auth/setup` | 首启，`{username, password, token?}` |
 | POST | `/api/ai-debate/auth/login` | `{username, password}` |
 | POST | `/api/ai-debate/auth/logout` | 退出 |
 | GET | `/api/ai-debate/status` | 顶栏服务灯，30 s 一次（页面隐藏时跳过） |
 
-`auth/state` 响应字段（外壳只读这三个）：
+`auth/state` 响应字段（外壳只读这几个）：
 
 ```json
 { "initialized": true, "authenticated": true, "username": "owner", "csrf": "<32 hex>" }
 ```
+
+`csrf` 当前服务端不返回，外壳兼容缺席。
 
 - `initialized:false` → 渲染「首次初始化」表单（用户名 / 密码 / 确认密码）
 - `initialized:true, authenticated:false` → 渲染登录表单

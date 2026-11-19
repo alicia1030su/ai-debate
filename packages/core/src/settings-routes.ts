@@ -1207,6 +1207,18 @@ export interface Diagnostics {
   readonly storeDirSource?: 'configured' | 'env' | 'default'
   /** `AI_DEBATE_HOME` as the engine saw it, echoed for the same reason. */
   readonly appHome?: string
+  /**
+   * The old plugin's state directory, for the import affordance.
+   *
+   * Always present (the path is computable on every machine); {@link legacyStoreBytes}
+   * is present only when a readable `state.json` is actually sitting there. Split
+   * into two fields so the page can distinguish "there is nothing to import" from
+   * "the import source exists but could not be measured" — the first is a normal
+   * first run, the second is a question the user deserves an answer to.
+   */
+  readonly legacyStoreDir?: string
+  /** Size of the old plugin's `state.json`, when it exists. */
+  readonly legacyStoreBytes?: number
   readonly sessions: { total: number; active: number; awaitingConfirmation: number; published: number }
   readonly publishLedger: {
     total: number

@@ -20,7 +20,7 @@ import { PERSONAS, PERSONA_STYLES, buildPersonaPrompt, resolvePersona } from './
 import { LlmError } from './llm.js'
 import { chooseModelSource } from './model-source.js'
 import { extractJsonObject } from './generator.js'
-import { chooseStoreDir, appHomeDir } from './store-dir.js'
+import { chooseStoreDir, appHomeDir, legacyDshStoreDir, probeStoreState } from './store-dir.js'
 import type { ResolvedConfig } from './config.js'
 import type { Diagnostics, LoginProbe, ModelProbe, PersonaPreview } from './settings-routes.js'
 import type { Runtime } from './runtime.js'
@@ -544,12 +544,18 @@ export async function collectDiagnostics(
   // v0.2.23 page ended up showing a plausible path with no provenance.
   const chosenDir = chooseStoreDir({ configured: config.storeDir })
   const appHome = appHomeDir()
+  // What the old plugin left behind. Reported, never acted on: an import is a
+  // deliberate click, and the page cannot offer one it has not been told about.
+  const legacyDir = legacyDshStoreDir()
+  const legacyState = chosenDir.dir === legacyDir ? { exists: false, bytes: 0 } : probeStoreState(legacyDir)
 
   return {
     enabled: config.enabled,
     storePath: runtime.store.path,
     storeDirSource: chosenDir.source,
     ...(appHome === undefined ? {} : { appHome }),
+    legacyStoreDir: legacyDir,
+    ...(legacyState.exists ? { legacyStoreBytes: legacyState.bytes } : {}),
     sessions: {
       total: data.sessions.length,
       // "active" means work is still possible from this state, which is exactly

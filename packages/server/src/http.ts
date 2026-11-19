@@ -24,6 +24,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AssetStore } from './assets.ts'
 import { clearSessionCookie, isLoopback, parseCookies, SESSION_COOKIE, sessionCookie, type AuthService } from './auth.ts'
 import type { JobQueue } from './jobs.ts'
+import type { Auditor } from './audit.ts'
 import type { Logger } from './logger.ts'
 import type { WebServerRegistry } from './registry.ts'
 
@@ -42,6 +43,7 @@ export interface HttpDeps {
   readonly info: () => Record<string, unknown>
   /** Local-only token that lets the CLI stop or restart the service. */
   readonly controlToken: string
+  readonly audit: Auditor
   /** The old plugin's data directory, read only when the owner asks. */
   readonly legacy: {
     scan(): { found: boolean; dir: string; sessions: number; ledger: number; approvals: number; bytes: number }
@@ -447,9 +449,12 @@ async function handleOperator(
         writeJson(response, 200, { ok: true, jobId: job.id })
         return
       }
-      case 'legacy-scan':
-        writeJson(response, 200, { ok: true, scan: deps.legacy.scan() })
+      case 'legacy-scan': {
+        const scan = deps.legacy.scan()
+        deps.audit.write('legacy.scanned', { found: scan.found, sessions: scan.sessions })
+        writeJson(response, 200, { ok: true, scan })
         return
+      }
       case 'legacy-import': {
         const outcome = deps.legacy.import()
         writeJson(response, outcome.ok ? 200 : 409, outcome)
@@ -458,6 +463,7 @@ async function handleOperator(
       case 'autostart-on':
       case 'autostart-off': {
         const outcome = deps.actions.autostart(action === 'autostart-on')
+        deps.audit.write('autostart.changed', { enable: action === 'autostart-on', ok: outcome.ok })
         writeJson(response, outcome.ok ? 200 : 400, outcome)
         return
       }

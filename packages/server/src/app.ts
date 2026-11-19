@@ -21,13 +21,15 @@ import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { networkInterfaces } from 'node:os'
 import { AssetStore } from './assets.ts'
 import { AuthService, isLoopback } from './auth.ts'
 import { ConfigStore } from './config-store.ts'
 import { CredentialStore } from './credential-store.ts'
 import { createHttpServer } from './http.ts'
 import { JobQueue } from './jobs.ts'
-import { Logger, type LogLevel } from './logger.ts'
+import { Logger, redact, type LogLevel } from './logger.ts'
+import { createAuditor } from './audit.ts'
 import { ensureLayout, layoutOf, type Layout } from './paths.ts'
 import { WebServerRegistry } from './registry.ts'
 import { createStandaloneHost } from './standalone-host.ts'
@@ -78,6 +80,7 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
   ensureLayout(layout)
 
   const log = new Logger({ level: options.logLevel ?? 'info', file: layout.logFile })
+  const audit = createAuditor(layout.auditFile, redact)
   log.info(`AI Debate ${options.version} 启动：数据目录 ${layout.dataDir}`)
 
   const config = new ConfigStore({ file: layout.configFile, backup: layout.configBackup })
@@ -91,21 +94,35 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     adminFile: layout.adminFile,
     sessionsFile: layout.sessionsFile,
     log,
+    audit,
     loopbackOnlySetup: isLoopback(options.host) || options.host === 'localhost',
   })
   const authLoad = auth.load()
   log.info(authLoad.initialized ? `管理员账号：${auth.username}` : '尚未初始化管理员账号，首次打开将进入初始化页面')
 
   const queue = new JobQueue({ file: layout.jobsFile, log })
-  registerJobHandlers({ queue, layout, config, credentials, log, version: options.version })
+  registerJobHandlers({ queue, layout, config, credentials, log, version: options.version, audit })
   const recovered = queue.start()
   if (recovered.recovered > 0) log.warn(`恢复 ${recovered.recovered} 个中断的任务`)
 
+  const startedAt = new Date().toISOString()
+  let actualPort = options.port
+
   const registry = new WebServerRegistry()
   const host = createStandaloneHost({
+    trustedHosts: trustedHostsFor(options.host),
+    serverInfo: () => ({
+      listen: options.host,
+      port: actualPort,
+      dataDir: layout.dataDir,
+      version: options.version,
+      startedAt,
+      pid: process.pid,
+    }),
     config,
     credentials,
     auth,
+    audit,
     registry,
     dataDir: layout.dataDir,
     version: options.version,
@@ -136,8 +153,6 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     log.info(`网页资源：${assetInfo.keys} 个（${assetInfo.source}）`)
   }
 
-  const startedAt = new Date().toISOString()
-  let actualPort = options.port
   let closing: Promise<void> | undefined
 
   const legacy = {
@@ -185,6 +200,7 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
       copyFileSync(join(scan.dir, 'state.json'), `${target}.pre-import-${Date.now()}`)
       copyFileSync(join(scan.dir, 'state.json'), target)
       log.warn(`已从旧插件目录导入台账：${scan.dir}（原文件保留）`)
+      audit.write('legacy.imported', { dir: scan.dir, sessions: scan.sessions, ledger: scan.ledger })
       return { ok: true, message: `已导入 ${scan.sessions} 个会话、${scan.ledger} 条台账、${scan.approvals} 条审批。旧文件未改动，凭据需要重新填写。` }
     },
   }
@@ -222,12 +238,14 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
 
   const shutdown = (reason: string): void => {
     log.info(`收到停止请求：${reason}`)
+    audit.write('service.shutdown', { reason })
     setTimeout(() => {
       void close().finally(() => process.exit(0))
     }, 250)
   }
   const restart = (reason: string): void => {
     log.info(`收到重启请求：${reason}`)
+    audit.write('service.restart', { reason })
     setTimeout(() => {
       void close().finally(() => process.exit(75))
     }, 250)
@@ -248,6 +266,7 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     info,
     controlToken: readControlToken(layout) ?? writeControlToken(layout),
     legacy,
+    audit,
     actions: {
       shutdown,
       restart,
@@ -348,6 +367,40 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
   }
 }
 
+/**
+ * Which Host header values this deployment answers to.
+ *
+ * The list is derived from the configured bind address — never from the request —
+ * because a fence that trusts whatever the client claims is not a fence. A reverse
+ * proxy in front of a loopback bind is the one case the bind address cannot
+ * describe, and that is what `AI_DEBATE_TRUSTED_HOSTS` is for: an explicit,
+ * operator-supplied list, comma separated.
+ */
+export function trustedHostsFor(host: string, env: NodeJS.ProcessEnv = process.env): readonly string[] {
+  const hosts = new Set<string>(['127.0.0.1', 'localhost', '[::1]', '::1'])
+  if (host !== '0.0.0.0' && host !== '::' && host !== '') {
+    hosts.add(host)
+  } else {
+    // Binding every interface means the operator intends to be reached at one of
+    // this machine's own addresses. Those are facts about the host, not claims
+    // from a request, so they can be trusted — still no header sniffing.
+    for (const addresses of Object.values(networkInterfaces())) {
+      for (const address of addresses ?? []) {
+        if (address.family === 'IPv4') hosts.add(address.address)
+        else hosts.add(`[${address.address}]`)
+      }
+    }
+  }
+  const extra = env.AI_DEBATE_TRUSTED_HOSTS
+  if (typeof extra === 'string') {
+    for (const entry of extra.split(',')) {
+      const trimmed = entry.trim()
+      if (trimmed !== '') hosts.add(trimmed)
+    }
+  }
+  return [...hosts]
+}
+
 function readControlToken(layout: Layout): string | undefined {
   try {
     const parsed = JSON.parse(readFileSync(layout.controlFile, 'utf8')) as { token?: unknown }
@@ -387,10 +440,11 @@ interface JobDeps {
   readonly credentials: CredentialStore
   readonly log: Logger
   readonly version: string
+  readonly audit: ReturnType<typeof createAuditor>
 }
 
 function registerJobHandlers(deps: JobDeps): void {
-  const { queue, layout, config, credentials, log, version } = deps
+  const { queue, layout, config, credentials, log, version, audit } = deps
 
   queue.register('backup.create', async ({ note }) => {
     const dir = join(layout.backupsDir, stamp())
@@ -410,6 +464,7 @@ function registerJobHandlers(deps: JobDeps): void {
       'utf8',
     )
     note('info', `备份完成：${dir}（${Object.keys(entries).length} 个文件）`)
+    audit.write('backup.created', { dir, files: Object.keys(entries).length })
     pruneAutoBackups()
   })
 
@@ -457,6 +512,7 @@ function registerJobHandlers(deps: JobDeps): void {
       config.replaceAll(restored)
     }
     note('info', `已从 ${name} 恢复；恢复前的数据保存在 ${pre}`)
+    audit.write('backup.restored', { dir: name, preRestore: pre })
     log.warn('备份已恢复，请重启服务以重新加载台账。')
   })
 

@@ -29,12 +29,17 @@ import type { CredentialStore } from './credential-store.ts'
 import type { WebServerRegistry } from './registry.ts'
 
 export interface StandaloneHostOptions {
+  /** Hosts this deployment answers to; the trust fence uses it to reject rebinding. */
+  readonly trustedHosts?: readonly string[]
+  /** Facts about the listener, shown on the settings page's status tab. */
+  readonly serverInfo?: () => { listen: string; port: number; dataDir: string; version: string; startedAt: string; pid: number }
   readonly config: ConfigStore
   readonly credentials: CredentialStore
   readonly auth: AuthService
   readonly registry: WebServerRegistry
   readonly dataDir: string
   readonly version: string
+  readonly audit?: { write(event: 'settings.write_failed', detail?: Record<string, unknown>): void }
   readonly log: {
     debug(message: string): void
     info(message: string): void
@@ -56,6 +61,7 @@ export interface StandaloneHost {
 
 /** Services the core may look up by name. */
 interface Services {
+  readonly appServer: unknown
   readonly settings: unknown
   readonly credentials: unknown
   readonly connection: unknown
@@ -72,7 +78,12 @@ export function createStandaloneHost(options: StandaloneHostOptions): Standalone
   const settings = {
     writable: true,
     async update(_namespace: string, patch: Record<string, unknown>): Promise<unknown> {
-      options.config.update(patch, options.log)
+      try {
+        options.config.update(patch, options.log)
+      } catch (error) {
+        options.audit?.write('settings.write_failed', { fields: Object.keys(patch), reason: String(error) })
+        throw error
+      }
       return { ok: true }
     },
     async mutate(_namespace: string, operations: readonly { op: 'unset'; path: readonly string[] }[]): Promise<unknown> {
@@ -121,6 +132,10 @@ export function createStandaloneHost(options: StandaloneHostOptions): Standalone
   }
 
   const services: Services = {
+    appServer: {
+      ...(options.trustedHosts === undefined ? {} : { trustedHosts: options.trustedHosts }),
+      ...(options.serverInfo === undefined ? {} : { info: options.serverInfo }),
+    },
     settings,
     credentials: options.credentials,
     connection,

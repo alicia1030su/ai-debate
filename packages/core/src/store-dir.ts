@@ -176,14 +176,24 @@ export function chooseStoreDir(options: {
   return { dir: fallback, source: 'default', differsFromDefault: false }
 }
 
-/** What is already on disk, for the "two candidates both have state" refusal. */
+/** What is already on disk, for the "two candidates both have state" report. */
 export interface StoreDirProbe {
   readonly dir: string
   readonly stateExists: boolean
   readonly stateBytes: number
 }
 
-function probeState(dir: string): { exists: boolean; bytes: number } {
+/**
+ * Look at a directory's `state.json` without touching it.
+ *
+ * Exported because the settings page needs the same answer for the old plugin's
+ * directory, and a second copy of this two-line `statSync` is exactly the kind of
+ * duplicate that drifts.
+ *
+ * @param dir directory to look in
+ * @returns whether a file is there and how big it is
+ */
+export function probeStoreState(dir: string): { exists: boolean; bytes: number } {
   // Real filesystem access, so the host's own flavour is the correct one here.
   const file = pathFor(process.platform).join(dir, 'state.json')
   try {
@@ -195,50 +205,59 @@ function probeState(dir: string): { exists: boolean; bytes: number } {
 }
 
 /**
- * Resolve and create the store directory, refusing the ambiguous case.
+ * Resolve and create the store directory, **reporting** the old plugin's state.
  *
- * ## The two-populated rule
+ * ## Why this does not throw
  *
- * If **both** the chosen directory and the old DSH plugin's directory hold a
- * `state.json`, the process refuses to start on that directory and says so.
- * Two ledgers means two possible answers to "has this already been published",
- * and picking one silently is how a duplicate post happens. Nothing is copied,
- * migrated or deleted: the owner moves the file, or points `storeDir` at the one
- * they want.
+ * The plugin build refused to start when the chosen directory was empty and the
+ * old `~/.dsh/ai-debate` held a `state.json`. That was necessary there, because
+ * the two directories belonged to the same host and picking one silently could
+ * merge two ledgers.
  *
- * The DSH-era plugin refused the moment the *chosen* directory was empty and the
- * old one was not. That was right inside a host that had already been running
- * with one directory; it is wrong for a new product, whose first run legitimately
- * lands next to an old installation's files. An empty ledger plus an available
- * import source is not an ambiguity — it is a fresh start.
+ * A standalone product's first run legitimately lands beside an old plugin's
+ * files, and a refusal here would mean "install it, open it, get a 500" — the
+ * worst possible first impression, for a situation the user did not cause. So
+ * nothing is thrown and nothing is merged: the chosen directory is used, and the
+ * old one is *reported* in {@link StoreDirLegacy} so the settings page can offer
+ * an explicit import. The import action is where "the target ledger is not
+ * empty" must be refused, because that is the moment a merge could actually
+ * happen — and it can refuse with a readable 409 instead of a start-up crash.
  */
 export function resolveStoreDirStrict(options: {
   readonly configured?: string | undefined
   readonly env?: NodeJS.ProcessEnv | undefined
   readonly platform?: Platform | undefined
   readonly home?: string | undefined
-}): ResolvedStoreDir & { readonly probe: StoreDirProbe } {
+}): ResolvedStoreDir & { readonly probe: StoreDirProbe; readonly legacy: StoreDirLegacy } {
   const platform = options.platform ?? process.platform
   const chosen = chooseStoreDir(options)
-  const legacy = legacyDshStoreDir(options.home ?? homedir(), platform)
+  const legacyDir = legacyDshStoreDir(options.home ?? homedir(), platform)
 
-  const chosenState = probeState(chosen.dir)
-  const legacyState = chosen.dir === legacy ? chosenState : probeState(legacy)
-
-  if (chosen.dir !== legacy && chosenState.exists && legacyState.exists) {
-    throw new Error(
-      `状态目录 ${chosen.dir} 与本应用旧插件目录 ${legacy} 里都有一份 state.json。` +
-        '本应用不会自动合并两份台账——那会把两次发布记录混在一起，让「是否已发表」失去唯一答案。' +
-        `请二选一：把要用的一份移动到 ${chosen.dir}，或在设置里显式填写 storeDir 指向要用的目录。`,
-    )
-  }
+  const chosenState = probeStoreState(chosen.dir)
+  const legacyState = chosen.dir === legacyDir ? chosenState : probeStoreState(legacyDir)
 
   mkdirSync(chosen.dir, { recursive: true })
 
   return {
     ...chosen,
     probe: { dir: chosen.dir, stateExists: chosenState.exists, stateBytes: chosenState.bytes },
+    legacy: {
+      dir: legacyDir,
+      exists: legacyDir !== chosen.dir,
+      stateExists: legacyState.exists,
+      stateBytes: legacyState.bytes,
+    },
   }
+}
+
+/** What the old plugin left behind, so the page can offer an import. */
+export interface StoreDirLegacy {
+  /** The old plugin's directory, whether or not it holds anything. */
+  readonly dir: string
+  /** False when the resolved directory *is* that directory (the owner pointed at it). */
+  readonly exists: boolean
+  readonly stateExists: boolean
+  readonly stateBytes: number
 }
 
 /**
@@ -249,12 +268,22 @@ export function resolveStoreDirStrict(options: {
  * ledger as "nothing was ever published", which reads as a clean slate rather than
  * as data loss.
  */
+/** Size of one state file, or zero when it is not a regular file. */
+function probeStateOfFile(file: string): { exists: boolean; bytes: number } {
+  try {
+    const stat = statSync(file)
+    return { exists: stat.isFile(), bytes: stat.size }
+  } catch {
+    return { exists: false, bytes: 0 }
+  }
+}
+
 export function assertStateWritable(dir: string): void {
   const file = pathFor(process.platform).join(dir, 'state.json')
   if (!existsSync(file)) return
   // Reading and parsing is the store's job; this only refuses the obvious case of a
   // zero-length file, which no valid state can be.
-  const probe = probeState(dir)
+  const probe = probeStoreState(dir)
   if (probe.exists && probe.bytes === 0) {
     throw new Error(
       `状态文件 ${file} 是空的（0 字节），不是有效的状态。` +

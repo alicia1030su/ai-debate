@@ -185,7 +185,7 @@ test('the old plugin directory is still nameable, for an explicit import', () =>
   assert.equal(legacyDshStoreDir('/home/x', 'linux'), '/home/x/.dsh/ai-debate')
 })
 
-test('two populated ledgers are refused instead of silently merged', () => {
+test('two populated ledgers are reported, never merged and never thrown on', () => {
   const home = mkdtempSync(join(tmpdir(), 'ai-debate-two-'))
   try {
     const chosen = join(home, 'chosen')
@@ -195,10 +195,15 @@ test('two populated ledgers are refused instead of silently merged', () => {
     writeFileSync(join(chosen, 'state.json'), '{"version":1}')
     writeFileSync(join(legacy, 'state.json'), '{"version":1}')
 
-    assert.throws(
-      () => resolveStoreDirStrict({ configured: chosen, home, env: {}, platform: process.platform }),
-      /都有一份 state\.json/,
-    )
+    // A throw here would surface as a 500 on the first request after install, for
+    // a situation the user did not create. The resolution succeeds, uses the
+    // chosen directory, and reports the other one so the page can offer an import.
+    const resolved = resolveStoreDirStrict({ configured: chosen, home, env: {}, platform: process.platform })
+    assert.equal(resolved.dir, chosen, '旧台账不会被读进来，也不会被合并')
+    assert.equal(resolved.probe.stateExists, true)
+    assert.equal(resolved.legacy.dir, legacy)
+    assert.equal(resolved.legacy.exists, true)
+    assert.equal(resolved.legacy.stateExists, true, '旧台账被报告出来，供显式导入')
   } finally {
     rmSync(home, { recursive: true, force: true })
   }
@@ -215,6 +220,22 @@ test('an empty new directory next to an old ledger is a fresh start, not a refus
     const resolved = resolveStoreDirStrict({ configured: chosen, home, env: {}, platform: process.platform })
     assert.equal(resolved.dir, chosen)
     assert.equal(resolved.probe.stateExists, false, '新目录还没有台账，这是全新安装而不是歧义')
+    assert.equal(resolved.legacy.stateExists, true, '旧数据可导入，但不参与解析')
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('when the owner points at the old directory, it is not reported as legacy', () => {
+  const home = mkdtempSync(join(tmpdir(), 'ai-debate-atlegacy-'))
+  try {
+    const legacy = legacyDshStoreDir(home, process.platform)
+    mkdirSync(legacy, { recursive: true })
+    writeFileSync(join(legacy, 'state.json'), '{"version":1}')
+
+    const resolved = resolveStoreDirStrict({ configured: legacy, home, env: {}, platform: process.platform })
+    assert.equal(resolved.dir, legacy)
+    assert.equal(resolved.legacy.exists, false, '解析目录就是旧目录时，没有「另一份」可导入')
   } finally {
     rmSync(home, { recursive: true, force: true })
   }
