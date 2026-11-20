@@ -63,7 +63,7 @@
 
 本机**未能**用官方 v0.2.0 二进制生成数据目录：从 Release 下载 87.8 MB 的 EXE 时连接在 40 MB 处中断，两次尝试（API 通道 38 分钟、`gh release download` 15 分钟超时）均未取得完整文件，SHA256 与发布值不符。这一项如实记为「本机未执行」，不计为通过。
 
-CI 的 `upgrade-real` 作业会在 runner 上下载官方 Linux 包（41.7 MB）并跑同一脚本；结论以那次 CI 日志为准。
+CI 的 `upgrade-real` 作业在 GitHub runner 上下载官方 Linux 包（41.7 MB），先用 **v0.2.0 二进制**完成管理员初始化、写入配置、创建监控，再用 v0.2.1 打开同一目录执行同一脚本 → **22/22 项通过**（比夹具路径少一项：真实旧目录里没有「已完成任务」行，脚本明确跳过而不再断言）。日志中的 `旧版来源：真实 v0.2.0 二进制` 与 `旧版二进制写入：setup=200 settings=200 monitor=200` 是该作业使用真旧版的证据。
 
 ## 4. Windows 启动器验收
 
@@ -82,18 +82,23 @@ CI 的 `upgrade-real` 作业会在 runner 上下载官方 Linux 包（41.7 MB）
 
 **关于自启**：本构建机的安全策略禁止 `reg.exe` 运行，产品返回可读的 400（「写入注册表失败，可能被安全软件拦截」），测试据此标记为「环境限制，未计为通过」，未伪造成功。在允许 `reg.exe` 的普通 Windows 上，该路径由同一段代码执行。
 
-## 5. Linux 验收
+## 5. Linux 验收（CI，真实 systemd）
 
-在本机无法完成（无 Docker 守护进程、无 Linux 环境）。CI 作业：
+本机无法完成（Docker 守护进程未运行、无 Linux 环境），全部在 GitHub runner 上执行。CI 运行 `44689135767`，全部作业通过。
 
-- `Package and install (ubuntu-22.04)` 与 `(ubuntu-24.04)`：runner 的 PID 1 是 systemd，先证明「能真的启动一个 unit」，再用 `install.sh` 安装、`systemctl enable --now`、跑页面工作流、`kill -9` 验证自动拉起、卸载保留数据、重装保留历史，并检查独立用户（`ai-debate`）与数据目录权限（750/700）与 logrotate 配置。
-- `Debian 12 binary compatibility (no systemd)`：容器无 init，只验证安装与二进制运行；作业内打印 `::notice::` 说明不覆盖 systemd 生命周期。
+| 作业 | 结果 | 关键输出 |
+|---|---|---|
+| Package and install (ubuntu-22.04) | ✅ **26/26** | `systemctl 报告服务 active`、`systemd 已 enable`、`服务以独立低权限用户运行（ai-debate）`、`数据目录权限收紧（750）`、`进程被 kill -9 后由 systemd 自动拉起`、`卸载保留用户数据`、`重新安装后历史数据仍在` |
+| Package and install (ubuntu-24.04) | ✅ **26/26** | 同上 |
+| Debian 12 binary compatibility (no systemd) | ✅ | 安装脚本成功；`--version` 输出 `0.2.1`；`healthz {"ok":true,"version":"0.2.1"}`；`index:200`、`auth:200` |
 
-这三项的结论以 CI 运行结果为准；本文件在发布前会补上实际状态。
+两个 Ubuntu 作业都在真实 systemd 上执行：先 `systemctl start cron` 证明这个 runner 能真的启动 unit（不是只看 `systemctl status` 的字符串），再安装、启用、跑完整工作流、`kill -9` 验证自动拉起、卸载保留数据、重装保留历史。
+
+Debian 12 作业在自己的日志里打印了限制：`Debian 12 容器没有 init，本作业只验证安装与程序兼容性，不验证 systemd 生命周期`。**Debian 12 的 systemd 生命周期未验证**，不计为通过。
 
 ## 6. 后台挂机稳定性
 
-### 6.1 压力测试（本机）
+### 6.1 压力测试（本机与 CI）
 
 `node --experimental-transform-types test/stress/soak.ts --seconds=120 --interval-ms=40`：
 
@@ -113,7 +118,25 @@ CI 的 `upgrade-real` 作业会在 runner 上下载官方 Linux 包（41.7 MB）
 }
 ```
 
-结论：两分钟、2441 次调度后堆没有增长；120 条回复产生 119 个候选（剩下一条是主人自己的发言，被正确过滤），**没有一条回复出现两个候选**；台账峰值 266，低于容量 400。
+结论：两分钟、2441 次调度后堆没有增长；120 条回复产生 119 个候选（剩下一条是主人自己的发言，被正确过滤），**没有一条回复出现两个候选**；待执行任务峰值远低于容量。
+
+CI 上同一脚本跑 **300 秒 / 7362 次调度**：
+
+```json
+{
+  "wallClockSeconds": 300,
+  "iterations": 7362,
+  "replies": 120,
+  "modelCalls": 119,
+  "heapGrowthMb": 2,
+  "peakQueued": 5,
+  "peakLedgerRows": 512,
+  "candidates": 119,
+  "duplicateCandidates": 0
+}
+```
+
+五分钟、7362 次调度后堆增长 2 MB；候选仍是一比一；待执行任务峰值 5（容量 400）。台账 512 行里 119 行是待审核（受保护、不清理），其余是历史，受保留策略约束。
 
 ### 6.2 未执行
 
@@ -157,8 +180,8 @@ CI 的 `upgrade-real` 作业会在 runner 上下载官方 Linux 包（41.7 MB）
 
 ## 9. 未完成的验证（明确列出）
 
-1. 24 小时墙钟压力测试。
+1. 24 小时墙钟压力测试（已跑 5 分钟 CI + 2 分钟本机）。
 2. 真实贴吧/微博账号的长期轮询与限流行为。
 3. Debian 12 的 systemd 生命周期（只有安装与二进制兼容）。
-4. Windows 开机自启的实际注册表写入（本机 `reg.exe` 被策略拦截）。
+4. Windows 开机自启的实际注册表写入（本机 `reg.exe` 被策略拦截；CI 的 windows-latest 上该检查会真实执行）。
 5. 真实发表：本版本依旧不开放无人值守发表，也未在真实账号上验证发表能力。
