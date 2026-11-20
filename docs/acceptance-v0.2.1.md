@@ -178,6 +178,28 @@ CI 上同一脚本跑 **300 秒 / 7362 次调度**：
 | 非法 URL（内网/未知域） | 400 且不落库 |
 | 审计事件 | 登录、监控增删改、暂停/恢复、队列清理/回收/重试、存储损坏/恢复/迁移 |
 
+## 8.5 发布后校验
+
+Release `v0.2.1` 由 tag 触发的工作流发布（annotated tag `531e9637` → commit `ca549cbf`）。发布后的 `verify-assets` 作业在 runner 上**重新下载**了三个附件：
+
+```
+AI-Debate-windows-x64.exe: OK      87895040 字节
+ai-debate-linux-x64.tgz: OK        41753971 字节
+```
+
+`sha256sum -c SHA256SUMS.txt` 通过；TGZ 解包后跑了凭据扫描；GitHub 记录的附件摘要与 `SHA256SUMS.txt` 一致：
+
+```
+cb3b14f0dc52ff5d579e64df5e0e21eff051c62291dcde162d48cda9a16cedcf  AI-Debate-windows-x64.exe
+2b658c70dbcacca3ccb74a5e794b4603132017d8d3d96655815f4f204a5d5f61  ai-debate-linux-x64.tgz
+```
+
+`releases/latest` 返回 `v0.2.1`，`prerelease=false`、`draft=false`；v0.2.0 的三个附件摘要与发布时一致，未被改动。
+
+**这一作业的最后一步在 v0.2.1 首次运行时失败**，原因是 `gh release view --json` 没有 `isLatest` 字段（`Unknown JSON field`）。这是校验脚本的错误，不是附件或产品的问题；同一作业里的下载、校验和、解包扫描都已通过。工作流已改为查询 `/releases/latest`，本文件发布后由 API 复核上面三项。
+
+本机无法直接下载附件（到 GitHub Release 的连接在 40 MB 处中断），因此「重新下载并核对」的证据来自 runner，而不是构建机。
+
 ## 9. 未完成的验证（明确列出）
 
 1. 24 小时墙钟压力测试（已跑 5 分钟 CI + 2 分钟本机）。

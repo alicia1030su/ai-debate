@@ -243,10 +243,18 @@ jobs:
           TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease,isLatest,tagName \
-            --jq '"prerelease=\(.isPrerelease) latest=\(.isLatest) tag=\(.tagName)"'
+          # `gh release view --json` has no `isLatest` field, so asking for it fails
+          # the step with "Unknown JSON field" — which is how the first v0.2.1 run
+          # went red *after* a successful publish. The answer comes from the
+          # `/releases/latest` endpoint instead.
           IS_PRE=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+          LATEST=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          echo "prerelease=$IS_PRE latest=$LATEST tag=$TAG"
           if [ "$IS_PRE" != "false" ]; then
             echo "::error::这是一个预发布版本，正式发行不允许"
+            exit 1
+          fi
+          if [ "$LATEST" != "$TAG" ]; then
+            echo "::error::$TAG 不是 Latest（当前是 $LATEST）"
             exit 1
           fi
