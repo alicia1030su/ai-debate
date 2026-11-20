@@ -152,6 +152,7 @@ function failureReport(options, stateFile, startedAt, endedAt, restarts, attempt
       cumulativeSeconds: Number(((endedAt - startedAt) / 1000).toFixed(3)),
       requestedSeconds: options.seconds,
       resumed: restarts > 0,
+      resumedAfterFailure: false,
       monitors: 0,
       threads: 0,
       seed: 0,

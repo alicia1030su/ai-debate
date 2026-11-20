@@ -64,6 +64,7 @@ export interface SoakOptions {
   readonly seed: number
   readonly stateFile?: string
   readonly resume: boolean
+  readonly acknowledgeFailures: boolean
   readonly killEvery: number
   readonly noKill: boolean
   readonly report?: string
@@ -160,6 +161,7 @@ export interface SoakReport {
   readonly cumulativeSeconds: number
   readonly requestedSeconds: number
   readonly resumed: boolean
+  readonly resumedAfterFailure: boolean
   readonly monitors: number
   readonly threads: number
   readonly seed: number
@@ -317,7 +319,7 @@ function parseArguments(argv: readonly string[]): SoakOptions {
     'seconds', 'deadline', 'monitors', 'interval-ms', 'seed', 'state-file', 'resume', 'kill-every',
     'no-kill', 'report', 'threads', 'reply-every-ms', 'scan-batch', 'scan-every-ms',
     'capacity', 'platform-fault-chance', 'model-fault-chance', 'disk-fault-chance',
-    'backlog-fault-chance', 'duplicate-reply-chance', 'disk-store', 'no-faults', 'self-test',
+    'backlog-fault-chance', 'duplicate-reply-chance', 'disk-store', 'acknowledge-failures', 'no-faults', 'self-test',
   ])
   for (const name of new Set([...values.keys(), ...flags])) {
     if (!known.has(name)) throw new Error(`不认识的参数：--${name}`)
@@ -331,6 +333,7 @@ function parseArguments(argv: readonly string[]): SoakOptions {
     seed: number('seed', 1, 0, true),
     ...(stateFile === undefined ? {} : { stateFile: resolve(stateFile) }),
     resume: flags.has('resume'),
+    acknowledgeFailures: flags.has('acknowledge-failures'),
     killEvery,
     noKill: flags.has('no-kill'),
     ...(report === undefined ? {} : { report: resolve(report) }),
@@ -849,14 +852,19 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
     if (task.identityKey !== undefined) activeKeys.add(task.identityKey)
     for (const key of task.identityKeys ?? []) activeKeys.add(key)
   }
+  const activeReplyCoordinates = new Set<string>()
+  for (const entry of entries) {
+    if (!activeKeys.has(entry.key)) continue
+    activeReplyCoordinates.add(`${entry.platform}:${entry.threadId}:${entry.postId}`)
+  }
   let lostTasks = identities.orphans(activeKeys).length
   for (const identity of entries) {
     if (identity.state !== 'candidate') continue
     const key = `${identity.platform}:${identity.threadId}:${identity.postId}`
-    if (!candidatesByReply.has(key)) lostTasks += 1
+    if (!candidatesByReply.has(key) && !activeReplyCoordinates.has(key)) lostTasks += 1
   }
   for (const key of candidatesByReply.keys()) {
-    if (identityByReply.get(key)?.state !== 'candidate') lostTasks += 1
+    if (identityByReply.get(key)?.state !== 'candidate' && !activeReplyCoordinates.has(key)) lostTasks += 1
   }
   for (const monitor of monitors.list()) {
     for (const postId of monitor.seen) {
@@ -961,6 +969,7 @@ function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'f
     cumulativeSeconds: Number(cumulativeSeconds.toFixed(3)),
     requestedSeconds: options.seconds,
     resumed: state.restarts > 0,
+    resumedAfterFailure: options.resume && options.acknowledgeFailures,
     monitors: state.monitors,
     threads: state.threads,
     seed: state.seed,
@@ -1094,6 +1103,10 @@ async function buildContext(options: SoakOptions): Promise<SoakContext> {
       scanEveryMs: state.scanEveryMs,
     }
     state.completed = false
+    if (options.acknowledgeFailures) {
+      state.invariantFailures = []
+      state.lostTaskStrikes = 0
+    }
   } else {
     rootDir = options.stateFile === undefined
       ? mkdtempSync(join(tmpdir(), 'ai-debate-soak-v022-'))
@@ -1661,6 +1674,7 @@ async function runSoak(options: SoakOptions): Promise<void> {
         cumulativeSeconds: 0,
         requestedSeconds: options.seconds,
         resumed: options.resume,
+        resumedAfterFailure: options.resume && options.acknowledgeFailures,
         monitors: options.monitors,
         threads: options.threads,
         seed: options.seed,
