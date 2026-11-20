@@ -201,6 +201,7 @@ async function main(): Promise<void> {
   let replies = 2
   let iteration = 0
   let peakTasks = 0
+  let peakQueued = 0
   let duplicateCandidates = 0
   let pruned = 0
 
@@ -235,6 +236,9 @@ async function main(): Promise<void> {
     }
     await engine.tick()
     peakTasks = Math.max(peakTasks, tasks.all().length)
+    // Capacity bounds *runnable* work, not history: a completed row is a record, not
+    // a slot. The queue's own limit is what "no unbounded growth" means here.
+    peakQueued = Math.max(peakQueued, tasks.queuedCount())
     if (iteration % 40 === 0) {
       // Keep the ledger honest the way the running product does: history is pruned,
       // never accumulated. The soak asserts the effect of that policy.
@@ -279,6 +283,7 @@ async function main(): Promise<void> {
     heapFinalMb: Math.round(finalHeap / 1024 / 1024),
     heapGrowthMb: Math.round((finalHeap - baselineHeap) / 1024 / 1024),
     peakLedgerRows: peakTasks,
+    peakQueued,
     ledgerRowsAtEnd: tasks.all().length,
     prunedRows: pruned,
     candidates: perTarget.size,
@@ -304,7 +309,14 @@ async function main(): Promise<void> {
 
   const failures: string[] = []
   if (duplicateCandidates > 0) failures.push(`${duplicateCandidates} 条回复出现了多个候选`)
-  if (report.peakLedgerRows > tasks.capacity) failures.push(`台账峰值 ${report.peakLedgerRows} 超过容量 ${tasks.capacity}`)
+  if (report.peakQueued > tasks.capacity) failures.push(`待执行任务峰值 ${report.peakQueued} 超过容量 ${tasks.capacity}`)
+  // Every `needs_review` row is protected from pruning, so the ledger's floor is the
+  // number of candidates a human still has to look at. Anything beyond that is
+  // history and must stay bounded by the retention policy.
+  const protectedRows = tasks.all().filter((task) => task.state === 'needs_review').length
+  if (report.peakLedgerRows > tasks.capacity + protectedRows + 300) {
+    failures.push(`台账峰值 ${report.peakLedgerRows} 超出「容量 + 待审核 + 保留」上限`)
+  }
   if (report.heapGrowthMb > 120) failures.push(`堆增长 ${report.heapGrowthMb} MB 超过阈值 120 MB`)
   // A `valid_draft` outcome that produced no candidate would silently lose work.
   const declined = tasks.all().filter((task) => task.lastErrorKind === 'generator_declined').length

@@ -161,12 +161,25 @@ async function seedWithRealBinary(binary: string): Promise<boolean> {
       process.stdout.write(`旧版二进制未能启动：${log.slice(-400)}\n`)
       return false
     }
+    // v0.2.0 authenticates with a session cookie; without carrying it, setup works
+    // and every later write is a 401 — which is exactly what the first CI run of
+    // this script hit, making the "real binary" path silently fall back.
+    let cookie = ''
     const post = async (path: string, body: unknown): Promise<number> => {
       const response = await fetch(`${base}${path}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', origin: base },
+        headers: {
+          'content-type': 'application/json',
+          origin: base,
+          ...(cookie === '' ? {} : { cookie }),
+        },
         body: JSON.stringify(body),
       })
+      const setCookie = response.headers.get('set-cookie')
+      const match = setCookie === null ? null : /ai_debate_session=([^;]+)/.exec(setCookie)
+      if (match !== null) cookie = `ai_debate_session=${match[1] as string}`
+      // Drain the body so the socket is reusable and an error page is not left open.
+      await response.text()
       return response.status
     }
     const setupStatus = await post('/api/ai-debate/auth/setup', { username: 'owner', password: 'upgrade-pass-2026' })
@@ -181,7 +194,7 @@ async function seedWithRealBinary(binary: string): Promise<boolean> {
     process.stdout.write(
       `旧版二进制写入：setup=${setupStatus} settings=${settingsStatus} monitor=${monitorStatus}\n`,
     )
-    return setupStatus === 200 && monitorStatus === 200
+    return setupStatus === 200 && settingsStatus === 200 && monitorStatus === 200
   } finally {
     child.kill('SIGTERM')
     await sleep(800)
@@ -349,8 +362,12 @@ async function main(): Promise<void> {
     seedQueueRows()
     process.stdout.write('旧版来源：真实 v0.2.0 二进制（管理员、配置、监控由它写入；队列中的待审核行按 v0.2.0 结构追加）\n\n')
   } else {
+    // A failed real-binary attempt leaves an admin record behind. Starting the
+    // fixture on top of it would make setup return 409 and look like a product bug.
+    rmSync(DATA_DIR, { recursive: true, force: true })
+    mkdirSync(DATA_DIR, { recursive: true })
     seedV020Directory()
-    process.stdout.write('旧版来源：按 v0.2.0 写出的文件结构（未提供可运行的 v0.2.0 二进制）\n\n')
+    process.stdout.write('旧版来源：按 v0.2.0 写出的文件结构（未提供或未能运行 v0.2.0 二进制）\n\n')
   }
 
   const stateFile = join(DATA_DIR, 'state.json')

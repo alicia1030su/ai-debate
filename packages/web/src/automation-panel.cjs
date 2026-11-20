@@ -276,6 +276,42 @@ function createAutomationPanel(deps) {
           ? `补偿扫描：每 ${num(monitor.compensationHours)} 小时回看，上次 ${rel(monitor.lastCompensationAt)}`
           : '补偿扫描：已关闭'
       const changes = Array.isArray(monitor.recentChanges) ? monitor.recentChanges : []
+      // The look-back window is per target: a quiet thread needs a wider one than a
+      // busy thread, and a value that can only be changed by editing JSON is not
+      // "configurable" in any sense the operator cares about.
+      const windowInput = el('input', {
+        class: 'auto-input auto-input-narrow',
+        type: 'number',
+        min: '0',
+        max: '168',
+        step: '1',
+        value: String(monitor.compensationHours ?? 24),
+        'aria-label': `${monitor.name} 的补偿回看小时数`,
+      })
+      const saveWindow = el(
+        'button',
+        {
+          class: 'shell-btn shell-btn-ghost',
+          type: 'button',
+          onclick: async () => {
+            const hours = Number(windowInput.value)
+            if (!Number.isFinite(hours) || hours < 0 || hours > 168) {
+              banner.textContent = '回看窗口必须在 0–168 小时之间（0 表示关闭）。'
+              return
+            }
+            banner.textContent = '正在保存回看窗口…'
+            const result = await deps.request(`${API}/automation/monitors/${encodeURIComponent(monitor.id)}`, {
+              method: 'PATCH',
+              body: { compensationHours: hours },
+            })
+            banner.textContent = result.ok
+              ? `回看窗口已设为 ${hours} 小时。`
+              : `保存失败：${result.network ? '无法连接服务' : result.error || `HTTP ${result.status}`}`
+            if (result.ok) await reload()
+          },
+        },
+        ['保存'],
+      )
       const actions = [
         el(
           'button',
@@ -352,7 +388,12 @@ function createAutomationPanel(deps) {
                   .join('；')}`,
               ]),
           blocked,
-          el('div', { class: 'auto-row-actions' }, actions),
+          el('div', { class: 'auto-row-actions' }, [
+            el('span', { class: 'auto-monitor-meta' }, ['回看（小时）']),
+            windowInput,
+            saveWindow,
+            ...actions,
+          ]),
         ]),
       )
     }

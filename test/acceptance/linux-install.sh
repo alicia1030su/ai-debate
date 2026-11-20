@@ -93,6 +93,15 @@ if [[ "$(id -u)" -eq 0 ]]; then
     done
     systemctl is-active --quiet ai-debate && pass "systemctl 报告服务 active" || fail "systemctl 报告服务 active"
     systemctl is-enabled --quiet ai-debate && pass "systemd 已 enable（开机自启）" || fail "systemd 已 enable"
+    # 独立低权限用户：服务不能以 root 跑。
+    MAIN_USER=$(systemctl show -p User --value ai-debate)
+    [[ "${MAIN_USER}" == "ai-debate" ]] && pass "服务以独立低权限用户运行（${MAIN_USER}）" || fail "服务用户不是 ai-debate（${MAIN_USER}）"
+    # 数据目录必须归该用户所有，且不对其他用户开放写权限。
+    OWNER=$(stat -c '%U' "${STATE_DIR}")
+    [[ "${OWNER}" == "ai-debate" ]] && pass "数据目录归服务用户所有" || fail "数据目录属主是 ${OWNER}"
+    MODE=$(stat -c '%a' "${STATE_DIR}")
+    [[ "${MODE}" == "750" || "${MODE}" == "700" ]] && pass "数据目录权限收紧（${MODE}）" || fail "数据目录权限过宽（${MODE}）"
+    [[ -f /etc/logrotate.d/ai-debate ]] && pass "已安装日志轮转配置" || echo "  （本机没有 logrotate，跳过）"
   else
     echo "== 没有运行中的 systemd：退化为手工启动 =="
     ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" --data-dir "${WORK}/data" --prefix "${WORK}/opt" --no-start ) \
