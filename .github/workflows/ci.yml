@@ -242,6 +242,7 @@ jobs:
           name: linux-tgz
           path: /tmp/ai-debate
       - name: Install without systemd and run the service
+        shell: bash
         run: |
           set -euo pipefail
           echo "::notice::Debian 12 容器没有 init，本作业只验证安装与程序兼容性，不验证 systemd 生命周期"
