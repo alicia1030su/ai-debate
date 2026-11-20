@@ -93,7 +93,7 @@ journalctl -u ai-debate -f
 /opt/ai-debate/bin/ai-debate status
 ```
 
-`Restart=on-failure` + `RestartSec=3`：异常退出（包括被 `kill -9`）会被 systemd 拉起。应用受控重启时先安全关闭再以退出码 `75` 退出；unit 的 `SuccessExitStatus=75` 避免把这次退出报告为失败，`RestartForceExitStatus=75` 则确保它仍然自动恢复（仅设 `SuccessExitStatus` 会让 `on-failure` 把 75 当作干净退出）。显式 `systemctl stop` 不会被重新拉起。服务器重启后服务自动恢复，`state.json` 与队列从磁盘继续。
+`Restart=on-failure` + `RestartSec=3`：异常退出（包括被 `kill -9`）会被 systemd 拉起。应用受控重启时先安全关闭再以退出码 `75` 退出；unit 的 `SuccessExitStatus=75` 避免把这次退出报告为失败，`RestartForceExitStatus=75` 则确保它仍然自动恢复（仅设 `SuccessExitStatus` 会让 `on-failure` 把 75 当作干净退出）。显式 `systemctl stop` 不会被重新拉起。`StartLimitIntervalSec=60` + `StartLimitBurst=10` 允许短时间内的维护重启和恢复突发，同时仍阻止无限重启循环。服务器重启后服务自动恢复，`state.json` 与队列从磁盘继续。
 
 `ProtectSystem=strict` 保持启用，`ReadWritePaths` 只包含实际的数据目录。`EnvironmentFile` 由 systemd 以 root 在降权前读取，配置目录不需要写权限。
 

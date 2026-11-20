@@ -189,6 +189,8 @@ jobs:
           grep -q '^Restart=on-failure$' "$tmp/ai-debate.service"
           grep -q '^SuccessExitStatus=75$' "$tmp/ai-debate.service"
           grep -q '^RestartForceExitStatus=75$' "$tmp/ai-debate.service"
+          grep -q '^StartLimitIntervalSec=60$' "$tmp/ai-debate.service"
+          grep -q '^StartLimitBurst=10$' "$tmp/ai-debate.service"
           grep -q '^ReadWritePaths=/var/lib/ai-debate$' "$tmp/ai-debate.service"
           grep -q '^ProtectSystem=strict$' "$tmp/ai-debate.service"
           grep -q '^ExecStart=/opt/ai-debate/bin/ai-debate serve$' "$tmp/ai-debate.service"

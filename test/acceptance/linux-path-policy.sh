@@ -136,6 +136,8 @@ fi
 if grep -q '^Restart=on-failure$' "${ROOT}/packaging/linux/ai-debate.service" \
   && grep -q '^SuccessExitStatus=75$' "${ROOT}/packaging/linux/ai-debate.service" \
   && grep -q '^RestartForceExitStatus=75$' "${ROOT}/packaging/linux/ai-debate.service" \
+  && grep -q '^StartLimitIntervalSec=60$' "${ROOT}/packaging/linux/ai-debate.service" \
+  && grep -q '^StartLimitBurst=10$' "${ROOT}/packaging/linux/ai-debate.service" \
   && grep -q '^ReadWritePaths=@DATA_DIR@$' "${ROOT}/packaging/linux/ai-debate.service" \
   && grep -q '^ProtectSystem=strict$' "${ROOT}/packaging/linux/ai-debate.service"; then
   pass "systemd 模板限定失败重启与唯一可写目录"
