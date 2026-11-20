@@ -53,16 +53,24 @@ export interface HttpDeps {
    */
   readonly automation: {
     status(): Record<string, unknown>
+    /** Runtime facts (memory, disk, uptime) for the status centre. */
+    health(): Record<string, unknown>
     monitors(): readonly Record<string, unknown>[]
     tasks(limit: number): readonly unknown[]
     reviews(): readonly Record<string, unknown>[]
     createMonitor(input: { name: string; url: string; intervalSec?: number; accountLabel?: string }): { id: string }
-    updateMonitor(id: string, patch: { name?: string; intervalSec?: number; enabled?: boolean; accountLabel?: string }): unknown
+    updateMonitor(
+      id: string,
+      patch: { name?: string; intervalSec?: number; enabled?: boolean; accountLabel?: string; compensationHours?: number },
+    ): unknown
     removeMonitor(id: string): boolean
     checkNow(id: string): { ok: boolean; message?: string }
+    scanNow(id: string, mode: 'compensate' | 'full'): { ok: boolean; message?: string }
     pauseAll(): void
     resumeAll(): void
     cancelTask(id: string): boolean
+    retryTask(id: string): boolean
+    maintenance(action: 'prune' | 'reap'): Record<string, unknown>
     loadErrors(): readonly string[]
   }
   /** The old plugin's data directory, read only when the owner asks. */
@@ -438,6 +446,7 @@ async function handleOperator(
     // undefined — and the page would print "undefined 个监控" instead of zero.
     writeJson(response, 200, {
       ...deps.automation.status(),
+      health: deps.automation.health(),
       monitorList: deps.automation.monitors(),
       reviews: deps.automation.reviews(),
       loadErrors: deps.automation.loadErrors(),
@@ -477,7 +486,7 @@ async function handleOperator(
     return
   }
 
-  const monitorMatch = /^\/api\/ai-debate\/automation\/monitors\/([^/]+)(?:\/(check|pause|resume))?$/.exec(pathname)
+  const monitorMatch = /^\/api\/ai-debate\/automation\/monitors\/([^/]+)(?:\/(check|scan|pause|resume))?$/.exec(pathname)
   if (monitorMatch !== null) {
     const id = decodeURIComponent(monitorMatch[1] as string)
     const action = monitorMatch[2]
@@ -492,17 +501,25 @@ async function handleOperator(
         writeJson(response, outcome.ok ? 200 : 404, outcome)
         return
       }
+      if (action === 'scan') {
+        const mode = body.mode === 'full' ? 'full' : 'compensate'
+        const outcome = deps.automation.scanNow(id, mode)
+        deps.audit.write('monitor.scanned', { id, mode, ok: outcome.ok })
+        writeJson(response, outcome.ok ? 200 : 404, outcome)
+        return
+      }
       if (action === 'pause' || action === 'resume') {
         const updated = deps.automation.updateMonitor(id, { enabled: action === 'resume' })
         deps.audit.write('monitor.toggled', { id, enabled: action === 'resume' })
         writeJson(response, updated === undefined ? 404 : 200, updated === undefined ? { error: '监控目标不存在。' } : { ok: true })
         return
       }
-      const patch: { name?: string; intervalSec?: number; enabled?: boolean; accountLabel?: string } = {}
+      const patch: { name?: string; intervalSec?: number; enabled?: boolean; accountLabel?: string; compensationHours?: number } = {}
       if (typeof body.name === 'string') patch.name = body.name
       if (typeof body.intervalSec === 'number') patch.intervalSec = body.intervalSec
       if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
       if (typeof body.accountLabel === 'string') patch.accountLabel = body.accountLabel
+      if (typeof body.compensationHours === 'number') patch.compensationHours = body.compensationHours
       const updated = deps.automation.updateMonitor(id, patch)
       if (updated === undefined) {
         writeJson(response, 404, { error: '监控目标不存在。' })
@@ -546,6 +563,30 @@ async function handleOperator(
   if (taskCancel !== null && method === 'POST') {
     const ok = deps.automation.cancelTask(decodeURIComponent(taskCancel[1] as string))
     writeJson(response, ok ? 200 : 404, ok ? { ok: true } : { error: '任务不存在或已结束。' })
+    return
+  }
+
+  const taskRetry = /^\/api\/ai-debate\/automation\/tasks\/([^/]+)\/retry$/.exec(pathname)
+  if (taskRetry !== null && method === 'POST') {
+    const id = decodeURIComponent(taskRetry[1] as string)
+    const ok = deps.automation.retryTask(id)
+    if (ok) deps.audit.write('queue.retried', { id, by: session.username })
+    writeJson(response, ok ? 200 : 409, ok ? { ok: true } : { error: '只有失败、阻塞或已取消的任务可以手动重试。' })
+    return
+  }
+
+  if (pathname === '/api/ai-debate/automation/maintenance' && method === 'POST') {
+    const body = await readJsonBody(request)
+    if (body === undefined) {
+      writeJson(response, 400, { error: '请求体不是合法 JSON。' })
+      return
+    }
+    const action = body.action === 'reap' ? 'reap' : body.action === 'prune' ? 'prune' : undefined
+    if (action === undefined) {
+      writeJson(response, 400, { error: 'action 只能是 prune 或 reap。' })
+      return
+    }
+    writeJson(response, 200, deps.automation.maintenance(action))
     return
   }
 

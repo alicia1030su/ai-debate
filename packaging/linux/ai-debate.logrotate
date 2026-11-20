@@ -1,0 +1,16 @@
+# Keep the service log from growing without bound.
+#
+# The service also rotates by size on its own (2 MB, one generation). This file is
+# the second layer: if the process is wedged and cannot rotate, logrotate still
+# bounds the file, and `copytruncate` means no signal is needed to reopen it.
+/var/lib/ai-debate/logs/*.log {
+    weekly
+    rotate 4
+    maxsize 10M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su ai-debate ai-debate
+}

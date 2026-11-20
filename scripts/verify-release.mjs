@@ -51,7 +51,19 @@ if (existsSync(tgz)) {
   process.stdout.write('· Linux TGZ 不在这里构建（需要在 Linux runner 上运行 packaging/linux/build.mjs）\n')
 }
 
-const docs = ['install-windows.md', 'install-linux.md', 'security.md', 'migration.md', 'differences.md', 'known-issues.md', 'architecture.md']
+const docs = [
+  'install-windows.md',
+  'install-linux.md',
+  'security.md',
+  'migration.md',
+  'differences.md',
+  'known-issues.md',
+  'architecture.md',
+  'automation-architecture.md',
+  'reliability-v0.2.1.md',
+  `acceptance-v${version}.md`,
+  `release-notes-v${version}.md`,
+]
 for (const doc of docs) check(`文档 ${doc} 存在`, existsSync(join(root, 'docs', doc)))
 
 const failed = checks.filter((item) => !item.ok)

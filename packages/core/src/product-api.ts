@@ -40,6 +40,26 @@ export interface ProbedReply {
   readonly floorPostId: string
   readonly floorNumber?: number
   readonly order: number
+  /**
+   * Hash of the fields that make this reply *this reply* (author, text, time,
+   * parent). The monitor stores it beside its cursor so the next scan can tell
+   * "already seen" from "seen, but edited" — comparing ids alone is what makes a
+   * monitor blind to changes.
+   */
+  readonly fingerprint: string
+}
+
+/** How much of the thread one read covered, and why it stopped. */
+export interface ProbeScan {
+  readonly mode: 'tail' | 'window' | 'full'
+  /** True when every page this mode set out to read came back whole. */
+  readonly complete: boolean
+  readonly pagesRead: number
+  readonly totalPages?: number
+  readonly repliesSeen: number
+  /** True when nested replies were cut off by the per-floor caps. */
+  readonly nestedTruncated?: boolean
+  readonly incompleteReason?: string
 }
 
 /** Result of one read of a monitored thread. */
@@ -54,6 +74,7 @@ export interface ProbeResult {
   /** Pages actually requested, for the task log. */
   readonly pagesRead: number
   readonly declaredTotal?: number
+  readonly scan: ProbeScan
 }
 
 export interface GenerateResult {
@@ -104,12 +125,16 @@ export interface DebateProductApi {
   /**
    * Read a thread without analysing it.
    *
-   * `fullScan` walks every page; the default reads the thread body plus the last
-   * page of floors, which is where new replies appear and costs two requests
-   * instead of dozens. The difference is reported in the result (`complete`), not
-   * hidden — a monitor built on tail reads cannot claim it saw the whole thread.
+   * `mode: 'tail'` (default) reads the thread body plus the last pages of floors,
+   * which is where new replies appear and costs a handful of requests instead of
+   * dozens. `'window'` walks back over a time window looking for edits and
+   * deletions. `'full'` walks every page the configuration allows. The difference
+   * is reported in `scan.complete` and `scan.incompleteReason`, never hidden — a
+   * monitor built on tail reads cannot claim it saw the whole thread.
+   *
+   * `fullScan` is a compatibility synonym for `mode: 'full'`.
    */
-  probe(input: { url: string; fullScan?: boolean; signal?: AbortSignal }): Promise<ProbeResult>
+  probe(input: { url: string; mode?: 'tail' | 'window' | 'full'; fullScan?: boolean; windowHours?: number; signal?: AbortSignal }): Promise<ProbeResult>
 
   /** Analyse one thread, optionally targeting one reply. Returns the session id. */
   analyze(input: {

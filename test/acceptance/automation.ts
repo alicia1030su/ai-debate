@@ -321,9 +321,22 @@ test('挂机链路：基线 → 发现新回复 → 分析 → 生成 → 待审
     assert.equal(after.length >= before, true)
 
     // 4. Same reply re-queued by hand: the dedupe key must refuse a second candidate.
-    const key = `generate:${review[0]!.sessionId}:f3`
+    //    The key is scoped to the monitor and the reply, not to the session: a second
+    //    analysis of the same thread yields a *new* session id, and a session-scoped
+    //    key would let the same reply collect a second candidate under it.
+    const key = `generate:${monitor.id}:f3`
     const again = kit.tasks.enqueue({ kind: 'generate', monitorId: monitor.id, postId: 'f3', sessionId: review[0]!.sessionId, dedupeKey: key })
     assert.equal(again.deduplicated, true, '同一回复只能有一个生成任务')
+
+    // 5. A fresh session for the same thread must not reopen the question.
+    const reanalyzed = kit.tasks.enqueue({
+      kind: 'generate',
+      monitorId: monitor.id,
+      postId: 'f3',
+      sessionId: 'a-different-session',
+      dedupeKey: `generate:${monitor.id}:f3`,
+    })
+    assert.equal(reanalyzed.deduplicated, true, '换一个会话也不能为同一回复再生成一个候选')
   } finally {
     await kit.dispose()
     model.server.close()
@@ -407,15 +420,23 @@ test('崩溃恢复：running 任务重新排队，且不会重复生成候选', 
     const generate = document.tasks.find((task) => task.kind === 'generate')
     assert.ok(generate !== undefined)
     generate.state = 'running'
+    // A task killed *during* the model call: the request was dispatched, the answer
+    // was never persisted. That is the only case where a retry may duplicate the
+    // request, so it must be recorded as uncertain rather than silently replayed.
+    ;(generate as unknown as { modelCall: { startedAt: string } }).modelCall = {
+      startedAt: new Date().toISOString(),
+    }
     writeFileSync(file, JSON.stringify(document), 'utf8')
 
     const reloaded = new AutoTaskStore({ file, log })
     reloaded.load()
     const recovered = reloaded.recoverInterrupted()
-    assert.equal(recovered, 1, '运行中的任务应被恢复')
+    assert.equal(recovered.recovered, 1, '运行中的任务应被恢复')
+    assert.equal(recovered.uncertain, 1, '模型调用中的任务应标记为结果不确定')
     const recoveredTask = reloaded.list().find((task) => task.kind === 'generate')
     assert.equal(recoveredTask?.state, 'pending')
-    assert.equal(recoveredTask?.lastErrorKind, 'interrupted')
+    assert.equal(recoveredTask?.lastErrorKind, 'interrupted_uncertain')
+    assert.equal(recoveredTask?.modelCall?.uncertain, true)
 
     // Re-running it must reuse the existing candidate, not create a second one.
     kit.tasks.load()

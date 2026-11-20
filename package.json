@@ -1,6 +1,6 @@
 {
   "name": "ai-debate",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "AI Debate — standalone discussion analysis, persona-driven reply drafting and human-approved publishing workbench.",
   "license": "AGPL-3.0-only",
@@ -21,7 +21,7 @@
     "bundle": "node scripts/bundle-server.mjs",
     "package:windows": "node packaging/windows/build.mjs",
     "package:linux": "node packaging/linux/build.mjs",
-    "test": "npm run test:core && npm run test:server && npm run test:web && npm run acceptance && npm run test:automation && npm run test:recovery",
+    "test": "npm run test:core && npm run test:server && npm run test:web && npm run acceptance && npm run test:automation && npm run test:recovery && npm run test:paging && npm run test:upgrade",
     "test:core": "node --experimental-transform-types --test --test-concurrency=4 \"packages/core/test/**/*.test.ts\"",
     "start": "node --experimental-transform-types packages/server/src/cli.ts serve",
     "smoke": "node --experimental-transform-types test/acceptance/standalone.ts",
@@ -37,7 +37,15 @@
     "test:recovery": "node --experimental-transform-types test/acceptance/recovery.ts",
     "pretest:automation": "node scripts/build-core.mjs",
     "pretest:recovery": "node scripts/build-core.mjs && node scripts/bundle-server.mjs",
-    "pretypecheck": "node scripts/build-core.mjs"
+    "pretypecheck": "node scripts/build-core.mjs",
+    "test:upgrade": "node --experimental-transform-types test/acceptance/upgrade.ts",
+    "test:paging": "node --experimental-transform-types test/acceptance/paging.ts",
+    "test:windows-launcher": "node --experimental-transform-types --test test/acceptance/windows-launcher.ts",
+    "test:soak": "node --experimental-transform-types test/stress/soak.ts --seconds=120",
+    "pretest:upgrade": "node scripts/build-core.mjs && node scripts/bundle-server.mjs",
+    "pretest:paging": "node scripts/build-core.mjs",
+    "pretest:windows-launcher": "node scripts/build-core.mjs && node scripts/build-web.mjs && node scripts/bundle-server.mjs",
+    "pretest:soak": "node scripts/build-core.mjs"
   },
   "devDependencies": {
     "@types/node": "~22.10.2",

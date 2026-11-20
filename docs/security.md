@@ -68,13 +68,14 @@ v0.1.0 支持把监听地址改成 `0.0.0.0` 或指定网卡，但**不内置 TL
 
 原 DSH 插件的数据目录（`~/.dsh/ai-debate`）默认**不读、不改、不删**。只有用户在「系统」页主动触发导入，程序才会读取一次并复制到新目录；导入前先统计、再确认，目标台账非空时拒绝覆盖。
 
-## 8.5 后台监控（v0.2.0）
+## 8.5 后台监控（v0.2.0，v0.2.1 扩展）
 
 - 监控只能指向已注册平台的帖子链接：新建时先做 URL 解析，内网地址、`file://`、未知域名一律 400 且不落库。这是 SSRF 的入口围栏。
 - 后台任务接口与会话同级鉴权；本机控制令牌**不**覆盖它，CLI 无法启停监控。
 - 任务日志只记录 post id、会话 id 与错误文本，不记录回复正文以外的私有内容，也不记录凭据。
 - 发表能力没有进入后台接口。候选终态是「待审核」，发布仍需审批页的一次性批准，且批准绑定正文哈希。
-- 审计事件：`monitor.created` / `monitor.updated` / `monitor.removed` / `monitor.toggled` / `automation.paused` / `automation.resumed`。
+- 审计事件：`monitor.created` / `monitor.updated` / `monitor.removed` / `monitor.toggled` / `monitor.scanned` / `automation.paused` / `automation.resumed` / `queue.recovered` / `queue.pruned` / `queue.reaped` / `queue.retried` / `store.corrupt` / `store.restored` / `store.migrated`。
+- **v0.2.1**：补偿扫描与全量重查同样只能对已解析的平台链接发起，走同一个 `probe` 入口；任务台账的清理**永不删除待审核任务**，避免候选失去来源；写入失败会进入降级并停止领取新任务，不会「带着坏台账继续跑」；模型调用在发出前落盘，中断后标记「结果不确定」，重试因此是可审计的。
 
 ## 9. 已知未做（v0.2.0）
 

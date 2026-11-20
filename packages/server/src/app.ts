@@ -33,7 +33,7 @@ import { createAuditor } from './audit.ts'
 import { ensureLayout, layoutOf, tightenPermissions, type Layout } from './paths.ts'
 import { WebServerRegistry } from './registry.ts'
 import { createStandaloneHost } from './standalone-host.ts'
-import { writeJson } from './atomic.ts'
+import { freeBytes, writeJson } from './atomic.ts'
 import { MonitorStore } from './monitor/store.ts'
 import { AutoTaskStore } from './monitor/tasks.ts'
 import { AutomationEngine, monitorViews } from './monitor/engine.ts'
@@ -80,6 +80,54 @@ export interface RunningServer {
 
 const AUTO_BACKUP_INTERVAL_MS = 6 * 60 * 60 * 1000
 const KEEP_AUTO_BACKUPS = 7
+
+/** Size of one file, or zero when it does not exist (or is not readable). */
+function fileSize(file: string): number {
+  try {
+    return statSync(file).size
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Total size of the files directly inside `dir`.
+ *
+ * Deliberately not recursive into subdirectories other than `logs` and `backups`:
+ * the number exists to answer "is my data directory growing without bound", and a
+ * full walk on every status poll would itself be a cost. A failure to read a file
+ * is skipped rather than failing the whole number.
+ */
+function dirSize(dir: string): number {
+  let total = 0
+  const stack = [dir]
+  let guard = 0
+  while (stack.length > 0 && guard < 2000) {
+    const current = stack.pop() as string
+    let entries
+    try {
+      entries = readdirSync(current, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      guard += 1
+      const full = join(current, entry.name)
+      if (entry.isDirectory()) {
+        // `backups` holds rotated copies; including them answers "how much disk
+        // does this service use", which is the question being asked.
+        if (entry.name === 'backups' || entry.name === 'logs' || current === dir) stack.push(full)
+        continue
+      }
+      try {
+        total += statSync(full).size
+      } catch {
+        // A file that vanished between readdir and stat contributes nothing.
+      }
+    }
+  }
+  return total
+}
 
 function sha256OfFile(file: string): string | undefined {
   try {
@@ -150,15 +198,50 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     log,
   })
 
-  const monitors = new MonitorStore({ file: layout.monitorsFile, log })
-  monitors.load()
+  const monitors = new MonitorStore({
+    file: layout.monitorsFile,
+    log,
+    onEvent: (event, detail) => {
+      if (event === 'write_failed') log.error(`监控配置写入失败：${String(detail.reason ?? '')}`)
+      else if (event === 'corrupt') audit.write('store.corrupt', { file: String(detail.file ?? '') })
+      else if (event === 'restored') audit.write('store.restored', { file: String(detail.file ?? '') })
+    },
+  })
+  const monitorLoad = monitors.load()
   if (monitors.loadError !== undefined) log.error(monitors.loadError)
+  if (monitorLoad.migrated) {
+    log.info('监控配置已从 v0.2.0 结构升级；旧字段保留，新字段按默认值补齐')
+    audit.write('store.migrated', { file: 'monitors.json' })
+    // Writing it back once means the next start reads the current shape instead of
+    // re-running the same defaults forever. A failure here is not fatal: the
+    // in-memory document is already usable, and a read-only data directory should
+    // still let the service start and report the problem.
+    try {
+      monitors.save()
+    } catch (error) {
+      log.warn(`监控配置迁移未能写回：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
 
-  const autoTasks = new AutoTaskStore({ file: layout.autoTasksFile, log })
-  const taskLoad = autoTasks.load()
-  const recoveredTasks = autoTasks.recoverInterrupted()
-  if (recoveredTasks > 0) log.warn(`恢复 ${recoveredTasks} 个中断的后台任务`)
-  void taskLoad
+  const autoTasks = new AutoTaskStore({
+    file: layout.autoTasksFile,
+    log,
+    ...(process.env.AI_DEBATE_QUEUE_CAPACITY === undefined
+      ? {}
+      : { capacity: Number(process.env.AI_DEBATE_QUEUE_CAPACITY) }),
+    onEvent: (event, detail) => {
+      if (event === 'write_failed') log.error(`任务台账写入失败：${String(detail.reason ?? '')}`)
+      else if (event === 'corrupt') audit.write('store.corrupt', { file: String(detail.file ?? '') })
+      else if (event === 'restored') audit.write('store.restored', { file: String(detail.file ?? '') })
+      else if (event === 'pruned') audit.write('queue.pruned', detail)
+    },
+  })
+  autoTasks.load()
+  const recovery = autoTasks.recoverInterrupted()
+  if (recovery.recovered > 0) {
+    log.warn(`恢复 ${recovery.recovered} 个中断的后台任务，其中 ${recovery.uncertain} 个模型调用结果不确定`)
+    audit.write('queue.recovered', { recovered: recovery.recovered, uncertain: recovery.uncertain })
+  }
 
   let productApi: DebateProductApi | undefined
   let engine: AutomationEngine | undefined
@@ -318,6 +401,37 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     backups: backups.list(),
   })
 
+  /**
+   * Runtime facts the console shows but the engine does not own.
+   *
+   * Computed on request rather than sampled on a timer: a background sampler would
+   * itself be a thing that can leak, and these are four cheap syscalls.
+   */
+  const health = (): Record<string, unknown> => {
+    const memory = process.memoryUsage()
+    let dataDirBytes: number | undefined
+    try {
+      dataDirBytes = dirSize(layout.dataDir)
+    } catch {
+      dataDirBytes = undefined
+    }
+    return {
+      startedAt,
+      uptimeSec: Math.round(process.uptime()),
+      nodeVersion: process.version,
+      heapUsedBytes: memory.heapUsed,
+      heapTotalBytes: memory.heapTotal,
+      rssBytes: memory.rss,
+      externalBytes: memory.external,
+      dataDir: layout.dataDir,
+      ...(dataDirBytes === undefined ? {} : { dataDirBytes }),
+      ...(freeBytes(layout.dataDir) === undefined ? {} : { freeBytes: freeBytes(layout.dataDir) as number }),
+      monitorsBytes: fileSize(layout.monitorsFile),
+      tasksBytes: fileSize(layout.autoTasksFile),
+      stateBytes: fileSize(join(layout.dataDir, 'state.json')),
+    }
+  }
+
   const shutdown = (reason: string): void => {
     log.info(`收到停止请求：${reason}`)
     audit.write('service.shutdown', { reason })
@@ -351,7 +465,21 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     backups,
     audit,
     automation: {
-      status: (): Record<string, unknown> => ((engine?.status() ?? { paused: true, running: false, concurrency: 1, perPlatform: 1, monitors: { total: 0, enabled: 0, blocked: 0 }, tasks: {}, today: { discovered: 0, candidates: 0, failures: 0 }, queued: 0, runningTasks: 0 }) as unknown as Record<string, unknown>),
+      status: (): Record<string, unknown> => (engine?.status() ?? {
+        paused: true,
+        running: false,
+        concurrency: 1,
+        perPlatform: 1,
+        monitors: { total: 0, enabled: 0, blocked: 0 },
+        tasks: {},
+        today: { discovered: 0, candidates: 0, failures: 0 },
+        queued: 0,
+        runningTasks: 0,
+        heartbeat: { ticks: 0, intervalMs: 0, healthy: false },
+        queue: { capacity: 0, used: 0, byState: {}, oldestPendingAgeSec: 0, longestRunningSec: 0, stuck: 0, backlog: { level: 'ok' } },
+        alerts: [],
+      }) as unknown as Record<string, unknown>,
+      health,
       monitors: () => monitorViews(monitors.list(), autoTasks.all()),
       tasks: (limit: number) => autoTasks.list(limit),
       reviews: () => autoTasks
@@ -379,16 +507,38 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
         autoTasks.enqueue({ kind: 'probe', monitorId: monitor.id, dedupeKey: `probe:${monitor.id}` })
         return monitor
       },
-      updateMonitor: (id: string, patch: { name?: string; intervalSec?: number; enabled?: boolean; accountLabel?: string }) => {
+      updateMonitor: (
+        id: string,
+        patch: { name?: string; intervalSec?: number; enabled?: boolean; accountLabel?: string; compensationHours?: number },
+      ) => {
         if (patch.enabled === true) monitors.clearBlock(id)
         return monitors.update(id, patch)
       },
       removeMonitor: (id: string) => monitors.remove(id),
       checkNow: (id: string) => engine?.checkNow(id) ?? { ok: false, message: '后台引擎未启动。' },
+      scanNow: (id: string, mode: 'compensate' | 'full') =>
+        engine?.scanNow(id, mode) ?? { ok: false, message: '后台引擎未启动。' },
       pauseAll: () => engine?.pause(),
       resumeAll: () => engine?.resume(),
       cancelTask: (id: string) => autoTasks.cancel(id),
-      loadErrors: () => [monitors.loadError, autoTasks.loadError].filter((entry): entry is string => entry !== undefined),
+      retryTask: (id: string) => autoTasks.retry(id),
+      /** Housekeeping the console can trigger: history trim and stuck reaping. */
+      maintenance: (action: 'prune' | 'reap') => {
+        if (action === 'prune') {
+          const outcome = autoTasks.prune()
+          audit.write('queue.pruned', { removed: outcome.removed, keptForReview: outcome.keptForReview, by: 'operator' })
+          return { ok: true, ...outcome }
+        }
+        const reaped = autoTasks.reapStuck()
+        if (reaped.length > 0) audit.write('queue.reaped', { count: reaped.length })
+        return { ok: true, reaped: reaped.length }
+      },
+      loadErrors: () => [
+        ...(monitors.loadError === undefined ? [] : [monitors.loadError]),
+        ...(autoTasks.loadError === undefined ? [] : [autoTasks.loadError]),
+        ...(monitors.saveError === undefined ? [] : [monitors.saveError]),
+        ...(autoTasks.saveError === undefined ? [] : [autoTasks.saveError]),
+      ],
     },
     actions: {
       shutdown,
@@ -436,6 +586,12 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     log,
     ...(options.monitorConcurrency === undefined ? {} : { concurrency: options.monitorConcurrency }),
     ...(options.monitorTickMs === undefined ? {} : { tickMs: options.monitorTickMs }),
+    ...(process.env.AI_DEBATE_TASK_TIMEOUT_MS === undefined
+      ? {}
+      : { taskTimeoutMs: Number(process.env.AI_DEBATE_TASK_TIMEOUT_MS) }),
+    ...(process.env.AI_DEBATE_COMPENSATION_MS === undefined
+      ? {}
+      : { compensationEveryMs: Number(process.env.AI_DEBATE_COMPENSATION_MS) }),
   })
   if (mounted) {
     engine.start()
@@ -585,7 +741,11 @@ export function setAutostart(enable: boolean): { ok: boolean; message: string } 
     const result = spawnSync('reg', ['delete', key, '/v', 'AIDebate', '/f'], { stdio: 'ignore' })
     return { ok: true, message: result.status === 0 ? '已关闭开机自启。' : '开机自启本来就是关闭的。' }
   }
-  const result = spawnSync('reg', ['add', key, '/v', 'AIDebate', '/t', 'REG_SZ', '/d', `"${exe}"`, '/f'], { stdio: 'ignore' })
+  // `--no-browser`: an autostart entry that opens a tab at every login is the kind
+  // of "feature" people disable and then distrust. The service starts, hidden.
+  const result = spawnSync('reg', ['add', key, '/v', 'AIDebate', '/t', 'REG_SZ', '/d', `"${exe}" --no-browser`, '/f'], {
+    stdio: 'ignore',
+  })
   return result.status === 0
     ? { ok: true, message: '已开启开机自启（仅当前用户）。' }
     : { ok: false, message: '写入注册表失败，可能被安全软件拦截。' }

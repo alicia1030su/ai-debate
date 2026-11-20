@@ -790,12 +790,33 @@ async function persistAnalysis(
     const merged = mergeTriggerRecords(rows)
 
     // Reuse a live session if any row still points at one.
+    //
+    // ## The read context is refreshed, the candidates are not
+    //
+    // A monitoring session lives for as long as its trigger does, which on a busy
+    // thread means days. If the stored comment list were frozen at the first read,
+    // every reply discovered afterwards would be unanswerable: `runGeneration`
+    // validates the target against `session.comments`, and an id that is not in that
+    // list is refused as "not read". The context fields are therefore replaced with
+    // this read's, while the candidates, the personae and the ledger row stay
+    // exactly as they were — a candidate is keyed by its own target id and a refresh
+    // cannot make it point somewhere else.
     for (const row of rows) {
-      const live = data.sessions.find((session) => session.id === row.sessionId)
-      if (live) {
-        outcome = { session: live, reused: true, historical: false }
-        return data
+      const index = data.sessions.findIndex((session) => session.id === row.sessionId)
+      if (index < 0) continue
+      const live = data.sessions[index] as StoredSession
+      const refreshed: StoredSession = {
+        ...live,
+        threadUrl: fields.threadUrl,
+        threadTitle: fields.threadTitle,
+        comments: fields.comments,
+        readQuality: fields.readQuality,
+        updatedAt: now,
       }
+      const sessions = [...data.sessions]
+      sessions[index] = refreshed
+      outcome = { session: refreshed, reused: true, historical: false }
+      return { ...data, sessions }
     }
 
     // The rows survive but their sessions are gone (TTL prune, or a store that

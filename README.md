@@ -29,8 +29,10 @@ certutil -hashfile AI-Debate-windows-x64.exe SHA256   # Windows
 3. 结果进入「待审核」，你在审批页确认后才手动发表。**后台不会自发任何内容。**
 
 - 首次检查只建立基线，不分析历史楼层。
-- 中断的任务重启后自动恢复；限流按平台要求等待；认证失效会暂停该目标并写明原因。
-- 详见 `docs/automation-architecture.md`。
+- **旧回复被改写或删除**：默认每 6 小时回看最近 24 小时（可配 1–168 小时），按内容指纹识别；监控行上另有「补偿扫描」「全量重查」按钮。
+- 中断的任务重启后自动恢复；模型调用是否可能重复会被单独标记，不会静默重放；限流按平台要求等待；认证失效会暂停该目标并写明原因。
+- 「自动挂机」页有运行状态区：调度心跳、队列占用、最久等待、内存、数据目录占用、最近一次崩溃恢复。
+- 详见 `docs/automation-architecture.md` 与 `docs/reliability-v0.2.1.md`。
 
 See `docs/install-windows.md`, `docs/install-linux.md`, `docs/security.md`, `docs/migration.md`,
 `docs/architecture.md`.
@@ -47,8 +49,10 @@ integration with a standalone runtime and web console.
 ```bash
 npm install
 npm run build          # core typecheck/build + web bundle
-npm test               # standalone and migrated core tests
+npm test               # every suite: core, server, web, HTTP, monitoring, recovery, paging, upgrade
 npm start              # run the server from source on 127.0.0.1:17860
+npm run test:soak      # drive the pipeline for two minutes and bound the growth
+node scripts/check-platform.mjs --url <thread>   # one read-only real-platform probe
 ```
 
 Packaging:

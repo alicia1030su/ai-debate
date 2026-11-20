@@ -79,6 +79,11 @@ AI_DEBATE_HOME=/var/lib/ai-debate
 AI_DEBATE_LOG_LEVEL=info
 # 远程/反代时列出浏览器实际访问的域名或 IP，逗号分隔；不填就只信任回环
 AI_DEBATE_TRUSTED_HOSTS=debate.example.com
+# 后台挂机调参（都有保守默认值，通常不必改）
+AI_DEBATE_QUEUE_CAPACITY=1500      # 任务台账上限
+AI_DEBATE_TASK_TIMEOUT_MS=600000   # 单个任务超过这个时间判定为卡死
+AI_DEBATE_COMPENSATION_MS=21600000 # 每个目标两次补偿扫描之间的间隔（6 小时）
+AI_DEBATE_JOB_CONCURRENCY=1        # 维护任务并发，不建议调大
 ```
 
 改完 `sudo systemctl restart ai-debate`。
@@ -112,6 +117,10 @@ sudo ./uninstall.sh --purge    # 连同数据与配置一起删除
 **访问 502/连接被拒绝**：`systemctl status ai-debate`；看 `journalctl -u ai-debate -n 100`。
 
 **端口被占用**：改 env 里的 `AI_DEBATE_PORT` 后重启。
+
+**日志**：`journalctl -u ai-debate` 或 `/var/lib/ai-debate/logs/`。安装包会写入 `/etc/logrotate.d/ai-debate`（每周、保留 4 份、`copytruncate`），程序自己也会按 2 MB 轮转一次。
+
+**磁盘**：`install.sh` 在安装前检查目标分区是否有 200 MB 余量，不足会直接中止且不写任何文件。运行期的余量显示在「自动挂机」页的运行状态区。
 
 **SELinux/AppArmor 拦截**：unit 已限制可写路径为数据目录与配置目录；如自定义了数据目录，同步修改 unit 的 `ReadWritePaths`。
 

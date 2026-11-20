@@ -203,6 +203,20 @@ function callControl(
   })
 }
 
+/**
+ * Whether this invocation may open a browser.
+ *
+ * The launcher normally does, because double-clicking an EXE that silently starts
+ * a server looks like nothing happened. Two cases must not: an autostart entry
+ * (opening a tab at every login is hostile) and a headless test run. Both pass
+ * `--no-browser`, which is also honoured through the environment so a shortcut
+ * can be configured without a wrapper script.
+ */
+function browserAllowed(flags: Record<string, string | true>): boolean {
+  if (flags['no-browser'] === true) return false
+  return process.env.AI_DEBATE_NO_BROWSER !== '1'
+}
+
 function openBrowser(url: string): void {
   const command = process.platform === 'win32' ? 'cmd' : process.platform === 'darwin' ? 'open' : 'xdg-open'
   const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url]
@@ -375,17 +389,22 @@ export async function runCli(argv: readonly string[]): Promise<void> {
   }
 
   // No command: the double-click path.
-  await launch({ dataDir, portFlag, hostFlag })
+  await launch({ dataDir, portFlag, hostFlag, openBrowser: browserAllowed(parsed.flags) })
 }
 
-async function launch(options: { dataDir: string; portFlag: number; hostFlag: string | undefined }): Promise<void> {
+async function launch(options: {
+  dataDir: string
+  portFlag: number
+  hostFlag: string | undefined
+  openBrowser: boolean
+}): Promise<void> {
   const run = readRunFile(options.dataDir)
   const port = options.portFlag > 0 ? options.portFlag : (run?.port ?? DEFAULT_PORT)
   const host = options.hostFlag ?? run?.host ?? DEFAULT_HOST
   const probe = await health(host, port)
   if (probe.ok) {
     process.stdout.write(`AI Debate 已在运行：http://${host}:${port}/\n`)
-    openBrowser(`http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}/`)
+    if (options.openBrowser) openBrowser(`http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}/`)
     return
   }
 
@@ -413,7 +432,7 @@ async function launch(options: { dataDir: string; portFlag: number; hostFlag: st
     const check = await health(host, port, 800)
     if (check.ok) {
       process.stdout.write(`已启动：http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}/\n`)
-      openBrowser(`http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}/`)
+      if (options.openBrowser) openBrowser(`http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}/`)
       return
     }
   }

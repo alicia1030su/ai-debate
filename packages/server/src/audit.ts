@@ -34,6 +34,14 @@ export type AuditEvent =
   | 'monitor.toggled'
   | 'automation.paused'
   | 'automation.resumed'
+  | 'monitor.scanned'
+  | 'queue.recovered'
+  | 'queue.pruned'
+  | 'queue.reaped'
+  | 'queue.retried'
+  | 'store.corrupt'
+  | 'store.restored'
+  | 'store.migrated'
 
 export interface Auditor {
   write(event: AuditEvent, detail?: Record<string, unknown>): void

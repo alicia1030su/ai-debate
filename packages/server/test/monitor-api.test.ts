@@ -186,6 +186,61 @@ test('监控接口：未登录一律 401，登录后可管理，非法链接被�
       assert.equal(response.status, 404, `${path} 不应存在：后台不允许发表`)
     }
 
+    // 9b. The status payload carries the status centre, not just the counters.
+    const statusResponse = await fetch(`${base}/api/ai-debate/automation/status`, { headers: { cookie } })
+    const statusBody = (await statusResponse.json()) as {
+      health?: { heapUsedBytes?: number; dataDir?: string; freeBytes?: number }
+      heartbeat?: { ticks?: number; intervalMs?: number }
+      queue?: { capacity?: number; used?: number }
+      alerts?: unknown[]
+    }
+    assert.ok(typeof statusBody.health?.heapUsedBytes === 'number' && statusBody.health.heapUsedBytes > 0, '状态中心应带真实内存用量')
+    assert.ok(typeof statusBody.health?.dataDir === 'string' && statusBody.health.dataDir !== '')
+    assert.ok(typeof statusBody.heartbeat?.intervalMs === 'number' && statusBody.heartbeat.intervalMs > 0)
+    assert.ok(typeof statusBody.queue?.capacity === 'number' && statusBody.queue.capacity > 0)
+    assert.ok(Array.isArray(statusBody.alerts))
+
+    // 9c. A compensating scan can be requested by hand, and is recorded.
+    const scan = await fetch(`${base}/api/ai-debate/automation/monitors/${monitorId}/scan`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base, cookie },
+      body: JSON.stringify({ mode: 'compensate' }),
+    })
+    assert.equal(scan.status, 200, '补偿扫描应被接受')
+    const fullScan = await fetch(`${base}/api/ai-debate/automation/monitors/${monitorId}/scan`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base, cookie },
+      body: JSON.stringify({ mode: 'full' }),
+    })
+    assert.equal(fullScan.status, 200, '全量重查应被接受')
+
+    // 9d. Queue maintenance is an operator action with real output.
+    const prune = await fetch(`${base}/api/ai-debate/automation/maintenance`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base, cookie },
+      body: JSON.stringify({ action: 'prune' }),
+    })
+    const pruneBody = (await prune.json()) as { ok?: boolean; removed?: number; keptForReview?: number }
+    assert.equal(prune.status, 200)
+    assert.equal(pruneBody.ok, true)
+    assert.equal(typeof pruneBody.removed, 'number')
+
+    const reap = await fetch(`${base}/api/ai-debate/automation/maintenance`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base, cookie },
+      body: JSON.stringify({ action: 'reap' }),
+    })
+    assert.equal(reap.status, 200)
+
+    // 9e. A retry on a task that is not finished is refused with 409, not silently
+    //     accepted: "the button did nothing" is worse than a clear refusal.
+    const rejected = await fetch(`${base}/api/ai-debate/automation/tasks/does-not-exist/retry`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base, cookie },
+      body: JSON.stringify({}),
+    })
+    assert.equal(rejected.status, 409)
+
     // 10. Delete.
     const removed = await fetch(`${base}/api/ai-debate/automation/monitors/${monitorId}`, {
       method: 'DELETE',

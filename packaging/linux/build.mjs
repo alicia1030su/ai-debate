@@ -52,6 +52,7 @@ mkdirSync(stage, { recursive: true })
 mkdirSync(work, { recursive: true })
 mkdirSync(join(stage, 'bin'), { recursive: true })
 mkdirSync(join(stage, 'systemd'), { recursive: true })
+mkdirSync(join(stage, 'logrotate'), { recursive: true })
 
 run('构建 core', 'node', [join('scripts', 'build-core.mjs')])
 run('构建 Web 控制台', 'node', [join('scripts', 'build-web.mjs')])
@@ -90,6 +91,7 @@ for (const file of ['install.sh', 'uninstall.sh']) {
   spawnSync('chmod', ['+x', join(stage, file)])
 }
 copyFileSync(join(root, 'packaging', 'linux', 'ai-debate.service'), join(stage, 'systemd', 'ai-debate.service'))
+copyFileSync(join(root, 'packaging', 'linux', 'ai-debate.logrotate'), join(stage, 'logrotate', 'ai-debate'))
 copyFileSync(join(root, 'README.md'), join(stage, 'README.md'))
 copyFileSync(join(root, 'LICENSE'), join(stage, 'LICENSE'))
 copyFileSync(join(root, 'NOTICE'), join(stage, 'NOTICE'))

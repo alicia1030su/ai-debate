@@ -7,7 +7,8 @@
  * that only a real secret has.
  */
 import { execFileSync } from 'node:child_process'
-import { readFileSync, statSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 
 const RULES = [
   { name: 'Tieba cookie', re: /(?:^|[^A-Za-z0-9])BDUSS(?:_BF)?=[A-Za-z0-9%._-]{16,}/ },
@@ -26,25 +27,52 @@ const ALLOW = new Set([
   'test/acceptance/fixtures/README.md',
 ])
 
-const files = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8' })
-  .split('\0')
-  .filter(Boolean)
-  .filter((file) => !ALLOW.has(file))
+/**
+ * Two modes:
+ *
+ *   - no argument: scan the tracked files, which is what CI runs on every push.
+ *   - one directory: scan that tree, which is how a *built archive* is checked
+ *     before it is published. Tracked files can be clean while an artefact carries
+ *     something that was never committed.
+ */
+const rootArg = process.argv[2]
+
+/** Every regular file under `dir`, relative to `dir`, following no symlinks. */
+function walk(dir, prefix = '', out = [], depth = 0) {
+  if (depth > 8 || out.length > 5000) return out
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) continue
+    const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`
+    if (entry.isDirectory()) walk(join(dir, entry.name), rel, out, depth + 1)
+    else if (entry.isFile()) out.push(rel)
+  }
+  return out
+}
+
+const files =
+  typeof rootArg === 'string' && rootArg !== ''
+    ? walk(rootArg)
+    : execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8' })
+        .split('\0')
+        .filter(Boolean)
+        .filter((file) => !ALLOW.has(file))
+const base = typeof rootArg === 'string' && rootArg !== '' ? rootArg : ''
 
 const MAX_BYTES = 4 * 1024 * 1024
 const findings = []
 
 for (const file of files) {
+  const full = base === '' ? file : join(base, file)
   let size
   try {
-    size = statSync(file).size
+    size = statSync(full).size
   } catch {
     continue
   }
   if (size > MAX_BYTES) continue
   let text
   try {
-    text = readFileSync(file, 'utf8')
+    text = readFileSync(full, 'utf8')
   } catch {
     continue
   }
@@ -66,4 +94,8 @@ if (findings.length > 0) {
   process.exit(1)
 }
 
-process.stdout.write(`✔ 凭据扫描通过（${files.length} 个受版本控制的文件）\n`)
+process.stdout.write(
+  base === ''
+    ? `✔ 凭据扫描通过（${files.length} 个受版本控制的文件）\n`
+    : `✔ 凭据扫描通过（${files.length} 个文件，目录 ${base}）\n`,
+)

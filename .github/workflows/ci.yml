@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-22.04, ubuntu-24.04, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -63,9 +63,67 @@ jobs:
       - name: Crash recovery acceptance
         shell: bash
         run: node --experimental-transform-types test/acceptance/recovery.ts
+      - name: Paging and cursor acceptance
+        shell: bash
+        run: node --experimental-transform-types test/acceptance/paging.ts
+      - name: Upgrade from a v0.2.0 data directory
+        shell: bash
+        run: node --experimental-transform-types test/acceptance/upgrade.ts
       - name: No DSH dependency
         shell: bash
         run: node scripts/assert-no-dsh.mjs
+
+  # Downloading the previous release is the only way to prove the upgrade path with
+  # bytes yesterday's build actually wrote. The `test` job's upgrade run uses a
+  # byte-faithful fixture; this one uses the real binary.
+  upgrade-real:
+    name: Upgrade from the real v0.2.0 binary
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build && npm run bundle
+      - name: Download v0.2.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download v0.2.0 --repo "${{ github.repository }}" \
+            --pattern 'ai-debate-linux-x64.tgz' --dir /tmp/v020 --clobber
+          mkdir -p /tmp/v020/pkg
+          tar -xzf /tmp/v020/ai-debate-linux-x64.tgz -C /tmp/v020/pkg
+          find /tmp/v020/pkg -name ai-debate -type f -exec chmod +x {} \;
+          echo "V020_BIN=$(find /tmp/v020/pkg -name ai-debate -type f | head -1)" >> "$GITHUB_ENV"
+      - name: Run the upgrade against the 0.2.0 binary
+        run: |
+          set -euo pipefail
+          AI_DEBATE_V020_BIN="$V020_BIN" node --experimental-transform-types test/acceptance/upgrade.ts
+      - name: Upload the upgrade report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-failure
+          path: /tmp/ai-debate-upgrade-*/**
+
+  soak:
+    name: Soak (short, CI)
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Run the pipeline for five minutes and bound the growth
+        run: node --experimental-transform-types test/stress/soak.ts --seconds=300 --interval-ms=40
 
   package-windows:
     name: Package Windows executable
@@ -90,6 +148,11 @@ jobs:
         env:
           AI_DEBATE_BIN: dist/AI-Debate-windows-x64.exe
         run: node --experimental-transform-types test/acceptance/standalone.ts
+      - name: Run the launcher acceptance against the packaged executable
+        shell: bash
+        env:
+          AI_DEBATE_BIN: dist/AI-Debate-windows-x64.exe
+        run: node --experimental-transform-types --test test/acceptance/windows-launcher.ts
       - uses: actions/upload-artifact@v4
         with:
           name: windows-exe
@@ -100,9 +163,13 @@ jobs:
           if-no-files-found: error
 
   package-linux:
-    name: Package Linux archive
-    runs-on: ubuntu-22.04
+    name: Package and install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -115,7 +182,8 @@ jobs:
         run: |
           set -euo pipefail
           tmp=$(mktemp -d)
-          sed "s|@PREFIX@|/opt/ai-debate|g; s|@DATA_DIR@|/var/lib/ai-debate|g; s|@CONF_DIR@|/etc/ai-debate|g; s|@APP_USER@|ai-debate|g"             packaging/linux/ai-debate.service > "$tmp/ai-debate.service"
+          sed "s|@PREFIX@|/opt/ai-debate|g; s|@DATA_DIR@|/var/lib/ai-debate|g; s|@CONF_DIR@|/etc/ai-debate|g; s|@APP_USER@|ai-debate|g" \
+            packaging/linux/ai-debate.service > "$tmp/ai-debate.service"
           systemd-analyze verify "$tmp/ai-debate.service" || true
           grep -q "Restart=always" "$tmp/ai-debate.service"
           grep -q "ExecStart=/opt/ai-debate/bin/ai-debate serve" "$tmp/ai-debate.service"
@@ -142,12 +210,50 @@ jobs:
         if: always()
         run: |
           sudo systemctl disable --now ai-debate 2>/dev/null || true
-          sudo rm -f /etc/systemd/system/ai-debate.service
+          sudo rm -f /etc/systemd/system/ai-debate.service /etc/logrotate.d/ai-debate
           sudo systemctl daemon-reload || true
-      - uses: actions/upload-artifact@v4
+      - if: matrix.os == 'ubuntu-22.04'
+        uses: actions/upload-artifact@v4
         with:
           name: linux-tgz
           path: |
             dist/ai-debate-linux-x64.tgz
             dist/ai-debate-linux-x64.tgz.sha256
           if-no-files-found: error
+
+  # Debian 12 has no hosted runner. This job proves the archive installs and the
+  # binary runs on Debian 12's glibc, and explicitly does *not* claim systemd
+  # lifecycle coverage there: a container has no init. The job prints that limit so
+  # a green tick cannot be mistaken for a systemd verification.
+  debian12:
+    name: Debian 12 binary compatibility (no systemd)
+    runs-on: ubuntu-22.04
+    needs: package-linux
+    container: debian:12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install prerequisites
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq curl ca-certificates tar >/dev/null
+      - name: Download the archive built by this run
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-tgz
+          path: /tmp/ai-debate
+      - name: Install without systemd and run the service
+        run: |
+          set -euo pipefail
+          echo "::notice::Debian 12 容器没有 init，本作业只验证安装与程序兼容性，不验证 systemd 生命周期"
+          tar -xzf /tmp/ai-debate/ai-debate-linux-x64.tgz -C /tmp
+          cd /tmp/ai-debate-linux-x64
+          ./install.sh --host 127.0.0.1 --port 17871 --no-start
+          /opt/ai-debate/bin/ai-debate --version
+          AI_DEBATE_HOME=/var/lib/ai-debate /opt/ai-debate/bin/ai-debate serve --port 17871 &
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:17871/healthz >/dev/null 2>&1; then break; fi
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:17871/healthz
+          curl -fsS -o /dev/null -w 'index:%{http_code}\n' http://127.0.0.1:17871/
+          curl -fsS -o /dev/null -w 'auth:%{http_code}\n' http://127.0.0.1:17871/api/ai-debate/auth/state

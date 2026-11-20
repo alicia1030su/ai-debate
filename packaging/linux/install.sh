@@ -69,6 +69,15 @@ else
   HAS_SYSTEMD=1
 fi
 
+echo "== 检查磁盘空间 =="
+# 200 MB covers the binary (~90 MB) plus a season of logs and the first backups.
+AVAIL_KB=$(df -Pk "${PREFIX%/*}" 2>/dev/null | awk 'NR==2 {print $4}')
+if [[ -n "${AVAIL_KB}" ]] && [[ "${AVAIL_KB}" -lt 204800 ]]; then
+  echo "磁盘剩余不足 200 MB（${AVAIL_KB} KB），安装已中止，未写入任何文件。" >&2
+  exit 1
+fi
+echo "磁盘空间充足（${AVAIL_KB:-未知} KB 可用）"
+
 echo "== 检查安装包 =="
 if [[ -f "${SCRIPT_DIR}/SHA256SUMS" ]]; then
   ( cd "${SCRIPT_DIR}" && sha256sum -c SHA256SUMS --quiet ) || {
@@ -106,6 +115,11 @@ AI_DEBATE_LOG_LEVEL=info
 EOF
   chmod 0640 "${CONF_DIR}/ai-debate.env"
   chown "${APP_USER}:${APP_USER}" "${CONF_DIR}/ai-debate.env"
+fi
+
+if command -v logrotate >/dev/null 2>&1 && [[ -d /etc/logrotate.d ]]; then
+  echo "== 安装日志轮转配置 =="
+  install -m 0644 "${SCRIPT_DIR}/logrotate/ai-debate" /etc/logrotate.d/ai-debate
 fi
 
 if [[ "${HAS_SYSTEMD}" -eq 1 ]]; then
