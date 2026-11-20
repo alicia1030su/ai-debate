@@ -496,9 +496,12 @@ async function main(): Promise<void> {
       })
       check('升级后管理员账号仍可登录', again.status === 200, `status=${again.status}`)
       const monitorsAgain = await call('/api/ai-debate/automation/monitors')
-      const listAgain = (monitorsAgain.body?.monitors ?? []) as { id: string }[]
-      check('重启后监控目标仍在', listAgain.some((monitor) => monitor.id === 'legacy-monitor-1'))
-      check('重启后新增的监控也在', listAgain.length >= 2, `count=${listAgain.length}`)
+      const listAgain = (monitorsAgain.body?.monitors ?? []) as { id: string; name: string }[]
+      // Matched by name: the real v0.2.0 binary assigns a UUID, and the question the
+      // operator cares about is "is the target I configured still there", not "did
+      // the id stay the same".
+      check('重启后监控目标仍在', listAgain.some((monitor) => monitor.name === '旧版监控目标'))
+      check('重启后新增的监控也在', listAgain.some((monitor) => monitor.name === '升级后新增'), `count=${listAgain.length}`)
     }
 
     // --- a failed upgrade must be recoverable: corrupt the task ledger, start, and
