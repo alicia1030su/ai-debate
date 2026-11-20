@@ -86,7 +86,7 @@ const postject = join(root, 'node_modules', 'postject', 'dist', 'cli.js')
 run('注入 SEA 准备块', process.execPath, [postject, binary, 'NODE_SEA_BLOB', join(work, 'ai-debate.blob'), '--sentinel-fuse', FUSE])
 spawnSync('chmod', ['+x', binary])
 
-for (const file of ['install.sh', 'uninstall.sh']) {
+for (const file of ['install.sh', 'uninstall.sh', 'common.sh']) {
   copyFileSync(join(root, 'packaging', 'linux', file), join(stage, file))
   spawnSync('chmod', ['+x', join(stage, file)])
 }

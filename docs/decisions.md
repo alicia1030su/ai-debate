@@ -158,7 +158,7 @@
 - ref 白名单：只接受 `AI_DEBATE_*` 且 `[A-Z0-9_]`；未知 ref **抛错**（防止核心将来加字段时写错命名空间，静默写进影子存储）。
 - `describe()` 只回答 `configured/source/writable`，**不回长度、不回尾 4 位**。上游那套 `length/tail` 的 DTO 在核心仍在，但本产品不提供额外信息 → 页面不可能显示「已配置 · 长度 0」这类谎言。
 - `set/unset` 成功后 `onChange(ref)` → `app.ts` → `host.emitCredentialUpdate(ref)` → 核心 `refreshSecrets()` → 重建平台适配器（cookie jar 必须立刻换掉）。
-- 备份**永不**包含 `credentials.*`、`admin.json`、`sessions.json`。
+- v0.2.2 起备份包含 `credentials.json` 密文，但**永不**包含 `credentials.key`、`admin.json`、`sessions.json`；跨机无原密钥时跳过凭据并要求重填。
 
 **Consequences**
 
@@ -311,9 +311,9 @@
 
 ---
 
-## ADR-010 备份 = 目录 + manifest（sha256），内容含数据不含身份
+## ADR-010 备份 = 目录 + manifest（sha256），含凭据密文但不含密钥与身份
 
-**Status**：Accepted（已落地；与最初「单个 JSON」不同）
+**Status**：Accepted（v0.2.2 更新：备份改为包含凭据密文，仍不含密钥与身份文件）
 
 **Context**
 
@@ -321,16 +321,16 @@
 
 **Decision**
 
-- 备份是 **`backups/<YYYY-MM-DDTHH-mm-ss>/` 目录**，含 `config.json`、`state.json`、`jobs.json`（存在才复制）+ `manifest.json`（每文件 `sha256` + `bytes` + 一句「不含凭据、口令与会话」）。
-- **不含** `credentials.*`、`admin.json`、`sessions.json`、`run/*`。
-- 恢复：先校验 manifest 里每个文件的 sha256（不匹配 → 拒绝），再把当前三份文件复制到 `backups/pre-restore-<ts>/`，然后覆盖；恢复后**要求重启**（台账在内存里有缓存）。
+- 备份是 **`backups/<YYYY-MM-DDTHH-mm-ss>/` 目录**，含 `config.json`、`state.json`、`jobs.json`、`monitors.json`、`auto-tasks.json`、`reply-identities.json`、`credentials.json`（存在才复制）+ `manifest.json`（每文件 `sha256` + `bytes` + 「不含密钥、口令与会话」）。
+- **不含** `credentials.key`、`admin.json`、`sessions.json`、`run/*`、`logs/*`。manifest 只记录密钥指纹用于判断能否解密，不记录密钥本身。
+- 恢复：先校验 manifest 里每个文件的 sha256（不匹配 → 拒绝），再把当前文件复制到 `backups/pre-restore-<ts>/`，然后覆盖；目标机器无密钥时跳过 `credentials.json` 并要求重填，已有密钥指纹不匹配时拒绝整个恢复。恢复后**要求重启**（台账在内存里有缓存）。
 - 自动备份：6h 一次 + 启动 30s 后首次（有 `state.json` 才跑）；保留最近 7 份自动备份。
 - `backup.restore` 崩溃 → 置 `failed`，不重跑（ADR-007 第 4 条）。
 
 **Consequences**
 
-- 备份可以被用户自由分享/上传而不泄漏凭据；逐文件可校验、可人工打开检查。
-- 负面：迁移多两步（重录凭据 + 重新登录）。这是用户会感谢的取舍。
+- 备份含凭据密文，可逐文件校验、可人工打开检查，但必须按敏感数据保管，不能公开分享；仅泄露备份而没有原密钥时无法直接解密。
+- 负面：跨机迁移仍需重填凭据并重新初始化管理员；若备份与原密钥同时泄漏，凭据也会泄漏。
 - 负面：备份是目录不是单文件，传输时需打包（文档写明可直接 `cp -r`）。
 
 **Alternatives**：单 JSON（不可逐文件校验、部分损坏无法定位）、备份含密钥（一个上传到论坛的「配置备份」就泄漏 Cookie）、备份加密（要用户选口令/记口令/unseal 流程，对单用户本地产品过重）。

@@ -177,16 +177,32 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
       - run: npm ci
+      - name: Check Linux deployment path policy without root
+        run: bash test/acceptance/linux-path-policy.sh
       - run: npm run package:linux
-      - name: Verify the systemd unit renders and parses
+      - name: Check the systemd unit rendering and restart policy
         run: |
           set -euo pipefail
           tmp=$(mktemp -d)
           sed "s|@PREFIX@|/opt/ai-debate|g; s|@DATA_DIR@|/var/lib/ai-debate|g; s|@CONF_DIR@|/etc/ai-debate|g; s|@APP_USER@|ai-debate|g" \
             packaging/linux/ai-debate.service > "$tmp/ai-debate.service"
-          systemd-analyze verify "$tmp/ai-debate.service" || true
-          grep -q "Restart=always" "$tmp/ai-debate.service"
-          grep -q "ExecStart=/opt/ai-debate/bin/ai-debate serve" "$tmp/ai-debate.service"
+          grep -q '^Restart=on-failure$' "$tmp/ai-debate.service"
+          grep -q '^SuccessExitStatus=75$' "$tmp/ai-debate.service"
+          grep -q '^RestartForceExitStatus=75$' "$tmp/ai-debate.service"
+          grep -q '^ReadWritePaths=/var/lib/ai-debate$' "$tmp/ai-debate.service"
+          grep -q '^ProtectSystem=strict$' "$tmp/ai-debate.service"
+          grep -q '^ExecStart=/opt/ai-debate/bin/ai-debate serve$' "$tmp/ai-debate.service"
+          if grep -q '@[A-Z_]*@' "$tmp/ai-debate.service"; then
+            echo "unit 仍有未渲染占位符" >&2
+            exit 1
+          fi
+          # A verifier failure must fail the job. The valid rendered unit is
+          # verified by linux-install.sh after the real binary/user exist.
+          printf '\nThisDirectiveDoesNotExist=yes\n' >> "$tmp/ai-debate.service"
+          if systemd-analyze verify "$tmp/ai-debate.service"; then
+            echo "systemd-analyze 错误地接受了非法 unit" >&2
+            exit 1
+          fi
       - name: Prove this runner has a working systemd
         run: |
           set -euo pipefail

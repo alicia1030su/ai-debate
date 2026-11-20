@@ -178,7 +178,7 @@ packaging/windows/build.mjs     # 收集 dist/web（含生成的 manifest.json�
 packaging/linux/build.mjs       # 依赖 dist/ai-debate.cjs + dist/web → stage dir → tar.gz → .sha256
 packaging/linux/install.sh      # /opt/ai-debate/bin + /var/lib/ai-debate + /etc/ai-debate + systemd；--purge 才删数据
 packaging/linux/uninstall.sh    # 默认保留数据
-packaging/linux/ai-debate.service # ProtectSystem=strict / ProtectHome / ReadWritePaths / Restart=always / NoNewPrivileges
+packaging/linux/ai-debate.service # ProtectSystem=strict / ProtectHome / ReadWritePaths / Restart=on-failure / SuccessExitStatus=75 / RestartForceExitStatus=75 / NoNewPrivileges
 
 scripts/build-core.mjs          # tsc → packages/core/lib（rm -rf 后全量，不用 incremental）
 scripts/build-web.mjs           # 切片 + 7 条改写 + esbuild + 复制 theme
@@ -637,13 +637,13 @@ startServer(options)
 ├─ egress.jsonl                核心出网审计
 ├─ logs/server.log (+ .1)      轮转；redact 后写入
 ├─ logs/audit.jsonl            安全动作审计（预留，见 §13 G6）
-├─ backups/<YYYY-MM-DDTHH-mm-ss>/   每个备份一个目录：config/state/jobs + manifest.json（sha256 + 「不含凭据、口令与会话」）
+├─ backups/<YYYY-MM-DDTHH-mm-ss>/   每个备份一个目录：config/state/jobs/monitors/auto-tasks/reply-identities/credentials.json + manifest.json（sha256 + 「不含密钥、口令与会话」）
 ├─ run/server.json / server.pid / control.json
 ```
 
 要点：
 
-- **备份是目录 + manifest**，不是单个 tar：可以逐文件校验 sha256，可以人工打开检查。备份**不含** `credentials.*`、`admin.json`、`sessions.json`。
+- **备份是目录 + manifest**，不是单个 tar：可以逐文件校验 sha256，也可以人工打开检查。v0.2.2 起备份包含 `credentials.json` 密文，但不含 `credentials.key`、`admin.json`、`sessions.json`；跨机无原密钥时跳过凭据并要求重填。备份仍须按敏感数据保管。
 - **恢复先备份自己**：`pre-restore-<ts>/` 目录保留恢复前的三份文件；`backup.restore` 崩溃会被置 `failed`（不重跑），并要求重启以重新加载台账。
 - **旧数据（`~/.dsh/ai-debate`）只探测、不自动读取**：`app.ts` 的 `legacy.scan()` 只统计「有没有 / 在哪 / 多少会话与台账」，`/system/status` 的 `legacy` 字段带 `note` 文案。导入必须由用户显式触发（`/system/action` 的 `legacy-import`），且**仅当新台账为空**时才复制，复制前后各留一份（`.pre-import-<ts>` 与原文不动）。凭据**不导入**。
 
@@ -744,7 +744,7 @@ stateDiagram-v2
 | T1 | 首启被本机他进程抢占 | 抢先 POST `/auth/setup` | 三个条件**同时**成立：① 未初始化；② 来源是 loopback **或** 持有启动日志里打印的一次性 token（`setupAllowed(remoteAddress, token)`，10 分钟有效、用后即废）；③ 同源（`Origin` 与 `Host` 一致）+ `content-type: application/json`。**不要求自定义头**（页面本来不发，强制会让初始化直接不可用）。初始化成功后接口关闭（409）。 | 同用户下的恶意进程本就能读 `admin.json`；声明在 `security.md` |
 | T2 | CSRF | 恶意网页诱导浏览器 | `SameSite=Strict` cookie + `crossSiteReason`(Origin/Host + `sec-fetch-site`) + 写请求必须 `application/json` | 无 |
 | T3 | DNS rebinding | 恶意域名解析到 127.0.0.1 | 核心的 `isTrustedRequest(request, trustedHosts)`：Host 必须**精确等于** `DEFAULT_TRUSTED_HOSTS`（127.0.0.1/localhost/[::1]/::1），且 Origin 存在时必须与 Host 同源；可信主机表由 server 注入，**永不从请求头自动扩宽** | 无 |
-| T4 | 凭据泄漏 | 日志/前端/备份/诊断 | 密文落盘；`describe` 只答 configured；日志 `redact()`；备份不含 credentials/admin/sessions；`/system/status` 不含凭据 | 进程内存中的明文 |
+| T4 | 凭据泄漏 | 日志/前端/诊断/备份 | 密文落盘；`describe` 只答 configured；日志 `redact()`；备份含凭据密文但不含密钥/身份文件；`/system/status` 不含凭据 | 进程内存中的明文；备份与原密钥同时泄漏 |
 | T5 | 越权发表 | 提示注入 + `confirm:true` | 核心已有：单次批准记录（绑定 session+candidate+platform+target+account+bodyHash+version，30min 过期）+ 能力矩阵门 + 导入会话硬拒 + 发表不在队列 | 用户自己点批准（产品设计） |
 | T6 | 登录爆破 | 循环尝试 | scrypt(N=16384) + `timingSafeEqual` + per-IP/per-user 15min 窗口 | 计数在内存，重启清零（§13 R6） |
 | T7 | 会话劫持 | XSS / 磁盘窃取 | `HttpOnly`+`SameSite=Strict`；磁盘只存 `sha256(id)`；CSP `script-src 'self'`；页面与外壳均不 `innerHTML` | 同用户可读进程内存 |

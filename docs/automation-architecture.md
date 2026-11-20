@@ -128,7 +128,7 @@ pending ──claim──> running ──ok──> completed
 
 | 机制 | Windows | Linux |
 |---|---|---|
-| 守护 | `ai-debate supervise`：子进程退出码非 0/75 时按 1s→30s 指数退避重启 | systemd `Restart=always` |
+| 守护 | `ai-debate supervise`：子进程退出码非 0/75 时按 1s→30s 指数退避重启 | systemd `Restart=on-failure` + `SuccessExitStatus=75` + `RestartForceExitStatus=75` |
 | 自启 | 可选写 `HKCU\...\Run`（默认关闭） | `systemctl enable` |
 | 单实例 | `run/instance.lock` + `/healthz` 双判据 | 同 |
 | 停止 | `ai-debate stop`（control token → `process.exit(0)`，守护不再拉起） | `systemctl stop` |

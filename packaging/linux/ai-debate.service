@@ -13,15 +13,21 @@ EnvironmentFile=-@CONF_DIR@/ai-debate.env
 Environment=AI_DEBATE_HOME=@DATA_DIR@
 Environment=NODE_ENV=production
 ExecStart=@PREFIX@/bin/ai-debate serve
-Restart=always
+# 75 is the application's controlled-restart exit code. SuccessExitStatus keeps
+# the service from being reported as failed, while RestartForceExitStatus makes
+# on-failure restart it anyway. An explicit systemctl stop is still never restarted.
+Restart=on-failure
+SuccessExitStatus=75
+RestartForceExitStatus=75
 RestartSec=3
 KillSignal=SIGTERM
 TimeoutStopSec=20
-# 数据目录之外不应可写；这里只允许它写自己的状态与日志。
+# ProtectSystem=strict makes the whole filesystem read-only; only application data
+# is writable. EnvironmentFile is read by systemd (as root) before dropping privileges.
 ProtectSystem=strict
+ReadWritePaths=@DATA_DIR@
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=@DATA_DIR@ @CONF_DIR@
 NoNewPrivileges=true
 PrivateDevices=true
 ProtectKernelTunables=true

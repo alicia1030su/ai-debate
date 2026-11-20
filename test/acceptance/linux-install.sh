@@ -1,46 +1,152 @@
 #!/usr/bin/env bash
 #
-# Linux acceptance: install the archive for real, start the installed service,
-# complete the core workflow over HTTP, restart and prove the state survived.
+# Linux acceptance: install the archive for real, exercise the path policy, start
+# the installed service, complete the core workflow over HTTP, prove crash and
+# controlled-restart recovery, preserve data across upgrade/uninstall, and verify
+# that purge requires a second confirmation.
 #
-# Run on a throw-away machine or a CI runner:
+# Run on a throw-away machine or CI runner:
 #   sudo ./test/acceptance/linux-install.sh dist/ai-debate-linux-x64.tgz
 #
-# It deliberately uses the *installed* path (/opt/ai-debate/bin/ai-debate) rather
-# than the extracted one, because "the tarball contains a working binary" and "the
-# installer produces a working service" are different claims.
 set -euo pipefail
 
 ARCHIVE="${1:-dist/ai-debate-linux-x64.tgz}"
 PORT=17862
 MOCK_PORT=17863
 WORK="$(mktemp -d)"
+TOKEN="acceptance-$$"
 PASS=0
 FAIL=0
+INSTALLED=0
+SERVICE_PID=""
+MOCK_PID=""
+SYSTEMD=0
+PREFIX=""
+DATA_DIR=""
+CONF_DIR=""
+BIN=""
+PKG_DIR=""
+INSTALL_ENV=()
+unset AI_DEBATE_INSTALL_TEST AI_DEBATE_INSTALL_TEST_ROOT
 
 pass() { PASS=$((PASS + 1)); echo "✔ $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "✖ $1"; }
+skip() { echo "  （跳过：$1）"; }
 
 cleanup() {
-  [[ -n "${SERVICE_PID:-}" ]] && kill "${SERVICE_PID}" 2>/dev/null || true
-  [[ -n "${MOCK_PID:-}" ]] && kill "${MOCK_PID}" 2>/dev/null || true
-  rm -rf "${WORK}"
+  if [[ "$INSTALLED" -eq 1 && -x "${PKG_DIR}/uninstall.sh" ]]; then
+    ( cd "$PKG_DIR" && env "${INSTALL_ENV[@]}" ./uninstall.sh ) >/dev/null 2>&1 || true
+  fi
+  [[ -n "$SERVICE_PID" ]] && kill "$SERVICE_PID" 2>/dev/null || true
+  [[ -n "$MOCK_PID" ]] && kill "$MOCK_PID" 2>/dev/null || true
+  rm -rf -- "$WORK"
 }
 trap cleanup EXIT
 
-if [[ ! -f "${ARCHIVE}" ]]; then
-  echo "找不到安装包：${ARCHIVE}" >&2
+if [[ ! -f "$ARCHIVE" ]]; then
+  echo "找不到安装包：$ARCHIVE" >&2
   exit 1
+fi
+ARCHIVE="$(realpath -m -- "$ARCHIVE")"
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  if [[ -f /etc/systemd/system/ai-debate.service ]]; then
+    echo "检测到已有 /etc/systemd/system/ai-debate.service；验收只能在干净的一次性主机运行。" >&2
+    exit 1
+  fi
+  if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+    SYSTEMD=1
+    PREFIX="/opt/ai-debate/${TOKEN}/ai-debate"
+    DATA_DIR="/srv/ai-debate/${TOKEN}/ai-debate"
+    CONF_DIR="/etc/ai-debate/${TOKEN}"
+  else
+    TEST_ROOT="${WORK}/test-root"
+    install -d -m 0700 -o root -g root "$TEST_ROOT"
+    INSTALL_ENV=(AI_DEBATE_INSTALL_TEST=1 "AI_DEBATE_INSTALL_TEST_ROOT=${TEST_ROOT}")
+    PREFIX="${TEST_ROOT}/prefix/ai-debate"
+    DATA_DIR="${TEST_ROOT}/data/ai-debate"
+    CONF_DIR="${TEST_ROOT}/conf/ai-debate"
+  fi
+else
+  DATA_DIR="${WORK}/data"
+  PREFIX="${WORK}/opt"
+  CONF_DIR="${WORK}/conf"
+fi
+
+echo "== 解压并校验安装包 =="
+mkdir -p "${WORK}/pkg"
+tar -xzf "$ARCHIVE" -C "${WORK}/pkg"
+PKG_DIR="${WORK}/pkg/ai-debate-linux-x64"
+( cd "$PKG_DIR" && sha256sum -c SHA256SUMS --quiet ) && pass "安装包 SHA256 校验" || fail "安装包 SHA256 校验"
+[[ -f "${PKG_DIR}/common.sh" ]] && pass "安装包包含共享路径策略" || fail "安装包缺少 common.sh"
+
+expect_rejected() {
+  local label="$1" output status
+  shift
+  output="${WORK}/rejected.log"
+  if ( cd "$PKG_DIR" && env "${INSTALL_ENV[@]}" ./install.sh "$@" ) >"$output" 2>&1; then
+    fail "$label（安装脚本错误地接受了恶意路径）"
+  else
+    status=$?
+    if [[ "$status" -eq 2 ]]; then
+      pass "$label"
+    else
+      fail "$label（退出码 ${status}，预期 2）"
+      cat "$output"
+    fi
+  fi
+}
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  echo "== 恶意路径必须失败 =="
+  # No test override here: these prove the production allowlist itself.
+  expect_rejected "拒绝系统根 prefix" --prefix / --no-start
+  expect_rejected "拒绝 /opt 共享目录" --prefix /opt --no-start
+  expect_rejected "拒绝 /usr/local 共享目录" --prefix /usr/local --no-start
+  expect_rejected "拒绝不以应用名结尾的 prefix" --prefix /opt/ai-debate-data --no-start
+  expect_rejected "拒绝 /var/lib 共享目录" --data-dir /var/lib --no-start
+  expect_rejected "拒绝 /etc/ai-debate-data" --data-dir /etc/ai-debate-data --no-start
+  expect_rejected "拒绝 /srv 共享目录" --data-dir /srv --no-start
+  expect_rejected "拒绝 /etc 共享目录" --conf-dir /etc --no-start
+  expect_rejected "拒绝相对路径" --data-dir relative/ai-debate --no-start
+  expect_rejected "拒绝换行/控制字符" --prefix $'/opt/ai-debate\nforged' --no-start
+  expect_rejected "拒绝 shell/systemd 元字符" --prefix '/opt/ai-debate/ai-debate;false' --no-start
+  expect_rejected "拒绝三个目录互相嵌套" \
+    --prefix /opt/ai-debate/nested/ai-debate \
+    --data-dir /opt/ai-debate/nested/ai-debate/data \
+    --conf-dir /etc/ai-debate/nested --no-start
+
+  NEST_ROOT="${WORK}/nest-root"
+  install -d -m 0700 "$NEST_ROOT"
+  if ( cd "$PKG_DIR" && env AI_DEBATE_INSTALL_TEST=1 "AI_DEBATE_INSTALL_TEST_ROOT=${NEST_ROOT}" \
+      ./install.sh --prefix "${NEST_ROOT}/app" --data-dir "${NEST_ROOT}/app/data" \
+      --conf-dir "${NEST_ROOT}/conf" --no-start ) >"${WORK}/nested.log" 2>&1; then
+    fail "测试模式下仍须拒绝互相嵌套的目录"
+  else
+    pass "测试模式下仍须拒绝互相嵌套的目录"
+  fi
+
+  OUTSIDE="${WORK}/outside"
+  install -d -m 0700 "$OUTSIDE"
+  if [[ "$SYSTEMD" -eq 1 ]]; then
+    install -d -m 0755 /var/lib/ai-debate
+    ESCAPE_LINK="/var/lib/ai-debate/${TOKEN}-escape"
+    ln -s "$OUTSIDE" "$ESCAPE_LINK"
+    expect_rejected "拒绝符号链接逃逸出数据根目录" --data-dir "$ESCAPE_LINK" --no-start
+    rm -f -- "$ESCAPE_LINK"
+  else
+    install -d -m 0700 "${TEST_ROOT}/links"
+    ESCAPE_LINK="${TEST_ROOT}/links/data"
+    ln -s "$OUTSIDE" "$ESCAPE_LINK"
+    expect_rejected "拒绝符号链接逃逸出测试根目录" --data-dir "$ESCAPE_LINK" --no-start
+  fi
 fi
 
 # A mock OpenAI-compatible endpoint so the model step is real HTTP, not a stub.
-# When the service runs inside a container that shares the host network (the CI
-# systemd job), the caller starts this on the host and passes AI_DEBATE_MOCK_URL.
 if [[ -n "${AI_DEBATE_MOCK_URL:-}" ]]; then
   echo "使用外部模型地址 ${AI_DEBATE_MOCK_URL}"
-  MOCK_PID=""
 else
-node -e '
+  node -e '
 const http = require("node:http");
 const server = http.createServer((req, res) => {
   let body = "";
@@ -65,81 +171,140 @@ const server = http.createServer((req, res) => {
 });
 server.listen('"${MOCK_PORT}"', "127.0.0.1");
 ' &
-MOCK_PID=$!
-sleep 1
+  MOCK_PID=$!
+  sleep 1
 fi
 
-echo "== 解压并安装 =="
-mkdir -p "${WORK}/pkg"
-tar -xzf "${ARCHIVE}" -C "${WORK}/pkg"
-( cd "${WORK}/pkg/ai-debate-linux-x64" && sha256sum -c SHA256SUMS --quiet ) && pass "安装包 SHA256 校验" || fail "安装包 SHA256 校验"
-
-SYSTEMD=0
+INSTALL_ARGS=(--host 127.0.0.1 --port "$PORT" --prefix "$PREFIX" --data-dir "$DATA_DIR" --conf-dir "$CONF_DIR")
 if [[ "$(id -u)" -eq 0 ]]; then
-  if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
-    SYSTEMD=1
-    echo "== 检测到运行中的 systemd：走真实安装（含开机自启）=="
-    # Default paths on purpose: the unit sets ProtectSystem=strict and whitelists
-    # /opt + /var/lib, so installing into a temp directory would leave the service
-    # unable to write its own data — a harness failure, not a product one.
-    ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" ) \
-      && pass "安装脚本执行（systemd 模式）" || fail "安装脚本执行"
-    STATE_DIR="/var/lib/ai-debate"
-    BIN="/opt/ai-debate/bin/ai-debate"
-    # The real proof: systemd says the unit is active, not that we spawned a process.
-    for _ in $(seq 1 40); do
-      if systemctl is-active --quiet ai-debate; then break; fi
-      sleep 0.5
-    done
-    systemctl is-active --quiet ai-debate && pass "systemctl 报告服务 active" || fail "systemctl 报告服务 active"
-    systemctl is-enabled --quiet ai-debate && pass "systemd 已 enable（开机自启）" || fail "systemd 已 enable"
-    # 独立低权限用户：服务不能以 root 跑。
-    MAIN_USER=$(systemctl show -p User --value ai-debate)
-    [[ "${MAIN_USER}" == "ai-debate" ]] && pass "服务以独立低权限用户运行（${MAIN_USER}）" || fail "服务用户不是 ai-debate（${MAIN_USER}）"
-    # 数据目录必须归该用户所有，且不对其他用户开放写权限。
-    OWNER=$(stat -c '%U' "${STATE_DIR}")
-    [[ "${OWNER}" == "ai-debate" ]] && pass "数据目录归服务用户所有" || fail "数据目录属主是 ${OWNER}"
-    MODE=$(stat -c '%a' "${STATE_DIR}")
-    [[ "${MODE}" == "750" || "${MODE}" == "700" ]] && pass "数据目录权限收紧（${MODE}）" || fail "数据目录权限过宽（${MODE}）"
-    [[ -f /etc/logrotate.d/ai-debate ]] && pass "已安装日志轮转配置" || echo "  （本机没有 logrotate，跳过）"
+  echo "== 自定义路径安装 =="
+  if [[ "$SYSTEMD" -eq 1 ]]; then
+    echo "运行中的 systemd：使用应用专属生产路径"
   else
-    echo "== 没有运行中的 systemd：退化为手工启动 =="
-    ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" --data-dir "${WORK}/data" --prefix "${WORK}/opt" --no-start ) \
-      && pass "安装脚本执行" || fail "安装脚本执行"
-    STATE_DIR="${WORK}/data"
-    BIN="${WORK}/opt/bin/ai-debate"
+    echo "没有运行中的 systemd：使用显式 0700 测试根目录"
+  fi
+  ( cd "$PKG_DIR" && env "${INSTALL_ENV[@]}" ./install.sh "${INSTALL_ARGS[@]}" ) \
+    && { pass "自定义路径安装成功"; INSTALLED=1; } \
+    || { fail "自定义路径安装"; exit 1; }
+  BIN="${PREFIX}/bin/ai-debate"
+  [[ -x "$BIN" ]] && pass "程序安装到自定义 prefix" || fail "自定义 prefix 中程序缺失"
+  [[ "$(stat -c '%U:%G:%a' "$PREFIX")" == "root:root:755" ]] \
+    && pass "prefix 为 root:root 0755" || fail "prefix 权限不正确"
+  [[ "$(stat -c '%U:%G:%a' "$DATA_DIR")" == "ai-debate:ai-debate:750" ]] \
+    && pass "数据目录归服务用户且权限 0750" || fail "数据目录权限不正确"
+  [[ "$(stat -c '%U:%G:%a' "$CONF_DIR")" == "root:root:755" ]] \
+    && pass "配置目录由 root 拥有" || fail "配置目录权限不正确"
+  [[ "$(stat -c '%U:%G:%a' "${CONF_DIR}/ai-debate.env")" == "root:ai-debate:640" ]] \
+    && pass "env 为 root:ai-debate 0640" || fail "env 权限不正确"
+  [[ -f /etc/systemd/system/ai-debate.service ]] && pass "已安装渲染后的 systemd unit" || fail "systemd unit 未安装"
+
+  echo "== 卸载器必须拒绝被篡改的系统目录 =="
+  cp /etc/systemd/system/ai-debate.service "${WORK}/good.service"
+  sed -i 's|^Environment=AI_DEBATE_HOME=.*|Environment=AI_DEBATE_HOME=/var/lib|' /etc/systemd/system/ai-debate.service
+  if ( cd "$PKG_DIR" && env "${INSTALL_ENV[@]}" ./uninstall.sh --purge --confirm-purge ) >"${WORK}/evil-uninstall.log" 2>&1; then
+    fail "卸载器错误地接受了系统数据目录"
+  else
+    [[ -d "$DATA_DIR" && -d "$CONF_DIR" && -d "$PREFIX" ]] \
+      && pass "卸载器拒绝系统目录且未删除任何内容" || fail "卸载器拒绝后仍删除了内容"
+  fi
+  cp "${WORK}/good.service" /etc/systemd/system/ai-debate.service
+  chmod 0644 /etc/systemd/system/ai-debate.service
+
+  if command -v logrotate >/dev/null 2>&1 && [[ -d /etc/logrotate.d ]]; then
+    [[ -f /etc/logrotate.d/ai-debate ]] && pass "已安装日志轮转配置" || fail "日志轮转配置缺失"
+    grep -Fq "${DATA_DIR}/logs/*.log" /etc/logrotate.d/ai-debate \
+      && grep -Fq "${DATA_DIR}/logs/*.jsonl" /etc/logrotate.d/ai-debate \
+      && grep -Fq "${DATA_DIR}/egress.jsonl" /etc/logrotate.d/ai-debate \
+      && pass "logrotate 覆盖 server/audit/egress 自定义路径" || fail "logrotate 路径不完整"
+    [[ "$(stat -c '%U:%G:%a' /etc/logrotate.d/ai-debate)" == "root:ai-debate:640" ]] \
+      && pass "logrotate 策略为 root:ai-debate 0640" || fail "logrotate 策略权限不正确"
+    if logrotate --debug /etc/logrotate.d/ai-debate >"${WORK}/logrotate.log" 2>&1; then
+      pass "logrotate --debug 接受渲染配置"
+    else
+      fail "logrotate --debug 失败"
+      cat "${WORK}/logrotate.log"
+    fi
+  else
+    skip "本机没有 logrotate"
+  fi
+
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    if systemd-analyze verify /etc/systemd/system/ai-debate.service >"${WORK}/verify.log" 2>&1; then
+      pass "systemd-analyze verify 接受自定义 unit"
+    else
+      fail "systemd-analyze verify 拒绝自定义 unit"
+      cat "${WORK}/verify.log"
+    fi
+    cp /etc/systemd/system/ai-debate.service "${WORK}/invalid.service"
+    printf '\nThisDirectiveDoesNotExist=yes\n' >> "${WORK}/invalid.service"
+    if systemd-analyze verify "${WORK}/invalid.service" >"${WORK}/invalid-verify.log" 2>&1; then
+      fail "systemd-analyze verify 对非法 unit 错误地返回 0"
+    else
+      pass "systemd-analyze verify 对非法 unit 返回非零"
+    fi
+  else
+    skip "本机没有 systemd-analyze"
   fi
 else
-  echo "非 root：跳过 install.sh，直接使用解压出的二进制"
-  STATE_DIR="${WORK}/data"
-  BIN="${WORK}/pkg/ai-debate-linux-x64/bin/ai-debate"
+  echo "非 root：跳过安装脚本，直接使用解压出的二进制"
+  BIN="${PKG_DIR}/bin/ai-debate"
 fi
 
-[[ -x "${BIN}" ]] && pass "程序可执行" || fail "程序缺失"
+[[ -x "$BIN" ]] && pass "程序可执行" || fail "程序缺失"
+
+wait_ready() {
+  for _ in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
 
 echo "== 启动已安装的程序 =="
-if [[ "${SYSTEMD}" -eq 1 ]]; then
-  # systemd owns the process; the config file written by install.sh points at the
-  # same data directory, so this exercises the real unit rather than a copy of it.
-  SERVICE_PID=""
+if [[ "$SYSTEMD" -eq 1 ]]; then
+  for _ in $(seq 1 40); do
+    systemctl is-active --quiet ai-debate && break
+    sleep 0.5
+  done
+  systemctl is-active --quiet ai-debate && pass "systemctl 报告服务 active" || { fail "systemd 服务未 active"; exit 1; }
+  systemctl is-enabled --quiet ai-debate && pass "systemd 已 enable（开机自启）" || fail "systemd 未 enable"
+  [[ "$(systemctl show -p User --value ai-debate)" == "ai-debate" ]] \
+    && pass "服务以独立低权限用户运行" || fail "服务用户不是 ai-debate"
+  [[ "$(systemctl show -p Restart --value ai-debate)" == "on-failure" ]] \
+    && pass "Restart=on-failure" || fail "Restart 策略不正确"
+  [[ "$(systemctl show -p SuccessExitStatus --value ai-debate)" == "75" ]] \
+    && pass "SuccessExitStatus=75" || fail "SuccessExitStatus 不是 75"
+  [[ "$(systemctl show -p RestartForceExitStatus --value ai-debate)" == "75" ]] \
+    && pass "RestartForceExitStatus=75" || fail "RestartForceExitStatus 不是 75"
+  [[ "$(systemctl show -p ReadWritePaths --value ai-debate)" == "$DATA_DIR" ]] \
+    && pass "ReadWritePaths 仅包含数据目录" || fail "ReadWritePaths 范围不正确"
+  [[ "$(systemctl show -p ProtectSystem --value ai-debate)" == "strict" ]] \
+    && pass "ProtectSystem=strict" || fail "ProtectSystem 不是 strict"
 else
-  AI_DEBATE_HOME="${STATE_DIR}" "${BIN}" serve --port "${PORT}" > "${WORK}/service.log" 2>&1 &
+  AI_DEBATE_HOME="$DATA_DIR" "$BIN" serve --port "$PORT" > "${WORK}/service.log" 2>&1 &
   SERVICE_PID=$!
 fi
 
-ready=0
-for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then ready=1; break; fi
-  sleep 0.5
-done
-[[ "${ready}" -eq 1 ]] && pass "服务启动并响应 /healthz" || { fail "服务启动"; cat "${WORK}/service.log"; exit 1; }
+if wait_ready; then
+  pass "服务启动并响应 /healthz"
+else
+  fail "服务启动"
+  [[ -f "${WORK}/service.log" ]] && cat "${WORK}/service.log"
+  exit 1
+fi
 
 JAR="${WORK}/cookies.txt"
 api() {
   local method="$1" path="$2" body="${3:-}"
-  curl -sS -b "${JAR}" -c "${JAR}" -X "${method}" \
+  local -a body_args=()
+  if [[ -n "$body" ]]; then
+    body_args=(--data "$body")
+  fi
+  curl -sS -b "${JAR}" -c "${JAR}" -X "$method" \
     -H 'content-type: application/json' -H "origin: http://127.0.0.1:${PORT}" \
-    ${body:+--data "${body}"} \
+    "${body_args[@]}" \
     "http://127.0.0.1:${PORT}${path}"
 }
 
@@ -160,73 +325,145 @@ DISCUSSION='{"root":{"author":"楼主","text":"现在的年轻人根本不愿意
 
 CONFIRM=$(api POST /api/ai-debate/action "$(node -e 'const d=process.argv[1];console.log(JSON.stringify({action:"manual-confirm",kind:"json",content:d,title:"Linux 验收",ownerName:"楼主",targetPostId:"c2"}))' "${DISCUSSION}")")
 SESSION=$(node -e 'const j=JSON.parse(process.argv[1]);console.log(j.sessionId||"")' "${CONFIRM}")
-[[ -n "${SESSION}" ]] && pass "导入并确认讨论" || fail "导入讨论"
+[[ -n "$SESSION" ]] && pass "导入并确认讨论" || fail "导入讨论"
 
 GEN=$(api POST /api/ai-debate/action "{\"action\":\"manual-generate\",\"sessionId\":\"${SESSION}\",\"targetPostId\":\"c2\"}")
 CANDIDATE=$(node -e 'const j=JSON.parse(process.argv[1]);console.log(j.candidateId||"")' "${GEN}")
-[[ -n "${CANDIDATE}" ]] && pass "生成候选" || fail "生成候选"
+[[ -n "$CANDIDATE" ]] && pass "生成候选" || fail "生成候选"
 
 api POST /api/ai-debate/action "{\"action\":\"manual-edit\",\"sessionId\":\"${SESSION}\",\"candidateId\":\"${CANDIDATE}\",\"text\":\"你举的例子只能说明有人这样，不能代表所有人。\"}" >/dev/null
 api POST /api/ai-debate/action "{\"action\":\"manual-approve\",\"sessionId\":\"${SESSION}\",\"candidateId\":\"${CANDIDATE}\",\"approvedText\":\"你举的例子只能说明有人这样，不能代表所有人。\"}" | grep -q '"ok":true' && pass "人工批准" || fail "人工批准"
 
+printf 'upgrade-%s\n' "$TOKEN" > "${DATA_DIR}/upgrade-marker"
+
 echo "== 重启，验证持久化 =="
-if [[ "${SYSTEMD}" -eq 1 ]]; then
+if [[ "$SYSTEMD" -eq 1 ]]; then
   systemctl restart ai-debate
-  sleep 1
 else
-  kill "${SERVICE_PID}"; wait "${SERVICE_PID}" 2>/dev/null || true
-  AI_DEBATE_HOME="${STATE_DIR}" "${BIN}" serve --port "${PORT}" >> "${WORK}/service.log" 2>&1 &
+  kill "$SERVICE_PID"; wait "$SERVICE_PID" 2>/dev/null || true
+  AI_DEBATE_HOME="$DATA_DIR" "$BIN" serve --port "$PORT" >> "${WORK}/service.log" 2>&1 &
   SERVICE_PID=$!
 fi
-ready=0
-for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then ready=1; break; fi
-  sleep 0.5
-done
-[[ "${ready}" -eq 1 ]] && pass "重启后服务可用" || fail "重启后服务"
-
+if wait_ready; then
+  pass "重启后服务可用"
+else
+  fail "重启后服务"
+  exit 1
+fi
 api GET /api/ai-debate/settings | grep -q '"status":"ready"' && pass "重启后会话仍有效" || fail "重启后会话"
-grep -q "${SESSION}" "${STATE_DIR}/state.json" && pass "重启后会话数据仍在" || fail "重启后数据"
+grep -q "$SESSION" "${DATA_DIR}/state.json" && pass "重启后会话数据仍在" || fail "重启后数据"
 
-if [[ "${SYSTEMD}" -eq 1 ]]; then
-  echo "== 强制 kill -9，验证 systemd 自动拉起 =="
+if [[ "$SYSTEMD" -eq 1 ]]; then
+  echo "== SIGKILL 自动恢复 =="
   MAIN_PID=$(systemctl show -p MainPID --value ai-debate)
-  [[ -n "${MAIN_PID}" && "${MAIN_PID}" != "0" ]] && pass "读到服务主进程 PID" || fail "读到服务主进程 PID"
-  kill -9 "${MAIN_PID}" 2>/dev/null || true
+  [[ -n "$MAIN_PID" && "$MAIN_PID" != "0" ]] && pass "读到服务主进程 PID" || fail "读到服务主进程 PID"
+  kill -9 "$MAIN_PID" 2>/dev/null || true
   restarted=0
-  for _ in $(seq 1 40); do
+  for _ in $(seq 1 60); do
     NEW_PID=$(systemctl show -p MainPID --value ai-debate)
-    if [[ -n "${NEW_PID}" && "${NEW_PID}" != "0" && "${NEW_PID}" != "${MAIN_PID}" ]] && systemctl is-active --quiet ai-debate; then
+    if [[ -n "$NEW_PID" && "$NEW_PID" != "0" && "$NEW_PID" != "$MAIN_PID" ]] && systemctl is-active --quiet ai-debate; then
       restarted=1; break
     fi
     sleep 0.5
   done
-  [[ "${restarted}" -eq 1 ]] && pass "进程被 kill -9 后由 systemd 自动拉起" || fail "进程被 kill -9 后由 systemd 自动拉起"
-  for _ in $(seq 1 40); do
-    if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then break; fi
-    sleep 0.5
-  done
-  curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1 && pass "拉起后再次可服务" || fail "拉起后再次可服务"
+  [[ "$restarted" -eq 1 ]] && pass "进程被 kill -9 后由 systemd 自动拉起" || fail "进程被 kill -9 后未自动拉起"
+  wait_ready && pass "拉起后再次可服务" || fail "拉起后不可服务"
 
-  echo "== 卸载（保留数据）=="
-  ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./uninstall.sh ) >/dev/null 2>&1 || true
-  systemctl is-active --quiet ai-debate && fail "卸载后服务仍活动" || pass "卸载后服务已停止"
-  [[ -f "${STATE_DIR}/state.json" ]] && pass "卸载保留用户数据" || fail "卸载保留用户数据"
-
-  echo "== 重新安装并启动，验证升级不丢数据 =="
-  ( cd "${WORK}/pkg/ai-debate-linux-x64" && ./install.sh --host 127.0.0.1 --port "${PORT}" ) >/dev/null 2>&1
-  for _ in $(seq 1 40); do
-    if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then break; fi
-    sleep 0.5
-  done
-  grep -q "${SESSION}" "${STATE_DIR}/state.json" && pass "重新安装后历史数据仍在" || fail "重新安装后历史数据仍在"
-  if [[ -f "${STATE_DIR}/monitors.json" ]]; then
-    pass "监控配置文件随数据目录保留"
+  echo "== 受控 exit 75 自动恢复 =="
+  MAIN_PID=$(systemctl show -p MainPID --value ai-debate)
+  if AI_DEBATE_HOME="$DATA_DIR" "$BIN" restart >"${WORK}/restart.log" 2>&1; then
+    pass "CLI 受控重启请求被接受"
   else
-    echo "  （本次运行未创建监控目标，跳过 monitors.json 检查）"
+    fail "CLI 受控重启请求失败"
+    cat "${WORK}/restart.log"
   fi
+  restarted=0
+  for _ in $(seq 1 60); do
+    NEW_PID=$(systemctl show -p MainPID --value ai-debate)
+    if [[ -n "$NEW_PID" && "$NEW_PID" != "0" && "$NEW_PID" != "$MAIN_PID" ]] && systemctl is-active --quiet ai-debate; then
+      restarted=1; break
+    fi
+    sleep 0.5
+  done
+  [[ "$restarted" -eq 1 ]] && pass "受控 exit 75 后由 systemd 自动恢复" || fail "受控 exit 75 后未自动恢复"
+  if journalctl -u ai-debate --since '-3 min' --no-pager 2>/dev/null | grep -q 'status=75'; then
+    pass "journal 确认主进程以 75 退出"
+  else
+    fail "journal 未确认 exit 75"
+  fi
+  wait_ready && pass "受控重启后再次可服务" || fail "受控重启后不可服务"
+
+  echo "== 显式停止不应被自动拉起 =="
+  systemctl stop ai-debate
+  sleep 4
+  if systemctl is-active --quiet ai-debate; then
+    fail "显式 systemctl stop 后服务仍活动"
+  else
+    pass "显式 systemctl stop 后保持停止"
+  fi
+  systemctl start ai-debate
+  wait_ready && pass "显式 start 后服务恢复" || fail "显式 start 后服务未恢复"
+
+  echo "== 升级保留自定义路径与数据 =="
+  # Deliberately omit every path flag: the installer must recover them from the unit.
+  ( cd "$PKG_DIR" && ./install.sh --host 127.0.0.1 --port "$PORT" ) >"${WORK}/upgrade-install.log" 2>&1 \
+    && pass "省略路径参数的升级安装成功" || { fail "升级安装失败"; cat "${WORK}/upgrade-install.log"; exit 1; }
+  [[ "$(systemctl show -p ReadWritePaths --value ai-debate)" == "$DATA_DIR" ]] \
+    && pass "升级保留自定义 DATA_DIR" || fail "升级丢失自定义 DATA_DIR"
+  [[ "$(systemctl show -p ExecStart --value ai-debate)" == "${PREFIX}/bin/ai-debate serve" ]] \
+    && pass "升级保留自定义 PREFIX" || fail "升级丢失自定义 PREFIX"
+  grep -q "$TOKEN" "${DATA_DIR}/upgrade-marker" && pass "升级保留用户数据" || fail "升级丢失用户数据"
+  wait_ready && pass "升级后服务可用" || fail "升级后服务不可用"
+
+  echo "== 卸载保留数据 =="
+  ( cd "$PKG_DIR" && ./uninstall.sh ) >"${WORK}/uninstall.log" 2>&1 \
+    && pass "卸载脚本读取自定义路径并成功" || { fail "卸载失败"; cat "${WORK}/uninstall.log"; exit 1; }
+  INSTALLED=0
+  systemctl is-active --quiet ai-debate && fail "卸载后服务仍活动" || pass "卸载后服务已停止"
+  [[ ! -e "$PREFIX" ]] && pass "卸载删除自定义 prefix" || fail "自定义 prefix 未删除"
+  [[ -f "${DATA_DIR}/state.json" && -f "${CONF_DIR}/ai-debate.env" ]] \
+    && pass "卸载保留数据与配置" || fail "卸载删除或丢失数据/配置"
+  [[ ! -e /etc/logrotate.d/ai-debate ]] && pass "卸载清理 logrotate 策略" || fail "logrotate 策略未清理"
+
+  echo "== purge 二次确认 =="
+  if ( cd "$PKG_DIR" && ./uninstall.sh --purge ) </dev/null >"${WORK}/purge-denied.log" 2>&1; then
+    fail "非交互 purge 无二次确认时错误地成功"
+  else
+    [[ -f "${DATA_DIR}/state.json" ]] && pass "缺少二次确认时拒绝 purge 且保留数据" || fail "缺少二次确认时数据被删除"
+  fi
+
+  echo "== 重新安装并验证历史数据 =="
+  ( cd "$PKG_DIR" && ./install.sh "${INSTALL_ARGS[@]}" ) >"${WORK}/reinstall.log" 2>&1 \
+    && { pass "重新安装成功"; INSTALLED=1; } \
+    || { fail "重新安装失败"; cat "${WORK}/reinstall.log"; exit 1; }
+  wait_ready && pass "重新安装后服务可用" || fail "重新安装后服务不可用"
+  grep -q "$SESSION" "${DATA_DIR}/state.json" && pass "重新安装后历史数据仍在" || fail "重新安装后历史数据丢失"
+
+  echo "== 确认后的 purge =="
+  ( cd "$PKG_DIR" && ./uninstall.sh --purge --confirm-purge ) >"${WORK}/purge.log" 2>&1 \
+    && { pass "二次确认后的 purge 成功"; INSTALLED=0; } \
+    || { fail "purge 失败"; cat "${WORK}/purge.log"; exit 1; }
+  [[ ! -e "$DATA_DIR" && ! -e "$CONF_DIR" && ! -e "$PREFIX" ]] \
+    && pass "purge 删除自定义数据、配置与程序目录" || fail "purge 未清理全部自定义目录"
+  rmdir "/opt/ai-debate/${TOKEN}" 2>/dev/null || true
+elif [[ "$INSTALLED" -eq 1 ]]; then
+  echo "== 无 systemd：验证卸载读取测试 unit/env =="
+  kill "$SERVICE_PID"; wait "$SERVICE_PID" 2>/dev/null || true
+  SERVICE_PID=""
+  ( cd "$PKG_DIR" && env "${INSTALL_ENV[@]}" ./uninstall.sh ) >"${WORK}/uninstall.log" 2>&1 \
+    && { pass "无 systemd 卸载成功"; INSTALLED=0; } \
+    || { fail "无 systemd 卸载失败"; cat "${WORK}/uninstall.log"; exit 1; }
+  [[ -f "${DATA_DIR}/state.json" && -f "${CONF_DIR}/ai-debate.env" && ! -e "$PREFIX" ]] \
+    && pass "无 systemd 卸载保留数据与配置" || fail "无 systemd 卸载路径处理错误"
+  if ( cd "$PKG_DIR" && env "${INSTALL_ENV[@]}" ./uninstall.sh --purge ) </dev/null >/dev/null 2>&1; then
+    fail "无 systemd purge 无确认时错误地成功"
+  else
+    [[ -f "${DATA_DIR}/state.json" ]] && pass "无 systemd purge 同样要求二次确认" || fail "无 systemd purge 删除了数据"
+  fi
+else
+  skip "非 root 环境不验证 systemd 自动恢复与安装/卸载"
 fi
 
 echo
 echo "${PASS}/$((PASS + FAIL)) 项通过"
-[[ "${FAIL}" -eq 0 ]] || exit 1
+[[ "$FAIL" -eq 0 ]] || exit 1

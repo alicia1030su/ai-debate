@@ -1,9 +1,15 @@
-# Keep the service log from growing without bound.
+# AI Debate log rotation. install.sh renders @DATA_DIR@ and @APP_USER@.
 #
-# The service also rotates by size on its own (2 MB, one generation). This file is
-# the second layer: if the process is wedged and cannot rotate, logrotate still
-# bounds the file, and `copytruncate` means no signal is needed to reopen it.
-/var/lib/ai-debate/logs/*.log {
+# Actual files (packages/server/src/paths.ts and core/src/net-audit.ts):
+#   logs/server.log, logs/audit.jsonl, egress.jsonl
+# The application has no SIGHUP/SIGUSR1 reopen handler. It uses appendFileSync by
+# path on every write, but copytruncate is intentional so rotation also works if a
+# future version keeps a descriptor open. Active files stay 0640 and writable by
+# the service account; root administers rotation. The installed policy is
+# 0640 root:ai-debate. copytruncate can lose writes in the truncate/append window.
+@DATA_DIR@/logs/*.log
+@DATA_DIR@/logs/*.jsonl
+@DATA_DIR@/egress.jsonl {
     weekly
     rotate 4
     maxsize 10M
@@ -12,5 +18,5 @@
     compress
     delaycompress
     copytruncate
-    su ai-debate ai-debate
+    su root @APP_USER@
 }
