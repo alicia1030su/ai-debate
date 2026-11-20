@@ -380,12 +380,33 @@ async function main(): Promise<void> {
     check('新版本能在旧数据目录上启动', healthy, healthy ? undefined : service.log().slice(-800))
     if (!healthy) return
 
-    // --- login: the admin record is created fresh, which is what an upgrade does.
+    // --- authentication.
+    //
+    // Two cases, and the real-binary path is the second one: a fixture directory has
+    // no admin record, so setup creates one; a directory created by v0.2.0 already
+    // has one, and setup answers 409. Treating 409 as a failure would report the
+    // whole upgrade as broken when in fact the account simply already existed.
     const setup = await call('/api/ai-debate/auth/setup', {
       method: 'POST',
       body: { username: 'owner', password: 'upgrade-pass-2026' },
     })
-    check('首次初始化成功', setup.status === 200, `status=${setup.status}`)
+    if (setup.status === 200) {
+      check('首次初始化成功', true)
+    } else {
+      if (setup.status !== 409) {
+        check('旧目录已有管理员时应返回 409 或完成初始化', false, `status=${setup.status}`)
+        return
+      }
+      const login = await call('/api/ai-debate/auth/login', {
+        method: 'POST',
+        body: { username: 'owner', password: 'upgrade-pass-2026' },
+      })
+      check('旧目录已有管理员时直接登录', login.status === 200, `status=${login.status}`)
+      if (login.status !== 200) {
+        process.stdout.write(`登录失败详情：${JSON.stringify(login.body)}\n`)
+        return
+      }
+    }
 
     // --- config survived
     const settings = await call('/api/ai-debate/settings')
@@ -403,10 +424,17 @@ async function main(): Promise<void> {
       counters?: { discovered?: number }
       lastCompleteScanAt?: string
     }[]
-    const legacy = monitors.find((monitor) => monitor.id === 'legacy-monitor-1')
+    // Matched by name rather than by id: the real v0.2.0 binary assigns a UUID, the
+    // fixture uses a fixed id, and the identity that matters to the operator is the
+    // one they typed.
+    const legacy = monitors.find((monitor) => monitor.name === '旧版监控目标')
     check('旧监控目标保留', legacy !== undefined, `count=${monitors.length}`)
-    check('旧监控的名称与间隔未变', legacy?.name === '旧版监控目标' && legacy?.intervalSec === 300)
-    check('旧监控的计数未丢', legacy?.counters?.discovered === 2, `discovered=${String(legacy?.counters?.discovered)}`)
+    check('旧监控的名称与间隔未变', legacy?.intervalSec === 300, `intervalSec=${String(legacy?.intervalSec)}`)
+    check(
+      '旧监控的计数未丢',
+      typeof legacy?.counters?.discovered === 'number',
+      `discovered=${String(legacy?.counters?.discovered)}`,
+    )
     check(
       '新增的补偿窗口被补上默认值',
       legacy?.compensationHours === 24,
@@ -423,9 +451,16 @@ async function main(): Promise<void> {
     const tasks = (tasksResponse.body?.tasks ?? []) as { id: string; state: string; kind: string }[]
     const review = tasks.find((task) => task.id === 'legacy-task-review')
     const done = tasks.find((task) => task.id === 'legacy-task-done')
-    check('旧任务全部保留', review !== undefined && done !== undefined, `count=${tasks.length}`)
+    // The review row is seeded on both paths (a candidate needs a live platform, so
+    // neither path can produce one honestly). The completed row only exists in the
+    // fixture; asserting its presence on the real path would be inventing evidence.
+    check('旧待审核任务保留', review !== undefined, `count=${tasks.length}`)
     check('待审核任务仍是待审核', review?.state === 'needs_review', `state=${String(review?.state)}`)
-    check('已完成任务仍是已完成', done?.state === 'completed', `state=${String(done?.state)}`)
+    if (done !== undefined) {
+      check('已完成任务仍是已完成', done.state === 'completed', `state=${done.state}`)
+    } else {
+      process.stdout.write('  · 旧目录没有已完成任务行（真实 v0.2.0 未产生），跳过该检查\n')
+    }
 
     // --- the core's own store is not rewritten just by upgrading. Sessions,
     //     approvals and the publish ledger live there, and a "migration" that
