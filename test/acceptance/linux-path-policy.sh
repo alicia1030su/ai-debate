@@ -113,6 +113,13 @@ else
   fail "env 路径解析不正确"
 fi
 
+if [[ "$(AI_DEBATE_INSTALL_TEST=1 AI_DEBATE_INSTALL_TEST_ROOT=/tmp/example install_metadata_path)" == "/tmp/example/.install-paths" ]] \
+  && [[ "$(install_metadata_path)" == "/etc/ai-debate/.install-paths" ]]; then
+  pass "安装元数据在测试与生产模式中使用不同安全位置"
+else
+  fail "安装元数据路径不正确"
+fi
+
 PREFIX='/opt/ai-debate/@DATA_DIR@/ai-debate'
 DATA_DIR='/srv/ai-debate/site-a'
 CONF_DIR='/etc/ai-debate/site-a'

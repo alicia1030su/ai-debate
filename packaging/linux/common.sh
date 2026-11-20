@@ -8,6 +8,7 @@ APP_USER="ai-debate"
 DEFAULT_PREFIX="/opt/ai-debate"
 DEFAULT_DATA_DIR="/var/lib/ai-debate"
 DEFAULT_CONF_DIR="/etc/ai-debate"
+INSTALL_METADATA_NAME=".install-paths"
 
 # Keep paths safe in systemd's unquoted Environment=/ExecStart= syntax, in
 # ReadWritePaths' comma-separated list, and in the shell tools used below.
@@ -233,4 +234,49 @@ render_template() {
     done
     printf '%s%s\n' "$output" "$rest"
   done < "$source_file" > "$destination_file"
+}
+
+install_metadata_path() {
+  if [[ -n "${AI_DEBATE_INSTALL_TEST_ROOT:-}" ]]; then
+    if [[ "${AI_DEBATE_INSTALL_TEST:-}" != "1" ]]; then
+      path_policy_error "测试安装元数据要求 AI_DEBATE_INSTALL_TEST=1。"
+      return $?
+    fi
+    printf '%s/%s\n' "$AI_DEBATE_INSTALL_TEST_ROOT" "$INSTALL_METADATA_NAME"
+  else
+    printf '/etc/ai-debate/%s\n' "$INSTALL_METADATA_NAME"
+  fi
+}
+
+# Keep a root-owned path record after a non-purge uninstall removes the unit, so
+# a later confirmed purge can still find custom directories. The file is parsed
+# as KEY=value data by the uninstaller, never sourced as shell code.
+write_install_metadata() {
+  local metadata metadata_dir temporary
+  metadata="$(install_metadata_path)" || return $?
+  metadata_dir="$(dirname -- "$metadata")"
+  if [[ -n "${AI_DEBATE_INSTALL_TEST_ROOT:-}" ]]; then
+    if [[ ! -d "$metadata_dir" || -L "$metadata_dir" ]]; then
+      path_policy_error "测试元数据目录不是真实目录：$metadata_dir"
+      return $?
+    fi
+  else
+    install -d -m 0755 -o root -g root "$metadata_dir" || return $?
+  fi
+  if [[ -L "$metadata" ]]; then
+    path_policy_error "拒绝写入符号链接安装元数据：$metadata"
+    return $?
+  fi
+  temporary="$(mktemp "${metadata}.XXXXXX")" || return $?
+  if ! {
+    printf 'AI_DEBATE_PREFIX=%s\n' "$PREFIX"
+    printf 'AI_DEBATE_HOME=%s\n' "$DATA_DIR"
+    printf 'AI_DEBATE_CONF_DIR=%s\n' "$CONF_DIR"
+  } > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  chown root:root "$temporary" || { rm -f -- "$temporary"; return 1; }
+  chmod 0640 "$temporary" || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$metadata"
 }

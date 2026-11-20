@@ -24,6 +24,7 @@ SYSTEMD=0
 PREFIX=""
 DATA_DIR=""
 CONF_DIR=""
+METADATA_FILE=""
 BIN=""
 PKG_DIR=""
 INSTALL_ENV=()
@@ -59,6 +60,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
     PREFIX="/opt/ai-debate/${TOKEN}/ai-debate"
     DATA_DIR="/srv/ai-debate/${TOKEN}/ai-debate"
     CONF_DIR="/etc/ai-debate/${TOKEN}"
+    METADATA_FILE="/etc/ai-debate/.install-paths"
   else
     TEST_ROOT="${WORK}/test-root"
     install -d -m 0700 -o root -g root "$TEST_ROOT"
@@ -66,6 +68,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
     PREFIX="${TEST_ROOT}/prefix/ai-debate"
     DATA_DIR="${TEST_ROOT}/data/ai-debate"
     CONF_DIR="${TEST_ROOT}/conf/ai-debate"
+    METADATA_FILE="${TEST_ROOT}/.install-paths"
   fi
 else
   DATA_DIR="${WORK}/data"
@@ -197,6 +200,11 @@ if [[ "$(id -u)" -eq 0 ]]; then
   [[ "$(stat -c '%U:%G:%a' "${CONF_DIR}/ai-debate.env")" == "root:ai-debate:640" ]] \
     && pass "env 为 root:ai-debate 0640" || fail "env 权限不正确"
   [[ -f /etc/systemd/system/ai-debate.service ]] && pass "已安装渲染后的 systemd unit" || fail "systemd unit 未安装"
+  [[ "$(stat -c '%U:%G:%a' "$METADATA_FILE")" == "root:root:640" ]] \
+    && grep -Fqx "AI_DEBATE_PREFIX=${PREFIX}" "$METADATA_FILE" \
+    && grep -Fqx "AI_DEBATE_HOME=${DATA_DIR}" "$METADATA_FILE" \
+    && grep -Fqx "AI_DEBATE_CONF_DIR=${CONF_DIR}" "$METADATA_FILE" \
+    && pass "安装元数据记录自定义路径且权限正确" || fail "安装元数据缺失或不正确"
 
   echo "== 卸载器必须拒绝被篡改的系统目录 =="
   cp /etc/systemd/system/ai-debate.service "${WORK}/good.service"
@@ -423,13 +431,17 @@ if [[ "$SYSTEMD" -eq 1 ]]; then
   [[ ! -e "$PREFIX" ]] && pass "卸载删除自定义 prefix" || fail "自定义 prefix 未删除"
   [[ -f "${DATA_DIR}/state.json" && -f "${CONF_DIR}/ai-debate.env" ]] \
     && pass "卸载保留数据与配置" || fail "卸载删除或丢失数据/配置"
+  [[ -f "$METADATA_FILE" ]] && grep -Fqx "AI_DEBATE_HOME=${DATA_DIR}" "$METADATA_FILE" \
+    && pass "卸载保留自定义路径元数据供后续 purge 使用" || fail "自定义路径元数据未保留"
   [[ ! -e /etc/logrotate.d/ai-debate ]] && pass "卸载清理 logrotate 策略" || fail "logrotate 策略未清理"
 
   echo "== purge 二次确认 =="
   if ( cd "$PKG_DIR" && ./uninstall.sh --purge ) </dev/null >"${WORK}/purge-denied.log" 2>&1; then
     fail "非交互 purge 无二次确认时错误地成功"
   else
-    [[ -f "${DATA_DIR}/state.json" ]] && pass "缺少二次确认时拒绝 purge 且保留数据" || fail "缺少二次确认时数据被删除"
+    grep -Fq "$DATA_DIR" "${WORK}/purge-denied.log" \
+      && [[ -f "${DATA_DIR}/state.json" ]] \
+      && pass "缺少二次确认时读取元数据拒绝 purge 且保留数据" || fail "缺少二次确认时未识别自定义数据目录"
   fi
 
   echo "== 重新安装并验证历史数据 =="
@@ -445,6 +457,7 @@ if [[ "$SYSTEMD" -eq 1 ]]; then
     || { fail "purge 失败"; cat "${WORK}/purge.log"; exit 1; }
   [[ ! -e "$DATA_DIR" && ! -e "$CONF_DIR" && ! -e "$PREFIX" ]] \
     && pass "purge 删除自定义数据、配置与程序目录" || fail "purge 未清理全部自定义目录"
+  [[ ! -e "$METADATA_FILE" ]] && pass "purge 删除安装路径元数据" || fail "purge 后仍残留安装元数据"
   rmdir "/opt/ai-debate/${TOKEN}" 2>/dev/null || true
 elif [[ "$INSTALLED" -eq 1 ]]; then
   echo "== 无 systemd：验证卸载读取测试 unit/env =="
@@ -455,10 +468,13 @@ elif [[ "$INSTALLED" -eq 1 ]]; then
     || { fail "无 systemd 卸载失败"; cat "${WORK}/uninstall.log"; exit 1; }
   [[ -f "${DATA_DIR}/state.json" && -f "${CONF_DIR}/ai-debate.env" && ! -e "$PREFIX" ]] \
     && pass "无 systemd 卸载保留数据与配置" || fail "无 systemd 卸载路径处理错误"
-  if ( cd "$PKG_DIR" && env "${INSTALL_ENV[@]}" ./uninstall.sh --purge ) </dev/null >/dev/null 2>&1; then
+  [[ -f "$METADATA_FILE" ]] && pass "无 systemd 卸载保留测试路径元数据" || fail "无 systemd 测试路径元数据缺失"
+  if ( cd "$PKG_DIR" && env "${INSTALL_ENV[@]}" ./uninstall.sh --purge ) </dev/null >"${WORK}/purge-denied.log" 2>&1; then
     fail "无 systemd purge 无确认时错误地成功"
   else
-    [[ -f "${DATA_DIR}/state.json" ]] && pass "无 systemd purge 同样要求二次确认" || fail "无 systemd purge 删除了数据"
+    grep -Fq "$DATA_DIR" "${WORK}/purge-denied.log" \
+      && [[ -f "${DATA_DIR}/state.json" ]] \
+      && pass "无 systemd purge 从元数据识别自定义路径并要求确认" || fail "无 systemd purge 未识别自定义路径"
   fi
 else
   skip "非 root 环境不验证 systemd 自动恢复与安装/卸载"

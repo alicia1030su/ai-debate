@@ -232,6 +232,10 @@ install -d -m 0755 -o root -g root /etc/systemd/system
 # Re-resolve after mkdir/chown: a path that changed while it was being created is
 # not allowed to redirect the remaining privileged operations.
 validate_deployment_paths "$PREFIX" "$DATA_DIR" "$CONF_DIR" || exit $?
+write_install_metadata || {
+  echo "无法记录安装路径，安装已中止。" >&2
+  exit 1
+}
 
 echo "== 安装程序 =="
 install -m 0755 -o root -g root "${SCRIPT_DIR}/bin/ai-debate" "${PREFIX}/bin/ai-debate"

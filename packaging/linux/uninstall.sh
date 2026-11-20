@@ -31,9 +31,10 @@ Without --purge, removes the program, unit and logrotate policy but keeps all da
 and configuration. --purge requires --confirm-purge as a second, explicit
 confirmation; an interactive terminal may instead type the displayed DELETE line.
 
-Installed PREFIX, DATA_DIR and CONF_DIR are read from the existing unit/env. They
-are validated against the same production path policy as install.sh before any
-recursive deletion. Test installs must pass the same AI_DEBATE_INSTALL_TEST_ROOT.
+Installed PREFIX, DATA_DIR and CONF_DIR are read from the existing unit/env and
+the root-owned path record kept after a non-purge uninstall. They are validated
+against the same production path policy as install.sh before any recursive
+deletion. Test installs must pass the same AI_DEBATE_INSTALL_TEST_ROOT.
 EOF
 }
 
@@ -62,6 +63,10 @@ UNIT_PREFIX=""
 UNIT_DATA=""
 UNIT_WORKDIR=""
 UNIT_CONF=""
+META_PREFIX=""
+META_DATA=""
+META_CONF=""
+METADATA_FILE="$(install_metadata_path)" || exit $?
 if [[ -f "$UNIT" ]]; then
   EXISTING_EXEC="$(read_unit_value "$UNIT" ExecStart "ExecStart")" || exit $?
   if [[ "$EXISTING_EXEC" != */bin/ai-debate\ serve ]]; then
@@ -100,6 +105,27 @@ if [[ -f "$UNIT" ]]; then
   elif [[ -n "$UNIT_WORKDIR" ]]; then
     DATA_DIR="$UNIT_WORKDIR"
   fi
+elif [[ -e "$METADATA_FILE" || -L "$METADATA_FILE" ]]; then
+  if [[ -L "$METADATA_FILE" || ! -f "$METADATA_FILE" ]]; then
+    echo "安装元数据必须是普通文件，拒绝删除：$METADATA_FILE" >&2
+    exit 2
+  fi
+  META_PREFIX="$(read_env_value "$METADATA_FILE" AI_DEBATE_PREFIX "AI_DEBATE_PREFIX")" || exit $?
+  META_DATA="$(read_env_value "$METADATA_FILE" AI_DEBATE_HOME "AI_DEBATE_HOME")" || exit $?
+  META_CONF="$(read_env_value "$METADATA_FILE" AI_DEBATE_CONF_DIR "AI_DEBATE_CONF_DIR")" || exit $?
+  PREFIX="$META_PREFIX"
+  DATA_DIR="$META_DATA"
+  CONF_DIR="$META_CONF"
+fi
+
+if [[ -n "$UNIT_PREFIX" && ( -e "$METADATA_FILE" || -L "$METADATA_FILE" ) ]]; then
+  if [[ -L "$METADATA_FILE" || ! -f "$METADATA_FILE" ]]; then
+    echo "安装元数据必须是普通文件，拒绝删除：$METADATA_FILE" >&2
+    exit 2
+  fi
+  META_PREFIX="$(read_env_value "$METADATA_FILE" AI_DEBATE_PREFIX "AI_DEBATE_PREFIX")" || exit $?
+  META_DATA="$(read_env_value "$METADATA_FILE" AI_DEBATE_HOME "AI_DEBATE_HOME")" || exit $?
+  META_CONF="$(read_env_value "$METADATA_FILE" AI_DEBATE_CONF_DIR "AI_DEBATE_CONF_DIR")" || exit $?
 fi
 
 ENV_FILE="${CONF_DIR}/ai-debate.env"
@@ -125,11 +151,29 @@ validate_deployment_paths "$PREFIX" "$DATA_DIR" "$CONF_DIR" || exit $?
 
 # Every independent record must agree. A tampered or half-upgraded installation
 # must fail closed rather than delete a directory inferred from only one record.
-for recorded_data in "$UNIT_DATA" "$UNIT_WORKDIR" "$ENV_DATA"; do
+for recorded_data in "$UNIT_DATA" "$UNIT_WORKDIR" "$ENV_DATA" "$META_DATA"; do
   if [[ -n "$recorded_data" ]]; then
     recorded_canonical="$(canonical_deployment_path "已记录的数据目录" "$recorded_data")" || exit $?
     if [[ "$recorded_canonical" != "$DATA_DIR" ]]; then
-      echo "unit/env 中的数据目录不一致（${recorded_canonical} != ${DATA_DIR}），拒绝卸载。" >&2
+      echo "unit/env/元数据中的数据目录不一致（${recorded_canonical} != ${DATA_DIR}），拒绝卸载。" >&2
+      exit 2
+    fi
+  fi
+done
+for recorded_prefix in "$UNIT_PREFIX" "$META_PREFIX"; do
+  if [[ -n "$recorded_prefix" ]]; then
+    recorded_canonical="$(canonical_deployment_path "已记录的安装目录" "$recorded_prefix")" || exit $?
+    if [[ "$recorded_canonical" != "$PREFIX" ]]; then
+      echo "unit/元数据中的安装目录不一致（${recorded_canonical} != ${PREFIX}），拒绝卸载。" >&2
+      exit 2
+    fi
+  fi
+done
+for recorded_conf in "$UNIT_CONF" "$META_CONF"; do
+  if [[ -n "$recorded_conf" ]]; then
+    recorded_canonical="$(canonical_deployment_path "已记录的配置目录" "$recorded_conf")" || exit $?
+    if [[ "$recorded_canonical" != "$CONF_DIR" ]]; then
+      echo "unit/元数据中的配置目录不一致（${recorded_canonical} != ${CONF_DIR}），拒绝卸载。" >&2
       exit 2
     fi
   fi
@@ -145,9 +189,16 @@ if [[ "$PURGE" -eq 1 && "$CONFIRM_PURGE" -eq 0 ]]; then
       exit 1
     fi
   else
-    echo "非交互环境下 --purge 还必须附带 --confirm-purge；未删除任何内容。" >&2
+    echo "非交互环境下 --purge 还必须附带 --confirm-purge；数据目录 ${DATA_DIR}，未删除任何内容。" >&2
     exit 1
   fi
+fi
+
+if [[ "$PURGE" -eq 0 ]]; then
+  write_install_metadata || {
+    echo "无法保留安装路径记录，卸载已中止。" >&2
+    exit 1
+  }
 fi
 
 echo "== 停止并禁用服务 =="
@@ -186,6 +237,7 @@ if [[ "$PURGE" -eq 1 ]]; then
   if id -u "${APP_USER}" >/dev/null 2>&1; then
     userdel "${APP_USER}" 2>/dev/null || true
   fi
+  rm -f -- "$METADATA_FILE"
   echo "数据目录 ${DATA_DIR} 与配置目录 ${CONF_DIR} 已删除。"
 else
   echo "== 保留数据 =="

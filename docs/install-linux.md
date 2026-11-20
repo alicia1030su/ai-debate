@@ -18,7 +18,8 @@ sudo ./install.sh
 3. 安装程序到 `/opt/ai-debate/bin/ai-debate`；
 4. 创建数据目录 `/var/lib/ai-debate` 与配置目录 `/etc/ai-debate`；
 5. 按实际路径渲染并校验 `/etc/systemd/system/ai-debate.service`；
-6. 有运行中的 systemd 时执行 `systemctl enable --now ai-debate`；容器中没有 systemd 时仍安装 unit、配置和程序，但不启用服务。
+6. 有运行中的 systemd 时执行 `systemctl enable --now ai-debate`；容器中没有 systemd 时仍安装 unit、配置和程序，但不启用服务；
+7. 记录 root 所有的安装路径元数据，普通卸载后仍可据此定位自定义目录并执行确认后的 purge。
 
 不需要安装 Node.js、DSH、Docker 或 Python。
 
@@ -104,6 +105,7 @@ journalctl -u ai-debate -f
 | `/var/lib/ai-debate/` | 数据：配置、台账、凭据、日志、备份、监控目标（`monitors.json`）与任务台账（`auto-tasks.json`） |
 | `/etc/ai-debate/ai-debate.env` | 监听地址、端口、数据目录 |
 | `/etc/systemd/system/ai-debate.service` | 按实际路径渲染的 systemd 单元 |
+| `/etc/ai-debate/.install-paths` | root 所有的安装路径记录；普通卸载后保留，供后续 `--purge` 找到自定义目录 |
 | `/etc/logrotate.d/ai-debate` | 按实际数据目录生成的日志轮转策略（安装 logrotate 时） |
 
 `/etc/ai-debate/ai-debate.env`：
@@ -142,7 +144,7 @@ sudo ./uninstall.sh            # 删除程序、unit、logrotate；保留数据�
 sudo ./uninstall.sh --purge --confirm-purge  # 永久删除数据与配置
 ```
 
-卸载脚本从已安装 unit/env 读取真实的 `PREFIX`、`DATA_DIR`、`CONF_DIR`，重新执行生产路径白名单校验，再清理自定义路径对应的 logrotate 配置。`--purge` 必须再带 `--confirm-purge`；在交互终端上也可以只给 `--purge`，然后完整输入显示的 `DELETE <数据目录> <配置目录>`。非交互环境下缺少第二重确认会直接失败，不删除任何内容。
+卸载脚本从已安装 unit/env 读取真实的 `PREFIX`、`DATA_DIR`、`CONF_DIR`，重新执行生产路径白名单校验，再清理自定义路径对应的 logrotate 配置。普通卸载会保留 root 所有的 `/etc/ai-debate/.install-paths` 路径记录，因此之后仍可直接运行确认后的 purge，无需记住自定义目录；测试安装的对应记录位于测试根目录。`--purge` 必须再带 `--confirm-purge`；在交互终端上也可以只给 `--purge`，然后完整输入显示的 `DELETE <数据目录> <配置目录>`。非交互环境下缺少第二重确认会直接失败，不删除任何内容。
 
 ## 8. 备份与恢复
 
