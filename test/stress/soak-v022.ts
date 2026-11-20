@@ -97,6 +97,17 @@ export interface CursorWatermark {
   readonly seen: number
 }
 
+export interface LockTimeoutEvent {
+  readonly at: string
+  readonly taskKind: string
+  readonly message: string
+  readonly runningTasks: number
+  readonly holderPid?: number
+  readonly holderAt?: number
+  readonly holderAgeMs?: number
+  readonly holderAlive?: boolean
+}
+
 export interface SoakState {
   readonly version: typeof STATE_VERSION
   startedAt: string
@@ -114,6 +125,11 @@ export interface SoakState {
   duplicateCandidates: number
   lostTasks: number
   lostTaskStrikes: number
+  convergenceLag: number
+  convergenceLagPeak: number
+  stuckIdentity: number
+  coreLockTimeouts: number
+  lockTimeoutEvents: LockTimeoutEvent[]
   cursorRegressions: number
   completedTaskReexecutions: number
   unrecordedInterruptions: number
@@ -147,6 +163,8 @@ export interface SoakState {
   operatorResumes: number
   queueRejections: number
   prunedRows: number
+  stoppedAt?: string
+  acknowledgedFailures: string[]
   invariantFailures: string[]
 }
 
@@ -188,6 +206,11 @@ export interface SoakReport {
   readonly pendingAtEnd: number
   readonly duplicateCandidates: number
   readonly lostTasks: number
+  readonly convergenceLag: number
+  readonly convergenceLagPeak: number
+  readonly stuckIdentity: number
+  readonly coreLockTimeouts: number
+  readonly lockTimeoutEvents: readonly LockTimeoutEvent[]
   readonly cursorRegressions: number
   readonly completedTaskReexecutions: number
   readonly unrecordedInterruptions: number
@@ -212,6 +235,8 @@ export interface SoakReport {
   readonly operatorResumes: number
   readonly queueRejections: number
   readonly prunedRows: number
+  readonly stoppedAt?: string
+  readonly acknowledgedFailures: readonly string[]
   readonly identities: ReturnType<ReplyIdentityStore['stats']>
   readonly engine?: EngineStatus
   readonly invariants: Readonly<Record<string, boolean>>
@@ -265,6 +290,8 @@ interface ActiveDiskFault {
 interface InvariantResult {
   readonly duplicateCandidates: number
   readonly lostTasks: number
+  readonly convergenceLag: number
+  readonly stuckIdentity: number
   readonly cursorRegressions: number
   readonly completedTaskReexecutions: number
   readonly failures: readonly string[]
@@ -384,6 +411,11 @@ export function createSoakState(input: {
     duplicateCandidates: 0,
     lostTasks: 0,
     lostTaskStrikes: 0,
+    convergenceLag: 0,
+    convergenceLagPeak: 0,
+    stuckIdentity: 0,
+    coreLockTimeouts: 0,
+    lockTimeoutEvents: [],
     cursorRegressions: 0,
     completedTaskReexecutions: 0,
     unrecordedInterruptions: 0,
@@ -417,6 +449,7 @@ export function createSoakState(input: {
     operatorResumes: 0,
     queueRejections: 0,
     prunedRows: 0,
+    acknowledgedFailures: [],
     invariantFailures: [],
   }
 }
@@ -454,6 +487,12 @@ export function loadSoakState(file: string): SoakState {
   }
   parsed.diskStoreActual ??= { auto_tasks: 0, monitors: 0, identities: 0 }
   parsed.diskStoreSkipped ??= { auto_tasks: 0, monitors: 0, identities: 0 }
+  parsed.convergenceLag ??= 0
+  parsed.convergenceLagPeak ??= 0
+  parsed.stuckIdentity ??= 0
+  parsed.coreLockTimeouts ??= 0
+  parsed.lockTimeoutEvents ??= []
+  parsed.acknowledgedFailures ??= []
   return parsed as SoakState
 }
 
@@ -752,8 +791,54 @@ function summarizeSession(session: NonNullable<ReturnType<DebateStore['getSessio
   }
 }
 
+function recordCoreLockTimeout(
+  context: Pick<SoakContext, 'state' | 'tasks'>,
+  error: unknown,
+  taskKind: string,
+): void {
+  const message = error instanceof Error ? error.message : String(error)
+  if (!message.includes('状态写入锁')) return
+  const holder: {
+    holderPid?: number
+    holderAt?: number
+    holderAgeMs?: number
+    holderAlive?: boolean
+  } = {}
+  try {
+    const raw = JSON.parse(readFileSync(join(context.state.dataDir, 'state.json.lock'), 'utf8')) as {
+      pid?: unknown
+      at?: unknown
+    }
+    if (typeof raw.pid === 'number') {
+      holder.holderPid = raw.pid
+      try {
+        process.kill(raw.pid, 0)
+        holder.holderAlive = true
+      } catch {
+        holder.holderAlive = false
+      }
+    }
+    if (typeof raw.at === 'number') {
+      holder.holderAt = raw.at
+      holder.holderAgeMs = Date.now() - raw.at
+    }
+  } catch {
+    // The holder may have released the lock between the timeout and sampling.
+  }
+  const event: LockTimeoutEvent = {
+    at: new Date().toISOString(),
+    taskKind,
+    message,
+    runningTasks: context.tasks.runningCount(),
+    ...holder,
+  }
+  context.state.coreLockTimeouts += 1
+  context.state.lockTimeoutEvents.push(event)
+  context.state.lockTimeoutEvents = context.state.lockTimeoutEvents.slice(-20)
+}
+
 function makeProductApi(
-  context: Pick<SoakContext, 'state' | 'faults' | 'threads' | 'runtime' | 'store'>,
+  context: Pick<SoakContext, 'state' | 'faults' | 'threads' | 'runtime' | 'store' | 'tasks'>,
 ): DebateProductApi {
   const byUrl = new Map(context.threads.map((thread) => [thread.url, thread]))
   return {
@@ -776,6 +861,7 @@ function makeProductApi(
         return { sessionId: output.sessionId }
       } catch (error) {
         context.state.failures += 1
+        recordCoreLockTimeout(context, error, 'analyze')
         throw error
       }
     },
@@ -796,6 +882,7 @@ function makeProductApi(
         }
       } catch (error) {
         context.state.failures += 1
+        recordCoreLockTimeout(context, error, 'generate')
         throw error
       }
     },
@@ -847,24 +934,46 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
   }
 
   const activeKeys = new Set<string>()
+  const terminalKeys = new Set<string>()
   for (const task of tasks.all()) {
-    if (task.state !== 'pending' && task.state !== 'running' && task.state !== 'retry_wait') continue
-    if (task.identityKey !== undefined) activeKeys.add(task.identityKey)
-    for (const key of task.identityKeys ?? []) activeKeys.add(key)
+    const keys = [task.identityKey, ...(task.identityKeys ?? [])].filter((key): key is string => key !== undefined)
+    if (task.state === 'pending' || task.state === 'running' || task.state === 'retry_wait') {
+      for (const key of keys) activeKeys.add(key)
+    } else {
+      for (const key of keys) terminalKeys.add(key)
+    }
   }
   const activeReplyCoordinates = new Set<string>()
   for (const entry of entries) {
     if (!activeKeys.has(entry.key)) continue
     activeReplyCoordinates.add(`${entry.platform}:${entry.threadId}:${entry.postId}`)
   }
-  let lostTasks = identities.orphans(activeKeys).length
+  const terminalReplyCoordinates = new Set<string>()
+  for (const entry of entries) {
+    if (!terminalKeys.has(entry.key)) continue
+    terminalReplyCoordinates.add(`${entry.platform}:${entry.threadId}:${entry.postId}`)
+  }
+  let lostTasks = 0
+  let convergenceLag = 0
+  let stuckIdentity = 0
+  const classifyUnconverged = (key: string): void => {
+    if (activeReplyCoordinates.has(key)) {
+      convergenceLag += 1
+      return
+    }
+    if (terminalReplyCoordinates.has(key)) stuckIdentity += 1
+    else lostTasks += 1
+  }
+  for (const identity of identities.orphans(activeKeys)) {
+    classifyUnconverged(`${identity.platform}:${identity.threadId}:${identity.postId}`)
+  }
   for (const identity of entries) {
     if (identity.state !== 'candidate') continue
     const key = `${identity.platform}:${identity.threadId}:${identity.postId}`
-    if (!candidatesByReply.has(key) && !activeReplyCoordinates.has(key)) lostTasks += 1
+    if (!candidatesByReply.has(key)) classifyUnconverged(key)
   }
   for (const key of candidatesByReply.keys()) {
-    if (identityByReply.get(key)?.state !== 'candidate' && !activeReplyCoordinates.has(key)) lostTasks += 1
+    if (identityByReply.get(key)?.state !== 'candidate') classifyUnconverged(key)
   }
   for (const monitor of monitors.list()) {
     for (const postId of monitor.seen) {
@@ -876,7 +985,7 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
         quality: 'stable',
         fingerprint: '',
       })
-      if (!identities.get(key)) lostTasks += 1
+      if (!identities.get(key)) classifyUnconverged(`${monitor.platform}:${monitor.threadId}:${postId}`)
     }
   }
 
@@ -922,6 +1031,7 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
   if (state.unhandledErrors > 0) failures.push(`发生 ${state.unhandledErrors} 个未处理异常`)
   if (state.unrecordedInterruptions > 0) failures.push(`${state.unrecordedInterruptions} 个中断任务没有恢复记录`)
   if (state.storeCorruptions > 0) failures.push(`检测到 ${state.storeCorruptions} 次 store 损坏`)
+  if (stuckIdentity > 0) failures.push(`${stuckIdentity} 个身份的覆盖任务已终态但仍未收敛`)
   if (lostTasks > 0 && !allowTransientLostTasks) {
     state.lostTaskStrikes += 1
     if (state.lostTaskStrikes >= 3) failures.push(`${lostTasks} 个已发现回复连续三轮缺少身份或任务记录`)
@@ -931,10 +1041,13 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
 
   state.duplicateCandidates = duplicateCandidates
   state.lostTasks = lostTasks
+  state.convergenceLag = convergenceLag
+  state.convergenceLagPeak = Math.max(state.convergenceLagPeak, convergenceLag)
+  state.stuckIdentity = stuckIdentity
   state.cursorRegressions += cursorRegressions
   state.completedTaskReexecutions = completedTaskReexecutions
   for (const failure of failures) addInvariantFailure(state, failure)
-  return { duplicateCandidates, lostTasks, cursorRegressions, completedTaskReexecutions, failures }
+  return { duplicateCandidates, lostTasks, convergenceLag, stuckIdentity, cursorRegressions, completedTaskReexecutions, failures }
 }
 
 function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'failed'): SoakReport {
@@ -955,6 +1068,7 @@ function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'f
     heapWithinThreshold: state.memoryPeakMb <= MAX_HEAP_MB,
     noUnhandledErrors: state.unhandledErrors === 0,
     noLostTasks: state.lostTasks === 0,
+    noStuckIdentity: state.stuckIdentity === 0,
     noStoreCorruption: state.storeCorruptions === 0,
     diskFailuresDegraded: state.undegradedDiskSessions === 0,
   }
@@ -1000,6 +1114,11 @@ function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'f
     pendingAtEnd: queue.byState.pending + queue.byState.retry_wait + queue.byState.running,
     duplicateCandidates: state.duplicateCandidates,
     lostTasks: state.lostTasks,
+    convergenceLag: state.convergenceLag,
+    convergenceLagPeak: state.convergenceLagPeak,
+    stuckIdentity: state.stuckIdentity,
+    coreLockTimeouts: state.coreLockTimeouts,
+    lockTimeoutEvents: state.lockTimeoutEvents.map((event) => ({ ...event })),
     cursorRegressions: state.cursorRegressions,
     completedTaskReexecutions: state.completedTaskReexecutions,
     unrecordedInterruptions: state.unrecordedInterruptions,
@@ -1026,6 +1145,8 @@ function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'f
     operatorResumes: state.operatorResumes,
     queueRejections: state.queueRejections,
     prunedRows: state.prunedRows,
+    ...(state.stoppedAt === undefined ? {} : { stoppedAt: state.stoppedAt }),
+    acknowledgedFailures: [...state.acknowledgedFailures],
     identities: identities.stats(),
     engine: engine.status(),
     invariants,
@@ -1104,6 +1225,9 @@ async function buildContext(options: SoakOptions): Promise<SoakContext> {
     }
     state.completed = false
     if (options.acknowledgeFailures) {
+      for (const failure of state.invariantFailures) {
+        if (!state.acknowledgedFailures.includes(failure)) state.acknowledgedFailures.push(failure)
+      }
       state.invariantFailures = []
       state.lostTaskStrikes = 0
     }
@@ -1258,7 +1382,7 @@ async function buildContext(options: SoakOptions): Promise<SoakContext> {
   })
   const runtime = buildRuntime(() => resolveConfig(config), quiet as never, registry, undefined, { store })
   await store.ready()
-  const api = makeProductApi({ state, faults, threads, runtime, store })
+  let api: DebateProductApi | undefined
   const engine = new AutomationEngine({
     monitors,
     tasks,
@@ -1271,6 +1395,7 @@ async function buildContext(options: SoakOptions): Promise<SoakContext> {
     concurrency: 4,
     perPlatformConcurrency: 4,
   })
+  api = makeProductApi({ state, faults, threads, runtime, store, tasks })
   engine.start()
   saveSoakState(stateFile, state)
   return {
@@ -1630,6 +1755,7 @@ async function runSoak(options: SoakOptions): Promise<void> {
     if (fatalError !== undefined) addInvariantFailure(state, fatalError)
     state.completed = state.invariantFailures.length === 0 && fatalError === undefined
     state.lastTickAt = new Date().toISOString()
+    if (!state.completed) state.stoppedAt ??= state.lastTickAt
     state.faults = faults.snapshot()
     saveSoakState(context.stateFile, state)
     const report = reportOf(context, Date.now(), state.completed ? 'passed' : 'failed')
@@ -1650,6 +1776,7 @@ async function runSoak(options: SoakOptions): Promise<void> {
       addInvariantFailure(context.state, fatalError)
       context.state.completed = false
       context.state.lastTickAt = new Date().toISOString()
+      context.state.stoppedAt ??= context.state.lastTickAt
       context.state.faults = context.faults.snapshot()
       try {
         saveSoakState(context.stateFile, context.state)
@@ -1701,6 +1828,11 @@ async function runSoak(options: SoakOptions): Promise<void> {
         pendingAtEnd: 0,
         duplicateCandidates: 0,
         lostTasks: 0,
+        convergenceLag: 0,
+        convergenceLagPeak: 0,
+        stuckIdentity: 0,
+        coreLockTimeouts: 0,
+        lockTimeoutEvents: [],
         cursorRegressions: 0,
         completedTaskReexecutions: 0,
         unrecordedInterruptions: 0,
@@ -1725,6 +1857,7 @@ async function runSoak(options: SoakOptions): Promise<void> {
         operatorResumes: 0,
         queueRejections: 0,
         prunedRows: 0,
+        acknowledgedFailures: [],
         identities: { total: 0, claimed: 0, candidate: 0, ignored: 0, fallback: 0 },
         invariants: { startupCompleted: false },
         invariantFailures: [fatalError],
