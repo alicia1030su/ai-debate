@@ -196,7 +196,9 @@ cb3b14f0dc52ff5d579e64df5e0e21eff051c62291dcde162d48cda9a16cedcf  AI-Debate-wind
 
 `releases/latest` 返回 `v0.2.1`，`prerelease=false`、`draft=false`；v0.2.0 的三个附件摘要与发布时一致，未被改动。
 
-**这一作业的最后一步在 v0.2.1 首次运行时失败**，原因是 `gh release view --json` 没有 `isLatest` 字段（`Unknown JSON field`）。这是校验脚本的错误，不是附件或产品的问题；同一作业里的下载、校验和、解包扫描都已通过。工作流已改为查询 `/releases/latest`，本文件发布后由 API 复核上面三项。
+**这个作业在 v0.2.1 的发布运行中整体标记为失败**：最后一步 `gh release view --json isLatest` 报 `Unknown JSON field`（该字段不存在）。这是校验脚本的错误，不是附件或产品的问题——同一作业里排在前面的「下载附件」「`sha256sum -c`」「解包并扫描」三步都通过了。
+
+发布本身（`Publish the release` 作业）是成功的；工作流已在 `main` 上改为查询 `/releases/latest`（commit `78695cc`），但 v0.2.1 的 tag 指向 `ca549cbf`，重跑那次工作流仍会执行旧脚本，因此这次运行的红叉保留在历史上，不做掩盖。上面三项结论是用 API 与 runner 日志复核的，不是用那一步的绿勾。
 
 本机无法直接下载附件（到 GitHub Release 的连接在 40 MB 处中断），因此「重新下载并核对」的证据来自 runner，而不是构建机。
 
