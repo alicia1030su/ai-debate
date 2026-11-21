@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { sha256, verifyReleaseSignoff } from '../scripts/verify-release-signoff.mjs'
+import { runViewArguments, sha256, verifyReleaseSignoff } from '../scripts/verify-release-signoff.mjs'
 
 const REQUIRED_FREEZE_FILES = [
   'package.json',
@@ -53,8 +53,8 @@ function json(root, path, value) {
 function successfulRun(candidateCommit, overrides = {}) {
   return {
     headSha: candidateCommit,
+    status: 'completed',
     conclusion: 'success',
-    completedAt: '2026-11-22T12:00:00Z',
     jobs: REQUIRED_JOBS.map((name) => ({ name, status: 'completed', conclusion: 'success', completedAt: '2026-11-22T11:59:00Z' })),
     ...overrides,
   }
@@ -322,15 +322,45 @@ test('签字拒绝 Tag 修改产品/构建文件', (t) => {
   assert.match(result.errors.join('\n'), /产品\/构建文件/)
 })
 
-test('签字拒绝 CI headSha 不匹配、job 缺失或 completedAt 缺失', (t) => {
+test('gh run view 参数只请求真实支持字段', () => {
+  const args = runViewArguments(123)
+  assert.deepEqual(args, ['run', 'view', '123', '--json', 'headSha,conclusion,status,jobs'])
+  const fields = args[args.indexOf('--json') + 1].split(',')
+  assert.ok(!fields.includes('updatedAt'))
+  assert.ok(!fields.includes('completedAt'))
+})
+
+test('签字拒绝 CI 状态、job 状态与完成时间不一致', (t) => {
   const context = fixture(t)
   assert.match(verify(context, successfulRun('b'.repeat(40))).errors.join('\n'), /CI headSha/)
+  assert.match(verify(context, successfulRun(context.candidateCommit, { status: 'in_progress' })).errors.join('\n'), /CI status/)
+  assert.match(verify(context, successfulRun(context.candidateCommit, { conclusion: 'failure' })).errors.join('\n'), /CI conclusion/)
+
   const missingJob = successfulRun(context.candidateCommit)
   missingJob.jobs.pop()
   assert.match(verify(context, missingJob).errors.join('\n'), /job 集合/)
-  const missingCompleted = successfulRun(context.candidateCommit)
-  delete missingCompleted.completedAt
-  assert.match(verify(context, missingCompleted).errors.join('\n'), /completedAt/)
+
+  const runningJob = successfulRun(context.candidateCommit)
+  runningJob.jobs[0].status = 'in_progress'
+  assert.match(verify(context, runningJob).errors.join('\n'), /CI job .* status/)
+
+  const failedJob = successfulRun(context.candidateCommit)
+  failedJob.jobs[0].conclusion = 'failure'
+  assert.match(verify(context, failedJob).errors.join('\n'), /CI job .* conclusion/)
+
+  const missingJobCompleted = successfulRun(context.candidateCommit)
+  delete missingJobCompleted.jobs[0].completedAt
+  assert.match(verify(context, missingJobCompleted).errors.join('\n'), /CI job .* completedAt/)
+
+  const invalidJobCompleted = successfulRun(context.candidateCommit)
+  invalidJobCompleted.jobs[0].completedAt = 'not-a-date'
+  assert.match(verify(context, invalidJobCompleted).errors.join('\n'), /CI job .* completedAt/)
+
+  const mismatchedRunCompleted = successfulRun(context.candidateCommit, { completedAt: '2026-11-22T12:00:01Z' })
+  assert.match(verify(context, mismatchedRunCompleted).errors.join('\n'), /completedAt 与必需 job 完成时间不一致/)
+  const matchingRunCompleted = successfulRun(context.candidateCommit, { completedAt: '2026-11-22T11:59:00Z' })
+  assert.equal(verify(context, matchingRunCompleted).ok, true)
+
   const extraJob = successfulRun(context.candidateCommit)
   extraJob.jobs.push({ name: 'Unexpected', status: 'completed', conclusion: 'success', completedAt: '2026-11-22T11:59:00Z' })
   assert.match(verify(context, extraJob).errors.join('\n'), /job 集合/)

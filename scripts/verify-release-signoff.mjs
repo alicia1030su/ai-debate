@@ -363,8 +363,12 @@ function verifyQaReport(root, signoff) {
   }
 }
 
+export function runViewArguments(runId) {
+  return ['run', 'view', String(runId), '--json', 'headSha,conclusion,status,jobs']
+}
+
 function defaultRunVerifier(repo, runId) {
-  const output = execFileSync('gh', ['run', 'view', String(runId), '--repo', repo, '--json', 'headSha,conclusion,completedAt,jobs'], {
+  const output = execFileSync('gh', [...runViewArguments(runId), '--repo', repo], {
     encoding: 'utf8',
     env: process.env,
   })
@@ -382,13 +386,12 @@ function verifyGithubRun(signoff, runVerifier) {
     throw new Error('签字 QA requiredJobs 与必需 job 集合不一致')
   }
   const run = runVerifier(repo, signoff.qa.runId)
+  requireEqual(run.status, 'completed', 'CI status')
   requireEqual(run.headSha, signoff.candidateCommit, 'CI headSha')
   requireEqual(run.conclusion, 'success', 'CI conclusion')
-  if (typeof run.completedAt !== 'string' || Number.isNaN(Date.parse(run.completedAt))) {
-    throw new Error('CI completedAt 缺失或无效')
-  }
   const jobs = new Map((run.jobs ?? []).map((job) => [job.name, job]))
   if (jobs.size !== REQUIRED_JOBS.length) throw new Error(`CI job 集合不是精确的 ${REQUIRED_JOBS.length} 项`)
+  let derivedCompletedAtMs = 0
   for (const name of REQUIRED_JOBS) {
     const job = jobs.get(name)
     if (job === undefined) throw new Error(`CI 缺少必需 job：${name}`)
@@ -397,6 +400,13 @@ function verifyGithubRun(signoff, runVerifier) {
     if (typeof job.completedAt !== 'string' || Number.isNaN(Date.parse(job.completedAt))) {
       throw new Error(`CI job ${name} completedAt 缺失或无效`)
     }
+    derivedCompletedAtMs = Math.max(derivedCompletedAtMs, Date.parse(job.completedAt))
+  }
+  if (run.completedAt !== undefined) {
+    if (typeof run.completedAt !== 'string' || Number.isNaN(Date.parse(run.completedAt))) {
+      throw new Error('CI completedAt 缺失或无效')
+    }
+    if (Date.parse(run.completedAt) !== derivedCompletedAtMs) throw new Error('CI completedAt 与必需 job 完成时间不一致')
   }
 }
 
