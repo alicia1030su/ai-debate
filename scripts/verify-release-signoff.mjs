@@ -389,7 +389,14 @@ function verifyGithubRun(signoff, runVerifier) {
   requireEqual(run.status, 'completed', 'CI status')
   requireEqual(run.headSha, signoff.candidateCommit, 'CI headSha')
   requireEqual(run.conclusion, 'success', 'CI conclusion')
-  const jobs = new Map((run.jobs ?? []).map((job) => [job.name, job]))
+  if (!Array.isArray(run.jobs) || run.jobs.length !== REQUIRED_JOBS.length) {
+    throw new Error(`CI job 集合不是精确的 ${REQUIRED_JOBS.length} 项`)
+  }
+  const jobs = new Map()
+  for (const job of run.jobs) {
+    if (jobs.has(job.name)) throw new Error(`CI job 名称重复：${job.name}`)
+    jobs.set(job.name, job)
+  }
   if (jobs.size !== REQUIRED_JOBS.length) throw new Error(`CI job 集合不是精确的 ${REQUIRED_JOBS.length} 项`)
   let derivedCompletedAtMs = 0
   for (const name of REQUIRED_JOBS) {

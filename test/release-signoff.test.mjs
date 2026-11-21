@@ -364,6 +364,10 @@ test('签字拒绝 CI 状态、job 状态与完成时间不一致', (t) => {
   const extraJob = successfulRun(context.candidateCommit)
   extraJob.jobs.push({ name: 'Unexpected', status: 'completed', conclusion: 'success', completedAt: '2026-11-22T11:59:00Z' })
   assert.match(verify(context, extraJob).errors.join('\n'), /job 集合/)
+
+  const duplicateJob = successfulRun(context.candidateCommit)
+  duplicateJob.jobs[duplicateJob.jobs.length - 1].name = duplicateJob.jobs[0].name
+  assert.match(verify(context, duplicateJob).errors.join('\n'), /job 名称重复/)
 })
 
 test('签字拒绝阈值篡改、严格不变量非零与 QA 最终 EXE 复验次数不足', (t) => {
