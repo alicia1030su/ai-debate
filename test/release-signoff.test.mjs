@@ -319,12 +319,27 @@ test('签字拒绝受保护工作树脏改动', (t) => {
   assert.match(result.errors.join('\n'), /受保护路径存在未提交改动/)
 })
 
+test('签字拒绝受保护路径 index-only 改动', (t) => {
+  const context = fixture(t)
+  const productFile = join(context.root, 'packages/core/src/store.ts')
+  const original = readFileSync(productFile, 'utf8')
+  writeFileSync(productFile, `${original}\n// index-only change\n`)
+  git(context.root, 'add', 'packages/core/src/store.ts')
+  writeFileSync(productFile, original)
+  const result = verify(context)
+  assert.equal(result.ok, false)
+  assert.match(result.errors.join('\n'), /受保护路径存在未提交改动/)
+})
+
 test('签字拒绝受保护路径未跟踪文件', (t) => {
   const context = fixture(t)
   write(context.root, 'packages/core/src/untracked.ts', 'export const untracked = true\n')
+  write(context.root, 'scripts/untracked.mjs', 'export const untracked = true\n')
   const result = verify(context)
   assert.equal(result.ok, false)
   assert.match(result.errors.join('\n'), /受保护路径存在未跟踪文件/)
+  assert.match(result.errors.join('\n'), /packages\/core\/src\/untracked\.ts/)
+  assert.match(result.errors.join('\n'), /scripts\/untracked\.mjs/)
 })
 
 test('签字允许 docs/evidence 未跟踪证据文件', (t) => {

@@ -443,6 +443,7 @@ function verifyCommitBinding(root, signoff, currentCommit) {
   }
   try {
     execFileSync('git', ['diff', '--quiet', 'HEAD', '--', ...PROTECTED_PATHS], { cwd: root })
+    execFileSync('git', ['diff', '--cached', '--quiet', 'HEAD', '--', ...PROTECTED_PATHS], { cwd: root })
   } catch {
     throw new Error('受保护路径存在未提交改动')
   }
