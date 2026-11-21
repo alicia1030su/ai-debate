@@ -446,6 +446,10 @@ function verifyCommitBinding(root, signoff, currentCommit) {
   } catch {
     throw new Error('受保护路径存在未提交改动')
   }
+  const untrackedProtected = git(root, ['ls-files', '--others', '--exclude-standard', '-z', '--', ...PROTECTED_PATHS])
+    .split('\0')
+    .filter((path) => path !== '')
+  if (untrackedProtected.length > 0) throw new Error(`受保护路径存在未跟踪文件：${untrackedProtected.join(', ')}`)
   execFileSync('git', ['diff', '--quiet', signoff.candidateCommit, currentCommit, '--', ...PROTECTED_PATHS], { cwd: root })
 }
 

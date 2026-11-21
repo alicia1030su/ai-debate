@@ -319,6 +319,21 @@ test('签字拒绝受保护工作树脏改动', (t) => {
   assert.match(result.errors.join('\n'), /受保护路径存在未提交改动/)
 })
 
+test('签字拒绝受保护路径未跟踪文件', (t) => {
+  const context = fixture(t)
+  write(context.root, 'packages/core/src/untracked.ts', 'export const untracked = true\n')
+  const result = verify(context)
+  assert.equal(result.ok, false)
+  assert.match(result.errors.join('\n'), /受保护路径存在未跟踪文件/)
+})
+
+test('签字允许 docs/evidence 未跟踪证据文件', (t) => {
+  const context = fixture(t)
+  write(context.root, 'docs/evidence/extra-evidence.txt', 'pending audit attachment\n')
+  const result = verify(context)
+  assert.equal(result.ok, true, result.errors.join('\n'))
+})
+
 test('签字拒绝被篡改的 Soak 证据字节', (t) => {
   const context = fixture(t)
   write(context.root, 'docs/evidence/soak-report.json', '{"status":"passed","completed":true}\n')
