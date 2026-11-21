@@ -183,7 +183,15 @@ function createElfBaselineMatcher(target, baseline) {
   }
   const similarity = allocatableBytes === 0 ? 0 : matchedAllocatableBytes / allocatableBytes
   if (similarity < MIN_BASELINE_SIMILARITY) {
-    throw new Error(`ELF 目标与 Node 基线可加载节匹配不足 ${(MIN_BASELINE_SIMILARITY * 100).toFixed(0)}%，拒绝按基线扫描`)
+    const unmatched = baselineSections
+      .filter((section) => section.size > 0 && (section.flags & 0x2) !== 0 && !matchedBaselineSections.has(section))
+      .map((section) => `${section.name || '(unnamed)'}:${section.size}`)
+      .slice(0, 12)
+      .join(', ')
+    throw new Error(
+      `ELF 目标与 Node 基线可加载节匹配不足 ${(MIN_BASELINE_SIMILARITY * 100).toFixed(0)}%`
+      + `（实际 ${(similarity * 100).toFixed(2)}%；未匹配 ${unmatched}），拒绝按基线扫描`,
+    )
   }
   return {
     similarity,
