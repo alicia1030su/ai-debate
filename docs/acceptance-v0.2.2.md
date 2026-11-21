@@ -8,10 +8,10 @@
 
 - 仓库：`ai-debate`，版本 `0.2.2`。
 - 本机：Windows x64，Node.js `22.22.2`；CI 固定 Node.js `22.18.0`。
-- 最终候选冻结基线：UTC 2026-11-21 10:01:17；冻结清单见 `.tmp-data/soak-v022-continuous-final-20261121T100117Z/freeze.txt`。
-- 最终 `packages/server/src/monitor/engine.ts` SHA256：`8edbe73ffdad754daa23df220723616f06c76dc84ba54ee5e2747d0d798dab9b`。
-- 最终 `packages/server/test/monitor-engine.test.ts` SHA256：`c6b040188011180ff44db58e0fc66f8bbb4053cac5b3206be07ead4de8c6b473`。
-- 最终 `test/stress/soak-v022.ts` SHA256：`79fe364ca636eeee50fbd9ae1a150d73c92bf60d5c30a6a19f80861a6d36aa58`。
+- 最终候选冻结基线：UTC 2026-11-21 12:03:04；冻结清单见 `.tmp-data/soak-v022-continuous-final-20261121T120304Z/freeze.txt`。
+- 最终 `packages/server/src/monitor/engine.ts` SHA256：`5323c87bc66306ba1e825fcf0ab0a5994afd754d05f977c6667f685225307c1c`。
+- 最终 `packages/server/test/monitor-engine.test.ts` SHA256：`0c549bd09b0da69e8b1f2179ba9c1b85aef2694fce791e159bfd264db627b47c`。
+- 最终 `test/stress/soak-v022.ts` SHA256：`14fddcede38f8bbef023570144d958414fb1e71b70e92b42488f220b5b7f4224`。
 - 既有 Windows EXE 构建于最终修复之前，已解除最终资产资格，必须重建；构建、测试与长跑证据不能相互替代。
 - 本次文档回填未 stage、未 commit；只更新六份发布文档，不改动产品代码、测试、工作流或 package 文件，也不把开发期或 CI 待办写成通过。
 
@@ -24,7 +24,7 @@
 | Core | **227/227 通过** | 含 HTTP 出网、manual 重定向、DNS 固定、Abort/429 边界 |
 | Server | **164/164 通过，exit 0** | 最终 server-only 写序修复前执行全量；命令完整输出后本机安全策略附注拦截，未重试 |
 | B1 四文件定向回归 | **74/74 通过** | 最终 Core 候选 |
-| monitor-engine 独立复跑 | **46/46 通过** | 最终写序修复后执行 |
+| monitor-engine 独立复跑 | **47/47 通过** | 最终写序修复后执行 |
 | Web | **12/12 通过** | 自动挂机、备份错误、诊断与未知值展示 |
 | standalone | **27/27 通过** | 脚本化端到端 |
 | automation | **8/8 通过** | 平台为脚本化 double |
@@ -32,13 +32,13 @@
 | paging | **7/7 通过** | 游标/分页 acceptance |
 | 真实 v0.2.1 升级 | **97/97 通过，`identityMigration: "migrated"`，`modelCalls=0`** | 真实 v0.2.1 Windows EXE；v0.2.0 仍为 fixture |
 | 迁移相关 | **38/38 通过** | migrate 20/20 + identities 13/13 + startup-migration 5/5 |
-| 终态身份恢复 | **59/59 通过** | identities 13/13 + monitor-engine 46/46 |
+| 终态身份恢复 | **60/60 通过** | identities 13/13 + monitor-engine 47/47 |
 | Soak harness 自测 | **6/6 通过** | soak-v022 4/4 + soak-faults 2/2；不代替 24h |
-| 秘密扫描器回归 | **10/10 通过** | 仓库秘密扫描通过，覆盖 235 个受版本控制文件；含 ELF 节偏移迁移基线回归 |
+| 秘密扫描器回归 | **12/12 通过** | 仓库秘密扫描通过，覆盖 235 个受版本控制文件；含 ELF 节偏移迁移基线回归 |
 | TypeScript | **`tsc --noEmit` 通过** | B1–B4 修复候选 |
 | 差异检查 | **`git diff --check`、`git diff --cached --check` 均通过** | B1–B4 修复候选 |
 
-以上计数对应当前冻结候选。Server 全量 164/164 完成于最后的 server 写序与计数器修复之前；两项修复后已独立复跑 monitor-engine 46/46、standalone 27/27、真实升级 97/97、Soak 自测 6/6、两组故障 Soak 与类型检查。最终 CI 仍须重新执行全量。
+以上计数对应当前冻结候选。Server 全量 164/164 完成于最后的计数器与发现写序修复之前；修复后已独立复跑 monitor-engine 47/47、standalone 27/27、真实升级 97/97、Soak 自测 6/6、高磁盘故障压力测试、两组故障 Soak 与类型检查。最终 CI 仍须重新执行全量。
 
 ### 2.2 B1 四文件基线
 
@@ -112,10 +112,12 @@
 ### 5.3 最终冻结候选预检与连续 24h 运行
 
 - 第一次“最终”长跑 `.tmp-data/soak-v022-continuous-final-20261121T092929Z/` 在约 22 分钟、4 次 SIGKILL/恢复后因最终 EXE 升级验收暴露计数器回归而主动中止；现场与 `ABORTED.txt` 保留，不计通过。恢复既有候选曾错误调用 `noteOutcome('candidate')`，把历史候选数从 2 增加到 3；现仅新生成且持久化的候选计数，恢复/复用不重复计数。
-- 冻结清单：`.tmp-data/soak-v022-continuous-final-20261121T100117Z/freeze.txt`。
-- 1000 监控、15 秒预检：通过；`generations=2`、`candidates=2`，全部严格不变量为 0；报告 SHA256 `2a7094c73737a6aeab05c8b98f4e94bb3e441d7b64f87e8fe8a810535ea0df41`。
-- 40 监控、`kill-every=4`、15 秒预检：通过；2 次 SIGKILL、2 次恢复，全部严格不变量为 0；报告 SHA256 `916977ed6ce720aa86c989ca33b623018f1ff24c495e21592d197f63a1922dbb`。
-- 全新连续 24h Soak 于 UTC `2026-11-21T10:02:08.346Z` 启动，参数 `monitors=1000`、`seed=1`、`kill-every=300`、`seconds=86400`；状态目录 `.tmp-data/soak-v022-continuous-final-20261121T100117Z/`。当前正在运行，尚未取得最终报告。
+- 第二次长跑 `.tmp-data/soak-v022-continuous-final-20261121T100117Z/` 在 5553.25 秒、18 次 SIGKILL/恢复后因 `lostTasks=1` 失败；其余严格不变量为 0。根因是分析任务入队失败被吞掉后游标仍推进，回复被当作已知并依赖延迟孤儿恢复。现发现顺序改为 identity → analysis task → cursor，任务写失败时游标不推进；现场与 `ABORTED.txt` 保留。
+- 60 秒高磁盘故障压力测试通过：4 次 SIGKILL/恢复、实际磁盘写故障 1 次，所有严格不变量为 0；报告 SHA256 `3e7798e8b4307bf28aefdae357f07ae73e6ebd3ff3734c11411ee4a16655cbd9`。
+- 冻结清单：`.tmp-data/soak-v022-continuous-final-20261121T120304Z/freeze.txt`。
+- 1000 监控、15 秒预检：通过；`generations=2`、`candidates=2`，全部严格不变量为 0；报告 SHA256 `09274cef17918b329f18938147dbec9e5a904e4835a2623dab1a55fdb391cd4f`。
+- 40 监控、`kill-every=4`、15 秒预检：通过；2 次 SIGKILL、2 次恢复，全部严格不变量为 0；报告 SHA256 `90b4f1a6ae388abeb97f81381538d204754d73f8638b862c006aacf51c493e26`。
+- 全新连续 24h Soak 于 UTC `2026-11-21T12:05:15.222Z` 启动，参数 `monitors=1000`、`seed=1`、`kill-every=300`、`seconds=86400`；状态目录 `.tmp-data/soak-v022-continuous-final-20261121T120304Z/`。当前正在运行，尚未取得最终报告。
 
 ## 6. 发布资产、工作流与 CI
 
@@ -123,13 +125,13 @@
 - 最终 EXE 本地重建被 WorkBuddy 批量删除安全守卫阻断（`packages/core/lib` 276 个文件，超过阈值）；未绕过守卫，最终 Windows/Linux 资产改由 CI 打包 job 产出并复验。
 - 最终源码 bundle 的 standalone **27/27**、真实升级 **97/97** 已通过；`verify-release.mjs`、Node 基线秘密扫描、打包后 standalone/launcher 必须在 CI 最终资产上重跑。
 - 注册表自启被本机安全策略阻断，**未计通过**。
-- v0.2.2 CI **尚未运行**；Linux TGZ **尚未构建**；正式 Release/Tag/Latest **尚未完成**。
+- v0.2.2 CI 已多轮运行：三平台 Test、Windows 打包、真实升级、5 分钟 Soak 与秘密扫描均通过；Linux SEA 基线校验已修复为 ELF 节级差分，等待最新一轮完整通过。最终 Linux TGZ、正式 Release/Tag/Latest **尚未完成**。
 - 真实贴吧/微博账号、Debian 12 真实 systemd：**未验证**。
 
 ## 7. 已知限制（P2，后续加固）
 
 - `scripts/scan-secrets.mjs` 默认整文件豁免 scanner 与 `test/acceptance/fixtures/README.md`；这两个文件误存真实凭据时不会被默认扫描发现。
-- 目录扫描模式对 `>4 MiB` 文件、深度 `>8`、文件数 `>5000` 静默跳过；SEA 二进制通过 `--baseline` 单独差分扫描：PE 只放行同偏移、同字节的 Node 运行时原匹配；ELF 按节名和大小配对，要求至少 99% 可加载字节与基线一致；只放行已配对节内对应字节也完全相同的运行时原匹配，新增 note、改写或未匹配区域仍全量扫描。
+- 目录扫描模式对 `>4 MiB` 文件、深度 `>8`、文件数 `>5000` 静默跳过；SEA 二进制通过 `--baseline` 单独差分扫描：PE 只放行同偏移、同字节的 Node 运行时原匹配；ELF 按节名和大小配对，要求至少 99% 可加载代码/静态数据字节与基线一致；只放行已配对节内对应字节也完全相同的运行时原匹配，新增 note、改写或未匹配区域仍全量扫描。
 - 模型请求不是 exactly-once；中断重试可能重复计费/调用。
 - 租约与实例记录不是分布式锁；不支持多实例。
 - manual/pre-restore 备份永不自动删除；长期运行需关注磁盘。
@@ -145,8 +147,8 @@ B1–B4 与新增 Soak/持久化阻断均已关闭，**最终架构复审 IS_PAS
 
 1. **B1 DNS 固定：已关闭。** 首次 socket lookup 固定 A/AAAA，后续连接复用；生产 fetch 使用 dispatcher 时同源重定向不重复解析，新 host 逐跳校验，策略变严仍复验。四文件定向 74/74，Core 227/227。
 2. **B2 未知任务 kind 熔断：已关闭。** 迁移全量枚举校验任务 kind，未知值熔断且不写 `migration.complete`；migrate 20/20。
-3. **B3 身份台账严格校验：已关闭。** 非法 `candidateId` 被拒绝，engine 回到核心会话核验候选证据；identities 13/13、monitor-engine 46/46。
-4. **B4 候选/analyze 双台账收敛：已关闭。** `candidateId` 仅作核心 session 提示，candidate 与 completed analyze 执行无模型对账，并在 await 后/finish 前重查 `needs_review` 防止异步竞态；终态身份恢复 59/59。
+3. **B3 身份台账严格校验：已关闭。** 非法 `candidateId` 被拒绝，engine 回到核心会话核验候选证据；identities 13/13、monitor-engine 47/47。
+4. **B4 候选/analyze 双台账收敛：已关闭。** `candidateId` 仅作核心 session 提示，candidate 与 completed analyze 执行无模型对账，并在 await 后/finish 前重查 `needs_review` 防止异步竞态；终态身份恢复 60/60。
 5. **Core 锁与 durable 读取：已关闭。** 同 PID 孤儿 token 可回收，其他活进程 token 不抢占；持久读等待 writeChain 并持锁读盘，不覆盖 dirty 内存。
 6. **幽灵候选与写序：已关闭。** durable absent 才熔断；identity ignored 先于 task failed，反向窗口由 ignored-review pass 无模型补任务；unavailable 保持等待。
 

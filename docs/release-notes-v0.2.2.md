@@ -127,8 +127,8 @@ v0.2.2 的备份包含 `credentials.json` **密文**，但不是“可以公开�
 | 项目 | 当前结果 |
 |---|---|
 | core | 227/227 通过 |
-| server | 164/164 通过，exit 0（最终 server-only 写序修复前）；B1 四文件定向 74/74；monitor-engine 最终修复后 46/46 |
-| 迁移/终态身份 | 迁移 38/38；终态身份恢复 59/59 |
+| server | 164/164 通过，exit 0（最终 server-only 写序修复前）；B1 四文件定向 74/74；monitor-engine 最终修复后 47/47 |
+| 迁移/终态身份 | 迁移 38/38；终态身份恢复 60/60 |
 | web | 12/12 通过 |
 | standalone | 27/27 通过 |
 | automation | 8/8 通过 |
@@ -136,7 +136,7 @@ v0.2.2 的备份包含 `credentials.json` **密文**，但不是“可以公开�
 | paging | 7/7 通过 |
 | upgrade | 97/97 通过，身份迁移 `migrated`（真实 v0.2.1 Windows EXE，modelCalls=0；v0.2.0 为 fixture） |
 | Soak 自测 | 6/6 通过；不代替连续 24h |
-| 秘密扫描 | 仓库扫描通过，235 个受版本控制文件；扫描器回归 10/10；PE 同偏移与 ELF 节级 Node 基线差分均有回归 |
+| 秘密扫描 | 仓库扫描通过，235 个受版本控制文件；扫描器回归 12/12；PE 同偏移与 ELF 节级 Node 基线差分均有回归 |
 | 类型与差异检查 | `tsc --noEmit`、`git diff --check`、`git diff --cached --check` 均通过 |
 
 这些结果对应 UTC 2026-11-21 10:01:17 的最终冻结候选。Server 全量完成于最后一次仅涉及 server 写序的修复之前；该修复后 monitor-engine、Soak 自测、两组故障 Soak 与类型检查均通过。最终 CI 与正式 Release 资产仍待完成。
@@ -147,7 +147,7 @@ v0.2.2 的备份包含 `credentials.json` **密文**，但不是“可以公开�
 - 全模式私网/回环/link-local/metadata 拒绝与 DNS rebinding socket 级固定已通过 Core 227/227；`isPinned` 仅在成功策略校验的 socket lookup 后为 true，忽略 dispatcher 的自定义/注入 fetch 不会触发真实 lookup，代理配置兼容与 CookieJar 属性模型仍是已知边界。
 - Windows 注册表自启在本构建机上受主机策略限制，未验证。
 - Debian 12 的 systemd 生命周期尚未在真实 init 环境验证。
-- 秘密扫描默认整文件豁免 scanner 与 fixtures README，目录模式会跳过 >4 MiB、深度>8、文件数>5000；SEA 二进制通过 `--baseline` 单独差分：PE 只放行 Node 运行时同偏移原字节；ELF 按节名和大小配对，要求至少 99% 可加载字节一致；只放行对应字节也完全相同的运行时原匹配，新增 note、改写或未匹配字节仍拦截。
+- 秘密扫描默认整文件豁免 scanner 与 fixtures README，目录模式会跳过 >4 MiB、深度>8、文件数>5000；SEA 二进制通过 `--baseline` 单独差分：PE 只放行 Node 运行时同偏移原字节；ELF 按节名和大小配对，要求至少 99% 可加载代码/静态数据字节一致；只放行对应字节也完全相同的运行时原匹配，新增 note、改写或未匹配字节仍拦截。
 - 备份中的手动/恢复前副本不会自动清理，长期运行需关注磁盘空间。
 - 日志轮转使用 `copytruncate`，极短的截断/写入窗口可能丢失少量日志。
 - Windows EXE 未代码签名，首次运行可能出现 SmartScreen 提示。
@@ -158,12 +158,12 @@ v0.2.2 的备份包含 `credentials.json` **密文**，但不是“可以公开�
 |---|---|
 | 架构复审 | **最终 IS_PASS YES，B1–B4 与 Soak/持久化阻断全部关闭**；只放行冻结候选进入 24h Soak |
 | 最终候选类型检查 | 通过，退出码 0；最终 Tag 与 CI 待复验 |
-| 24 小时 Soak | **正在运行**。UTC `2026-11-21T10:02:08.346Z` 启动，状态目录 `.tmp-data/soak-v022-continuous-final-20261121T100117Z/`；预检 1000 监控 15s 与 40 监控 2 次 SIGKILL 15s 均通过 |
-| Soak/持久化发布阻断 | **已修复并复审通过**：durable-only 证据、孤儿锁回收、token CAS release、幽灵候选无模型收敛、identity-before-task 写序、恢复既有候选不重复计数 |
-| v0.2.2 CI | **尚未运行** |
+| 24 小时 Soak | **正在运行**。UTC `2026-11-21T12:05:15.222Z` 启动，状态目录 `.tmp-data/soak-v022-continuous-final-20261121T120304Z/`；预检 1000 监控 15s 与 40 监控 2 次 SIGKILL 15s 均通过 |
+| Soak/持久化发布阻断 | **已修复并复审通过**：durable-only 证据、孤儿锁回收、token CAS release、幽灵候选无模型收敛、identity-before-task 写序、恢复既有候选不重复计数、发现任务先于游标持久化 |
+| v0.2.2 CI | **多轮运行中**；三平台 Test、Windows 打包、真实升级、短 Soak 已通过，Linux ELF 基线修复等待最新完整轮次 |
 | 身份自动迁移 | **97/97 `migrated`，modelCalls=0；迁移相关 38/38**；最终 EXE 与 CI `upgrade-real` 待复验 |
 | 最终 Windows EXE | **待重建**。旧 EXE `adfb5112…` 为最终修复前资产，已解除资格 |
-| Linux TGZ | **尚未构建** |
+| Linux TGZ | 已由 CI 构建，但最终 ELF 基线扫描与 systemd 生命周期等待最新完整轮次 |
 | 下载后 SHA256/Latest | **待正式发布后回填** |
 | 真实平台/Windows 自启/Debian systemd | **未验证或受环境限制** |
 

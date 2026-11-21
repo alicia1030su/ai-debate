@@ -983,6 +983,7 @@ export async function inspectInvariants(context: SoakContext, allowTransientLost
   let convergenceLag = 0
   let stuckIdentity = 0
   let authBlockedIdentity = 0
+  const lostCoordinates: string[] = []
   const classifyUnconverged = (key: string): void => {
     if (activeReplyCoordinates.has(key)) {
       convergenceLag += 1
@@ -990,7 +991,10 @@ export async function inspectInvariants(context: SoakContext, allowTransientLost
     }
     if (terminalReplyCoordinates.has(key)) stuckIdentity += 1
     else if (authBlockedReplyCoordinates.has(key)) authBlockedIdentity += 1
-    else lostTasks += 1
+    else {
+      lostTasks += 1
+      if (lostCoordinates.length < 10) lostCoordinates.push(key)
+    }
   }
   for (const identity of entries) {
     if (identity.state === 'claimed' && !activeKeys.has(identity.key)) {
@@ -1064,7 +1068,7 @@ export async function inspectInvariants(context: SoakContext, allowTransientLost
   if (stuckIdentity > 0) failures.push(`${stuckIdentity} 个身份的覆盖任务已终态但仍未收敛`)
   if (lostTasks > 0 && !allowTransientLostTasks) {
     state.lostTaskStrikes += 1
-    if (state.lostTaskStrikes >= 3) failures.push(`${lostTasks} 个已发现回复连续三轮缺少身份或任务记录`)
+    if (state.lostTaskStrikes >= 3) failures.push(`${lostTasks} 个已发现回复连续三轮缺少身份或任务记录：${lostCoordinates.join(', ')}`)
   } else {
     state.lostTaskStrikes = 0
   }

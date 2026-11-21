@@ -29,8 +29,8 @@ function binaryWithKey(key) {
 }
 
 /** Minimal ELF64 fixture; the injected note deliberately shifts later sections. */
-function elfFixture({ noteKey, addNote = noteKey !== undefined, tamperText = false } = {}) {
-  const names = ['', '.text', '.rodata', ...(addNote ? ['.note.node.sea'] : []), '.shstrtab']
+function elfFixture({ noteKey, addNote = noteKey !== undefined, tamperText = false, tamperDynamic = false, dynamicKey } = {}) {
+  const names = ['', '.text', '.rodata', '.dynstr', ...(addNote ? ['.note.node.sea'] : []), '.shstrtab']
   const nameTable = Buffer.from(`${names.join('\0')}\0`)
   const nameOffsets = new Map()
   let cursor = 0
@@ -42,11 +42,15 @@ function elfFixture({ noteKey, addNote = noteKey !== undefined, tamperText = fal
   if (tamperText) text.fill(0x46)
   const rodata = Buffer.alloc(512, 0x44)
   rodata.write(runtimeKey, 64)
+  const dynstr = Buffer.alloc(128, 0x44)
+  if (dynamicKey !== undefined) dynstr.write(dynamicKey, 16)
+  else if (tamperDynamic) dynstr.fill(0x46)
   const note = addNote ? Buffer.alloc(256, 0x45) : undefined
   if (note !== undefined && noteKey !== undefined) note.write(noteKey, 32)
   const contents = [
     { name: '.text', type: 1, flags: 0x6, data: text },
     { name: '.rodata', type: 1, flags: 0x2, data: rodata },
+    { name: '.dynstr', type: 3, flags: 0x2, data: dynstr },
     ...(note === undefined ? [] : [{ name: '.note.node.sea', type: 7, flags: 0, data: note }]),
     { name: '.shstrtab', type: 3, flags: 0, data: nameTable },
   ]
@@ -142,6 +146,30 @@ test('ELF 新增 note 中的密钥必须拦截', (t) => {
   const target = join(dir, 'app.elf')
   writeFileSync(baseline, elfFixture())
   writeFileSync(target, elfFixture({ noteKey: injectedKey }))
+
+  const result = run(['--baseline', baseline, target])
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /AWS access key/)
+})
+
+test('ELF 动态链接元数据重建不削弱运行时派生校验', (t) => {
+  const dir = fixture(t)
+  const baseline = join(dir, 'node.elf')
+  const target = join(dir, 'app.elf')
+  writeFileSync(baseline, elfFixture())
+  writeFileSync(target, elfFixture({ addNote: true, tamperDynamic: true }))
+
+  const result = run(['--baseline', baseline, target])
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /忽略 1 条运行时原字节匹配/)
+})
+
+test('ELF 动态链接元数据中的新增密钥仍必须拦截', (t) => {
+  const dir = fixture(t)
+  const baseline = join(dir, 'node.elf')
+  const target = join(dir, 'app.elf')
+  writeFileSync(baseline, elfFixture())
+  writeFileSync(target, elfFixture({ addNote: true, tamperDynamic: true, dynamicKey: injectedKey }))
 
   const result = run(['--baseline', baseline, target])
   assert.equal(result.status, 1)

@@ -4,7 +4,7 @@
 >
 > 状态：**最终冻结候选回归通过，B1–B4 与 Soak/持久化架构复审 IS_PASS YES；全新连续 24h Soak 正在运行（NO-GO）**。v0.2.2 CI、最终双平台资产与正式 Release/Tag/Latest 仍须回填。
 >
-> 证据基线：UTC 2026-11-21 10:01:17 的最终冻结候选；清单见 `.tmp-data/soak-v022-continuous-final-20261121T100117Z/freeze.txt`。
+> 证据基线：UTC 2026-11-21 12:03:04 的最终冻结候选；清单见 `.tmp-data/soak-v022-continuous-final-20261121T120304Z/freeze.txt`。
 
 ## 1. 可靠性目标与实际保证
 
@@ -227,7 +227,7 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 - QA 快照（UTC 02:14:38）：`completed=false`，lastTickAge `0.037s`，iterations 1331、restarts/kills 4/4、peakQueue 26、peakLedger 278、memoryPeak 45.79 MB。
 - 首次连续运行在 **1881.156s** 后失败，证据保留为 `report-failed-1881s.json`：`stuckIdentity=1`。`stable:faketieba:t016:r4` 于 02:22:24.854Z claim；generate task `55e161ed-01d3-4947-9b4b-4bd35ee4ebd4` attempts=2/maxAttempts=2，模型调用 02:22:48.748→49.874Z uncertain 超时，49.930Z failed/network；monitor `soak-monitor-0016` 最终无 blockedReason；50.889Z soak 失败。这是产品 failed+claimed 缺陷，不是 auth-blocked 误判。
 - Soak harness 新增 `authBlockedIdentity`：仅当任务 `state='blocked'` 且对应 monitor 仍存在 `blockedReason` 时豁免，单独计数；`failed/cancelled/completed/needs_review` 以及 monitor 已不 blocked 的 blocked 任务仍严格计入 `stuckIdentity`。Soak 自测 **6/6 通过**；最终严格短 Soak 预检的 stuck/lost/duplicate/unhandled 全为 0。
-- 产品侧终态任务占用身份已修复：active 集合只计真正覆盖工作的状态，blocked 监控不重排；failed generate 无候选时收敛为 `ignored`，人工 retry 仍可恢复；核心已有候选时直接转 `needs_review`；completed analyze 命中候选时 analyze 转 `needs_review`、generate 创建 0、model call 0；`markCandidate` 写失败保持 completed/claimed，并由 candidate/analyze 无模型对账继续收敛。最终 identities **13/13**、monitor-engine **46/46**，合计 **59/59**。
+- 产品侧终态任务占用身份已修复：active 集合只计真正覆盖工作的状态，blocked 监控不重排；failed generate 无候选时收敛为 `ignored`，人工 retry 仍可恢复；核心已有候选时直接转 `needs_review`；completed analyze 命中候选时 analyze 转 `needs_review`、generate 创建 0、model call 0；`markCandidate` 写失败保持 completed/claimed，并由 candidate/analyze 无模型对账继续收敛。最终 identities **13/13**、monitor-engine **47/47**，合计 **60/60**。
 - 该次失败是历史事实，修复后的短测通过也不能替代 B1–B4 修复候选的连续 24h。
 
 ### 8.4 B1–B4 修复候选连续 24h Soak：302.081s 失败（历史事实）
@@ -248,23 +248,24 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 ### 8.5 最终冻结候选预检与连续 24h 运行
 
 - 第一次最终长跑 `.tmp-data/soak-v022-continuous-final-20261121T092929Z/` 在约 22 分钟后因计数器回归主动中止并失效，现场保留于 `ABORTED.txt`。恢复既有候选曾重复累计 monitor 候选数；现仅正常生成路径计数，恢复/复用不重复计数。
-- 冻结清单：`.tmp-data/soak-v022-continuous-final-20261121T100117Z/freeze.txt`；最终 `engine.ts` SHA256 `8edbe73ffdad754daa23df220723616f06c76dc84ba54ee5e2747d0d798dab9b`。
-- 1000 监控、15 秒预检通过，全部严格不变量为 0；报告 SHA256 `2a7094c73737a6aeab05c8b98f4e94bb3e441d7b64f87e8fe8a810535ea0df41`。
-- 40 监控、`kill-every=4`、15 秒预检通过，2 次 SIGKILL、2 次恢复，全部严格不变量为 0；报告 SHA256 `916977ed6ce720aa86c989ca33b623018f1ff24c495e21592d197f63a1922dbb`。
-- 全新连续 24h Soak 于 UTC `2026-11-21T10:02:08.346Z` 启动，状态目录 `.tmp-data/soak-v022-continuous-final-20261121T100117Z/`；当前正在运行，尚无最终报告。
+- 第二次最终长跑 `.tmp-data/soak-v022-continuous-final-20261121T100117Z/` 在 5553.25 秒、18 次 SIGKILL/恢复后因 `lostTasks=1` 失败。分析任务入队失败曾被吞掉并继续推进游标；现发现顺序为 identity → analysis task → cursor，任务写失败时游标不推进。60 秒高磁盘故障压力测试通过，报告 SHA256 `3e7798e8b4307bf28aefdae357f07ae73e6ebd3ff3734c11411ee4a16655cbd9`。
+- 冻结清单：`.tmp-data/soak-v022-continuous-final-20261121T120304Z/freeze.txt`；最终 `engine.ts` SHA256 `5323c87bc66306ba1e825fcf0ab0a5994afd754d05f977c6667f685225307c1c`。
+- 1000 监控、15 秒预检通过，全部严格不变量为 0；报告 SHA256 `09274cef17918b329f18938147dbec9e5a904e4835a2623dab1a55fdb391cd4f`。
+- 40 监控、`kill-every=4`、15 秒预检通过，2 次 SIGKILL、2 次恢复，全部严格不变量为 0；报告 SHA256 `90b4f1a6ae388abeb97f81381538d204754d73f8638b862c006aacf51c493e26`。
+- 全新连续 24h Soak 于 UTC `2026-11-21T12:05:15.222Z` 启动，状态目录 `.tmp-data/soak-v022-continuous-final-20261121T120304Z/`；当前正在运行，尚无最终报告。
 
 ## 9. 回归证据
 
 ### 9.1 最终冻结候选回归
 
-证据基线为 UTC 2026-11-21 10:01:17。Server 全量完成于最后一次仅涉及 server 写序的修复之前；该修复后已复跑 monitor-engine、Soak 自测、两组故障 Soak 与类型检查，最终 CI 仍须重新执行全量。
+证据基线为 UTC 2026-11-21 12:03:04。Server 全量完成于最后一次仅涉及 server 写序的修复之前；该修复后已复跑 monitor-engine、Soak 自测、两组故障 Soak 与类型检查，最终 CI 仍须重新执行全量。
 
 | 套件/检查 | 结果 | 边界 |
 |---|---|---|
 | Core | **227/227 通过** | 含 DNS 固定、manual 重定向、Cookie 隔离与出网边界 |
 | Server | **164/164 通过，exit 0** | 最终 server-only 写序修复前全量；命令输出后本机安全策略附注拦截，未重试 |
 | B1 四文件定向 | **74/74 通过** | `net-audit.ts`、`platforms/http.ts` 与两份对应测试 |
-| monitor-engine | **46/46 通过** | 最终写序修复后独立复跑 |
+| monitor-engine | **47/47 通过** | 最终写序修复后独立复跑 |
 | Web | **12/12 通过** | 自动挂机、备份错误、诊断与未知值展示 |
 | standalone | **27/27 通过** | 脚本化端到端 |
 | automation | **8/8 通过** | 平台为脚本化 double |
@@ -272,9 +273,9 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 | paging | **7/7 通过** | 游标/分页 acceptance |
 | 真实升级 | **97/97，`identityMigration: "migrated"`，`modelCalls=0`** | 真实 v0.2.1 Windows EXE；v0.2.0 仍为 fixture |
 | 迁移相关 | **38/38** | migrate 20/20 + identities 13/13 + startup-migration 5/5 |
-| 终态身份恢复 | **59/59** | identities 13/13 + monitor-engine 46/46 |
+| 终态身份恢复 | **60/60** | identities 13/13 + monitor-engine 47/47 |
 | Soak harness 自测 | **6/6 通过** | soak-v022 4/4 + soak-faults 2/2；不代替连续 24h |
-| 秘密扫描器回归 | **10/10 通过** | 仓库扫描通过，235 个受版本控制文件；含 ELF 节偏移迁移基线回归 |
+| 秘密扫描器回归 | **12/12 通过** | 仓库扫描通过，235 个受版本控制文件；含 ELF 节偏移迁移基线回归 |
 | 类型与差异检查 | **`tsc --noEmit`、`git diff --check`、`git diff --cached --check` 均通过** | 最终冻结候选 |
 
 ### 9.2 最终修复前 Windows 资产证据（非发布资产）
@@ -290,7 +291,7 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 
 - 文档工程师早期复跑与 QA Round 3 计数均属于历史快照，已被 §9.1 B1–B4 修复候选结果取代，不作为当前结论。
 - 早期复跑使用 `npm run --ignore-scripts <suite>` 以避免重建钩子删除并重建产物；该命令边界仍只适用于对应历史证据。
-- 302.081s 失败现场保留；最终冻结候选的连续 24h Soak 正在运行。v0.2.2 CI 尚未运行；最终 Linux/Windows 资产、下载后复验与 Latest 尚未完成。当前发布判定为 **NO-GO**。
+- 302.081s 与 5553.25s 失败现场均保留；最终冻结候选的连续 24h Soak 正在运行。v0.2.2 CI 多轮运行中，Linux ELF 基线修复等待最新完整轮次；最终 Linux/Windows 资产、下载后复验与 Latest 尚未完成。当前发布判定为 **NO-GO**。
 
 ## 10. 剩余可靠性风险
 
@@ -298,7 +299,8 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 |---|---|---|
 | core 锁 release 瞬时读失败（已修复） | 曾留下活 PID 锁并触发 `coreLockTimeouts` | 同 PID 孤儿 token 回收、token CAS release、清理诊断不覆盖 persist；短测与 24h Soak 复验 |
 | dirty 内存候选被当作持久证据（已修复） | 曾造成 candidate 身份/任务与磁盘 `candidates=0` 不一致 | durable-only 产品 API 与 harness；absent/unavailable 分离；短测与 24h Soak 复验 |
-| 恢复既有候选重复累计 monitor 计数（已修复） | 升级/孤儿恢复把历史候选数再次加一 | 仅正常生成持久候选后计数；恢复/复用不计数；monitor-engine 46/46、真实升级 97/97 |
+| 恢复既有候选重复累计 monitor 计数（已修复） | 升级/孤儿恢复把历史候选数再次加一 | 仅正常生成持久候选后计数；恢复/复用不计数；monitor-engine 47/47、真实升级 97/97 |
+| 发现任务写失败后游标仍推进（已修复） | 回复被当作已知，短暂依赖延迟孤儿恢复并触发 lostTasks | identity → analysis task → cursor；任务写失败传播且游标不推进；monitor-engine 47/47、60 秒高磁盘故障压力测试通过 |
 | 模型请求不是 exactly-once | 中断重试可能重复计费/调用 | 调用前落盘、uncertain 标记、候选去重、人工可见 |
 | 租约不是分布式锁 | 强行多实例会破坏活性与一致性 | 单实例记录、明确不支持多实例 |
 | 全局身份台账无独立 TTL/裁剪 | 长期运行文件可能持续增长 | 24h Soak 与状态中心体积观测；后续需制定保留策略 |
@@ -308,7 +310,7 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 | 有界读取 | 窗口外编辑、超页嵌套与超 `maxFloorPages` 内容可能漏读 | 明确 incomplete 原因、补偿与手动全量 |
 | 真实平台行为未知 | 风控、限流阈值、页面结构可能与 fixture 不同 | 诊断、冷却、失败分类；实号验收未完成 |
 | 身份迁移源损坏 | 以空身份栅栏启动可能重放旧回复 | 启动前迁移；身份/监控源不可读时自动化熔断，服务与健康检查仍可用 |
-| 秘密扫描静默边界 | 允许文件或超大/过深目录可能漏扫 | 默认整文件豁免 scanner 与 fixtures README；目录模式跳过 >4 MiB、深度>8、文件数>5000；SEA 二进制通过 `--baseline` 单独差分：PE 同偏移原字节；ELF 按节名和大小配对，至少 99% 可加载字节一致后，只放行对应字节完全相同的原匹配 |
+| 秘密扫描静默边界 | 允许文件或超大/过深目录可能漏扫 | 默认整文件豁免 scanner 与 fixtures README；目录模式跳过 >4 MiB、深度>8、文件数>5000；SEA 二进制通过 `--baseline` 单独差分：PE 同偏移原字节；ELF 按节名和大小配对，至少 99% 可加载代码/静态数据字节一致后，只放行对应字节完全相同的原匹配 |
 
 ## 11. 运维处置
 

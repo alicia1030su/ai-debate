@@ -49,15 +49,15 @@
 
 | 方法 | 结果 | 边界 |
 |---|---|---|
-| `node scripts/scan-secrets.mjs` | 通过，扫描 **235 个受版本控制文件**；扫描器回归 **10/10**；PE 同偏移与 ELF 节级 Node 基线差分均有回归 | 只识别既定秘密形态；不是数据流证明，且有 §5 R-17 的静默边界 |
-| server 测试 | **全量 164/164，exit 0**；迁移 38/38、终态恢复 59/59 | 全量完成于最终 server-only 写序修复前；命令输出后本机安全策略附注拦截，未重试。写序修复后 monitor-engine 46/46 |
+| `node scripts/scan-secrets.mjs` | 通过，扫描 **235 个受版本控制文件**；扫描器回归 **12/12**；PE 同偏移与 ELF 节级 Node 基线差分均有回归 | 只识别既定秘密形态；不是数据流证明，且有 §5 R-17 的静默边界 |
+| server 测试 | **全量 164/164，exit 0**；迁移 38/38、终态恢复 60/60 | 全量完成于最终 server-only 写序修复前；命令输出后本机安全策略附注拦截，未重试。写序修复后 monitor-engine 47/47 |
 | core 测试 | **227/227 通过**；B1 四文件定向 **74/74** | 含贴吧分页、manual 重定向/Cookie 隔离、私网/metadata 拒绝、DNS 固定、Abort/429 边界 |
 | web 测试 | **12/12 通过** | 含自动挂机、备份错误、诊断与未知值展示 |
 | standalone | **27/27 通过** | 含认证、跨站、路径穿越、备份与重启持久化 |
 | automation / recovery / paging | **8/8、8 项、7/7 通过** | 平台为脚本化 double，不是真实账号 |
 | upgrade | **97/97 通过，`migrated`，`modelCalls=0`** | 真实 v0.2.1 EXE；v0.2.0 仍为 fixture |
 | 类型与差异检查 | **`tsc --noEmit`、`git diff --check`、`git diff --cached --check` 均通过** | 最终冻结候选；最终 Tag 复验待回填 |
-| v0.2.2 CI | 尚未运行 | 待最终回填 |
+| v0.2.2 CI | 多轮运行中；三平台 Test、Windows 打包、真实升级、短 Soak 已通过 | Linux ELF 基线修复后等待最新完整轮次 |
 
 ### 2.3 未使用的证据
 
@@ -139,8 +139,8 @@ AES-256-GCM 使用随机 12 字节 IV，AAD 绑定 `AI_DEBATE_*` ref。`describe
 | R-14 | 低 | control token 使用非密码学随机输入生成 | 不应作为远程安全凭据 | 仅回环 + 需能读 0600 数据目录；权限最小化 |
 | R-15 | 低 | Windows ACL/icacls 失败只告警 |  stripped/FAT/受限主机可能未收紧目录 | 日志明确告警；文档建议核对 ACL |
 | R-16 | 低 | 讨论正文会发送到用户配置的模型端点 | 第三方模型可见对话内容 | 由用户显式配置；出网策略与审计；隐私提示 |
-| R-17 | 低 | 秘密扫描存在静默边界 | 允许文件误存凭据或超大/过深目录可能漏扫 | 默认整文件豁免 scanner 与 fixtures README；目录模式跳过 >4 MiB、深度>8、文件数>5000；SEA 二进制通过 `--baseline` 单独差分，新增/改写字节仍拦截 |
-| R-18 | 高（已修复，待长跑复验） | core 锁 release 瞬时读失败曾留下活 PID 锁；dirty 内存候选曾被自动化 session 当作持久证据；恢复既有候选曾重复累计 monitor 计数 | 曾导致活进程锁长期占用、`coreLockTimeouts=3`、candidate/磁盘不一致与升级计数漂移 | 已修复：同 PID 孤儿 token 回收、token CAS release、durable-only 读取、幽灵候选无模型收敛、仅新生成候选计数；monitor-engine 46/46、真实升级 97/97、Soak 自测 6/6、两组故障预检通过；最终 24h 正在运行 |
+| R-17 | 低 | 秘密扫描存在静默边界 | 允许文件误存凭据或超大/过深目录可能漏扫 | 默认整文件豁免 scanner 与 fixtures README；目录模式跳过 >4 MiB、深度>8、文件数>5000；SEA 二进制通过 `--baseline` 单独差分：PE 同偏移原字节；ELF 按节名/大小配对并要求至少 99% 可加载代码/静态数据字节一致，只忽略对应字节完全相同的原匹配，新增/改写字节仍拦截 |
+| R-18 | 高（已修复，待长跑复验） | core 锁 release 瞬时读失败曾留下活 PID 锁；dirty 内存候选曾被自动化 session 当作持久证据；恢复既有候选曾重复累计 monitor 计数；发现任务写失败后游标曾仍推进 | 曾导致活进程锁长期占用、`coreLockTimeouts=3`、candidate/磁盘不一致、升级计数漂移与 `lostTasks=1` | 已修复：同 PID 孤儿 token 回收、token CAS release、durable-only 读取、幽灵候选无模型收敛、仅新生成候选计数、identity → analysis task → cursor 写序；monitor-engine 47/47、真实升级 97/97、60 秒高磁盘故障压力测试通过；最终 24h 正在运行 |
 
 ## 6. 未验证项
 
@@ -151,11 +151,11 @@ AES-256-GCM 使用随机 12 字节 IV，AAD 绑定 `AI_DEBATE_*` ref。`describe
 3. Windows `HKCU\...\Run` 自启写入/关闭/重启；构建机 `reg.exe` 被主机策略拦截。
 4. Debian 12 真实 systemd 生命周期；容器无 init，只能证明安装与二进制兼容。
 5. 独立 Ubuntu/Debian 虚拟机上的升级、杀进程恢复与卸载。
-6. 最终冻结候选的连续 24 小时 Soak 结果；该长跑于 UTC `2026-11-21T10:02:08.346Z` 启动，当前正在运行。历史 302.081s 失败现场保留，不能作为通过证据。
-7. v0.2.2 CI 全部 job；尚未运行。
+6. 最终冻结候选的连续 24 小时 Soak 结果；该长跑于 UTC `2026-11-21T12:05:15.222Z` 启动，当前正在运行。历史 302.081s 失败与 5553.25 秒 `lostTasks=1` 失败现场均保留，不能作为通过证据。
+7. v0.2.2 CI 全部 job；多轮运行中，三平台 Test、Windows 打包、真实升级与短 Soak 已通过，Linux ELF 基线修复等待最新一轮完整通过。
 8. 最终 Windows EXE 与 Linux TGZ；既有 EXE 是最终修复前资产，必须重建。正式附件下载复验与 Latest 尚未完成，EXE 未代码签名。
 9. 真实平台恶意重定向样本与长期真实运行行为。
-10. 最终 commit/tag 上的全量测试、类型检查复验；当前冻结候选已通过本地门禁，但 CI 尚未运行。
+10. 最终 commit/tag 上的全量测试、类型检查复验；当前冻结候选已通过本地门禁，CI 最终轮仍待完成。
 
 ## 7. 复现命令
 

@@ -7,8 +7,8 @@
  *   - --baseline <node-binary>: for an explicitly named SEA executable, ignore
  *     only matches proven to come from the trusted Node runtime. PE uses exact
  *     same-offset bytes; ELF injection may relocate sections, so ELF requires
- *     >=99% of allocatable bytes to match after pairing sections by name and
- *     size, and suppresses a match only when its exact bytes also match. Every added,
+ *     >=99% of allocatable code/static-data bytes to match after pairing sections
+ *     by name and size, and suppresses a match only when its exact bytes also match. Every added,
  *     rebuilt, changed or unmatched byte is still scanned. A target that is not
  *     demonstrably derived from the baseline fails closed.
  */
@@ -36,6 +36,26 @@ const MAX_TEXT_BYTES = 4 * 1024 * 1024
 const BINARY_CHUNK_BYTES = 4 * 1024 * 1024
 const BINARY_OVERLAP_BYTES = 4096
 const MIN_BASELINE_SIMILARITY = 0.99
+// LIEF legitimately rebuilds ELF dynamic-linking metadata when injecting a note.
+// These sections remain fully scanned; they only do not prove runtime derivation.
+const ELF_DYNAMIC_METADATA_TYPES = new Set([
+  3, // SHT_STRTAB (.dynstr)
+  4, // SHT_RELA
+  5, // SHT_HASH
+  6, // SHT_DYNAMIC
+  7, // SHT_NOTE
+  9, // SHT_REL
+  11, // SHT_DYNSYM
+  19, // SHT_RELR
+  0x6ffffff6, // SHT_GNU_HASH
+  0x6ffffffd, // SHT_GNU_verdef
+  0x6ffffffe, // SHT_GNU_verneed
+  0x6fffffff, // SHT_GNU_versym
+])
+
+function isElfRuntimeSection(section) {
+  return (section.flags & 0x2) !== 0 && !ELF_DYNAMIC_METADATA_TYPES.has(section.type)
+}
 
 function parseArgs(argv) {
   const targets = []
@@ -140,8 +160,8 @@ function parseElfSections(buffer) {
 
 /**
  * ELF injection rebuilds the layout, so original bytes can move. Pair original
- * sections by name and size and require >=99% of allocatable bytes to remain
- * identical. Only a match whose exact bytes are unchanged inside a paired range
+ * sections by name and size and require >=99% of allocatable code/static-data
+ * bytes to remain identical. Only a match whose exact bytes are unchanged inside a paired range
  * may be suppressed. Added/rebuilt notes and changed bytes remain fully scanned.
  */
 function createElfBaselineMatcher(target, baseline) {
@@ -168,7 +188,7 @@ function createElfBaselineMatcher(target, baseline) {
       if (best === undefined || same > best.same) best = { index, candidate, same }
     }
     if (best === undefined) {
-      if ((section.flags & 0x2) !== 0) weakSections.push(`${section.name || '(unnamed)'}:missing`)
+      if (isElfRuntimeSection(section)) weakSections.push(`${section.name || '(unnamed)'}:missing`)
       continue
     }
     used.add(best.index)
@@ -177,7 +197,7 @@ function createElfBaselineMatcher(target, baseline) {
       targetEnd: best.candidate.fileOffset + best.candidate.size,
       baselineStart: section.fileOffset,
     })
-    if ((section.flags & 0x2) !== 0) {
+    if (isElfRuntimeSection(section)) {
       allocatableBytes += section.size
       matchedAllocatableBytes += best.same
       if (best.same / section.size < MIN_BASELINE_SIMILARITY) {
@@ -189,7 +209,7 @@ function createElfBaselineMatcher(target, baseline) {
   // Sum every baseline allocatable section, including those without a target
   // counterpart, so a stripped or replaced runtime cannot pass.
   for (const section of baselineSections) {
-    if (section.size === 0 || (section.flags & 0x2) === 0) continue
+    if (section.size === 0 || !isElfRuntimeSection(section)) continue
     if (!ranges.some((range) => range.baselineStart === section.fileOffset && range.targetEnd - range.targetStart === section.size)) {
       allocatableBytes += section.size
     }

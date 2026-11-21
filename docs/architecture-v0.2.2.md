@@ -4,7 +4,7 @@
 >
 > 版本：`0.2.2`（根目录与三个 workspace 的 `package.json` 一致）
 >
-> 证据基线：UTC 2026-11-21 10:01:17 的最终冻结候选；运行环境 Node.js `22.22.2`，CI 固定 `22.18.0`。`engine.ts` SHA256 为 `8edbe73ffdad754daa23df220723616f06c76dc84ba54ee5e2747d0d798dab9b`，冻结清单见 `.tmp-data/soak-v022-continuous-final-20261121T100117Z/freeze.txt`。
+> 证据基线：UTC 2026-11-21 12:03:04 的最终冻结候选；运行环境 Node.js `22.22.2`，CI 固定 `22.18.0`。`engine.ts` SHA256 为 `5323c87bc66306ba1e825fcf0ab0a5994afd754d05f977c6667f685225307c1c`，冻结清单见 `.tmp-data/soak-v022-continuous-final-20261121T120304Z/freeze.txt`。
 >
 > 相关文档：[可靠性](./reliability-v0.2.2.md)、[安全审计](./security-audit-v0.2.2.md)、[升级验收](./upgrade-v0.2.2.md)、[发布说明](./release-notes-v0.2.2.md)、[验收报告](./acceptance-v0.2.2.md)。
 
@@ -91,7 +91,7 @@ flowchart LR
 
 核心 `state.json` 另有跨进程锁：每次获取随机 token，写前重新验证 token，release 以 rename+CAS 只删除自己的锁。其他活进程的锁永不被年龄回收；同 PID 但未注册在 `activeLockTokens` 的 token 视为已结束临界区的孤儿，可立即回收。清理诊断不改变已成功 persist 的结果。
 
-候选证据使用 durable-only 边界：`readPersistedSnapshot()` 等待本实例 writeChain，再持锁读取磁盘，且不把 dirty 内存覆盖到持久视图；产品 API 与 Soak harness 都从该持久事实判断候选是否存在。`absent` 与 `unavailable` 严格区分。幽灵候选恢复先写 identity `ignored`，再写 task `failed`；若任务写失败，下一轮由 ignored 身份栅栏仅补任务终态，不重读核心、不调用模型。monitor 候选计数只在正常生成路径确认持久候选后增加；超时恢复、孤儿对账和既有候选复用不得再次累计。
+候选证据使用 durable-only 边界：`readPersistedSnapshot()` 等待本实例 writeChain，再持锁读取磁盘，且不把 dirty 内存覆盖到持久视图；产品 API 与 Soak harness 都从该持久事实判断候选是否存在。`absent` 与 `unavailable` 严格区分。幽灵候选恢复先写 identity `ignored`，再写 task `failed`；若任务写失败，下一轮由 ignored 身份栅栏仅补任务终态，不重读核心、不调用模型。monitor 候选计数只在正常生成路径确认持久候选后增加；超时恢复、孤儿对账和既有候选复用不得再次累计。新回复发现采用 identity → analysis task → monitor cursor 的持久顺序；任务写入失败时游标不得推进。
 
 ## 5. 自动挂机流水线
 
@@ -283,10 +283,10 @@ Linux 路径策略将 prefix 限制在 `/opt/ai-debate` 或 `/usr/local/ai-debat
 |---|---|---|
 | 最终架构复审 | **IS_PASS YES，B1–B4 与 Soak/持久化阻断全部关闭**；只放行冻结候选进入 24h Soak，不等于正式发布签字 | 正式 Tag 保持相同实现与证据 |
 | v0.2.1 → v0.2.2 全局身份自动迁移 | **已接线并通过**。迁移 20/20、身份 13/13、启动集成 5/5，合计 38/38；真实升级 97/97（`migrated`，`modelCalls=0`） | 最终候选测试结果与 CI `upgrade-real` 链接 |
-| 24 小时 Soak | 最终冻结候选于 UTC `2026-11-21T10:02:08.346Z` 启动，`monitors=1000`、`seed=1`、`kill-every=300`、`seconds=86400`；状态目录 `.tmp-data/soak-v022-continuous-final-20261121T100117Z/`。**正在运行，尚无最终报告** | 连续 24h 报告、墙钟时长、重启/杀死、不变量、峰值与结论 |
-| Soak/持久化发布阻断 | **已修复并复审通过**。durable-only 候选证据、同 PID 孤儿锁回收、token CAS release、幽灵候选无模型收敛、unavailable fail-closed；另修复 identity ignored 先于 task failed 的反向写序窗口 | 最终 24h Soak 与 CI 复验 |
-| v0.2.2 CI | **尚未运行** | 各 job 结果、运行链接、失败项与复验结果 |
-| 正式 EXE/TGZ | 既有 Windows EXE 为最终修复前资产，已解除资格；Linux TGZ 尚未构建 | 最终双平台 SHA256、`--version`、安装/生命周期、下载后复验、Latest 校验 |
+| 24 小时 Soak | 最终冻结候选于 UTC `2026-11-21T12:05:15.222Z` 启动，`monitors=1000`、`seed=1`、`kill-every=300`、`seconds=86400`；状态目录 `.tmp-data/soak-v022-continuous-final-20261121T120304Z/`。**正在运行，尚无最终报告** | 连续 24h 报告、墙钟时长、重启/杀死、不变量、峰值与结论 |
+| Soak/持久化发布阻断 | **已修复并复审通过**。durable-only 候选证据、同 PID 孤儿锁回收、token CAS release、幽灵候选无模型收敛、unavailable fail-closed、identity-before-task 写序、恢复候选不重复计数、identity → analysis task → cursor 发现写序 | 最终 24h Soak 与 CI 复验 |
+| v0.2.2 CI | **多轮运行中**；三平台 Test、Windows 打包、真实升级、短 Soak 已通过，Linux ELF 基线修复等待最新完整轮次 | 各 job 结果、运行链接、失败项与复验结果 |
+| 正式 EXE/TGZ | 既有 Windows EXE 为最终修复前资产，已解除资格；Linux TGZ 已构建但最终扫描/生命周期待最新 CI | 最终双平台 SHA256、`--version`、安装/生命周期、下载后复验、Latest 校验 |
 | 真实贴吧/微博账号 | 未验证 | 实号只读/限流/认证/嵌套读取结果；未验证能力继续保持 unavailable |
 | Windows 注册表自启 | launcher 1/1 通过，但注册表自启被本机安全策略阻断，未计通过 | 可写主机上的开启/关闭/重启结果 |
 | Debian systemd | 仅计划二进制兼容与无 init 安装验证 | Debian 12 真实 systemd 生命周期结果，或明确接受未覆盖 |

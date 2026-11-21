@@ -699,7 +699,10 @@ export class AutomationEngine {
       uncovered.push(entry)
     }
     if (uncovered.length === 0) return
-    this.#enqueue({
+    // Discovery must not advance the monitor cursor unless the analysis row is
+    // durable. Let write failures propagate so the probe stays running for lease
+    // recovery and the next scan can retry the same fresh reply.
+    this.#tasks.enqueue({
       kind: 'analyze',
       monitorId: monitor.id,
       postId: uncovered[0]!.postId,
@@ -1312,13 +1315,14 @@ export class AutomationEngine {
       return
     }
 
-    // Claim globally *before* advancing this monitor's cursor. If the identity
-    // write fails, the cursor stays put and the next scan sees the reply again. If
-    // the cursor write fails after the claim, startup's orphan recovery enqueues the
-    // claimed reply. Either crash order is safe; the reverse order would lose it.
+    // Durable discovery order: identity -> analysis task -> monitor cursor. If
+    // either ledger write fails, the cursor stays put and the next scan sees the
+    // reply again. A cursor failure after both ledgers are safe: orphan recovery
+    // already has a claimed identity covered by durable work.
     const known = new Set(monitor.seen)
     const freshIds = fresh.filter((reply) => !known.has(reply.postId)).map((reply) => reply.postId)
     const claimed = this.#claimReplies(monitor, fresh, freshIds)
+    if (freshIds.length > 0) this.#enqueueAnalysis(monitor, claimed)
     const outcome = this.#monitors.applyScan(monitor.id, {
       at: startedAt,
       coverage: 'tail',
@@ -1340,7 +1344,6 @@ export class AutomationEngine {
     }
     // Two monitors can see the same floor; the identity fence makes the second
     // one a no-op even though its own cursor was advanced independently.
-    this.#enqueueAnalysis(monitor, claimed)
     this.#tasks.note(task.id, 'info', `发现 ${outcome.fresh.length} 条新发言，已排入分析队列`)
     this.#tasks.finish(task.id, 'completed')
   }
@@ -1370,6 +1373,7 @@ export class AutomationEngine {
     const known = new Set(monitor.seen)
     const freshIds = replies.filter((reply) => !known.has(reply.postId)).map((reply) => reply.postId)
     const claimed = this.#claimReplies(monitor, replies, freshIds)
+    if (freshIds.length > 0) this.#enqueueAnalysis(monitor, claimed)
     const outcome = this.#monitors.applyScan(monitor.id, {
       at: startedAt,
       coverage: full ? 'full' : 'tail',
@@ -1398,7 +1402,6 @@ export class AutomationEngine {
       // through analysis like any other discovery, or a slow probe cadence would
       // silently drop it. Rewrites are the opposite case — they are recorded only,
       // because a candidate built on a since-edited reply answers a dead question.
-      this.#enqueueAnalysis(monitor, claimed)
       this.#tasks.note(task.id, 'info', `补偿扫描发现 ${outcome.fresh.length} 条新发言，已排入分析队列`)
     }
     if (!result.scan.complete) {

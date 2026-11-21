@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { DebateProductApi, GenerateResult, SessionSummary } from '../../core/src/product-api.ts'
+import type { DebateProductApi, GenerateResult, ProbeResult, SessionSummary } from '../../core/src/product-api.ts'
 import { AtomicWriteError } from '../src/atomic.ts'
 import { AutomationEngine } from '../src/monitor/engine.ts'
 import { ReplyIdentityStore } from '../src/monitor/identities.ts'
@@ -37,6 +37,33 @@ function sessionWithCandidate(sessionId: string, candidateId: string): SessionSu
   }
 }
 
+function probeWithReply(postId: string): ProbeResult {
+  const at = '2026-01-01T00:00:00.000Z'
+  return {
+    platform: PLATFORM,
+    threadId: THREAD_ID,
+    title: '恢复测试帖',
+    url: 'https://fake.example/p/t016',
+    complete: true,
+    pagesRead: 1,
+    declaredTotal: 1,
+    replies: [{
+      postId,
+      kind: 'floor',
+      authorName: '对方',
+      authorId: 'rival',
+      content: '一条新的反对意见。',
+      createdAt: at,
+      floorPostId: postId,
+      floorNumber: 1,
+      order: 0,
+      fingerprint: `fp-${postId}`,
+      identityQuality: 'stable',
+    }],
+    scan: { mode: 'tail', complete: true, pagesRead: 1, totalPages: 1, repliesSeen: 1 },
+  }
+}
+
 interface Harness {
   readonly monitors: MonitorStore
   readonly tasks: AutoTaskStore
@@ -54,6 +81,7 @@ interface Harness {
 function harness(options: {
   generate?: () => Promise<GenerateResult>
   analyze?: () => Promise<{ sessionId: string }>
+  probe?: () => Promise<ProbeResult>
   session?: (sessionId: string) => Promise<SessionSummary | undefined>
 } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'ai-debate-orphan-'))
@@ -74,7 +102,10 @@ function harness(options: {
   let session = options.session ?? (async () => undefined)
   const api: DebateProductApi = {
     resolveUrl: (url) => ({ platform: PLATFORM, threadId: THREAD_ID, url }),
-    probe: async () => { throw new Error('测试不应读取平台') },
+    probe: async () => {
+      if (options.probe === undefined) throw new Error('测试不应读取平台')
+      return options.probe()
+    },
     analyze: async () => {
       calls.analyze += 1
       return options.analyze === undefined ? { sessionId: 'analysis-session' } : options.analyze()
@@ -192,6 +223,39 @@ function deferred<T>(): {
   })
   return { promise, resolve, reject }
 }
+
+test('发现写序：分析任务写失败时游标不得推进，恢复后补分析任务', async (t) => {
+  const kit = harness({ probe: async () => probeWithReply(POST_ID) })
+  t.after(() => kit.dispose())
+  kit.monitors.markBaseline(kit.monitorId, new Date(kit.now.value - 1_000).toISOString())
+  const originalEnqueue = kit.tasks.enqueue.bind(kit.tasks)
+  let injected = false
+  let failWrites = true
+  kit.tasks.enqueue = (...args: Parameters<AutoTaskStore['enqueue']>) => {
+    if (args[0].kind === 'analyze' && failWrites) {
+      injected = true
+      throw new AtomicWriteError('io', 'tasks.json', 'injected analysis enqueue failure')
+    }
+    return originalEnqueue(...args)
+  }
+  kit.tasks.enqueue({ kind: 'probe', monitorId: kit.monitorId, dedupeKey: `probe:${kit.monitorId}` })
+  kit.engine.start()
+  try {
+    assert.equal(await tickUntil(kit, () => injected && kit.engine.status().degraded !== undefined), true)
+    assert.equal(kit.identities.get(IDENTITY_KEY)?.state, 'claimed')
+    assert.equal(kit.monitors.get(kit.monitorId)?.seen.includes(POST_ID), false, '任务未持久化时游标不得推进')
+    assert.equal(kit.tasks.all().some((task) => task.kind === 'analyze'), false)
+
+    failWrites = false
+    kit.tasks.enqueue = originalEnqueue
+    kit.now.value += 30_001
+    assert.equal(await tickUntil(kit, () => kit.tasks.all().some((task) => task.kind === 'analyze')), true)
+    assert.equal(kit.monitors.get(kit.monitorId)?.seen.includes(POST_ID), false, '恢复任务不应伪造游标')
+    assert.equal(kit.calls.generate, 0)
+  } finally {
+    kit.tasks.enqueue = originalEnqueue
+  }
+})
 
 test('孤儿对账：failed generate 收敛为 ignored，人工 retry 仍可生成候选', async (t) => {
   const kit = harness({
