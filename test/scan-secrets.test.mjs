@@ -39,7 +39,7 @@ function elfFixture({ noteKey, addNote = noteKey !== undefined, tamperText = fal
     cursor += name.length + 1
   }
   const text = Buffer.alloc(256, 0x43)
-  if (tamperText) text[17] ^= 0xff
+  if (tamperText) text.fill(0x46)
   const rodata = Buffer.alloc(512, 0x44)
   rodata.write(runtimeKey, 64)
   const note = addNote ? Buffer.alloc(256, 0x45) : undefined

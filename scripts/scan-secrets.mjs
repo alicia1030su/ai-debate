@@ -7,8 +7,8 @@
  *   - --baseline <node-binary>: for an explicitly named SEA executable, ignore
  *     only matches proven to come from the trusted Node runtime. PE uses exact
  *     same-offset bytes; ELF injection may relocate sections, so ELF requires
- *     >=99% of allocatable sections to match by name, size and exact content,
- *     and suppresses matches only inside those matched ranges. Every added,
+ *     >=99% of allocatable bytes to match after pairing sections by name and
+ *     size, and suppresses a match only when its exact bytes also match. Every added,
  *     rebuilt, changed or unmatched byte is still scanned. A target that is not
  *     demonstrably derived from the baseline fails closed.
  */
@@ -139,58 +139,66 @@ function parseElfSections(buffer) {
 }
 
 /**
- * ELF injection rebuilds the layout, so original bytes can move. Match original
- * sections by name, size and exact content; only those proven-identical ranges
- * may suppress a runtime match. Added/rebuilt notes and changed sections remain
- * fully scanned.
+ * ELF injection rebuilds the layout, so original bytes can move. Pair original
+ * sections by name and size and require >=99% of allocatable bytes to remain
+ * identical. Only a match whose exact bytes are unchanged inside a paired range
+ * may be suppressed. Added/rebuilt notes and changed bytes remain fully scanned.
  */
 function createElfBaselineMatcher(target, baseline) {
   const targetSections = parseElfSections(target)
   const baselineSections = parseElfSections(baseline)
   const used = new Set()
-  const matchedBaselineSections = new Set()
   const ranges = []
+  const weakSections = []
+  let allocatableBytes = 0
+  let matchedAllocatableBytes = 0
 
   for (const section of baselineSections) {
     if (section.size === 0 || section.fileOffset + section.size > baseline.length) continue
-    const candidateIndex = targetSections.findIndex((candidate, index) =>
-      !used.has(index)
-      && candidate.name === section.name
-      && candidate.size === section.size
-      && candidate.fileOffset + candidate.size <= target.length
-      && target.subarray(candidate.fileOffset, candidate.fileOffset + candidate.size)
-        .equals(baseline.subarray(section.fileOffset, section.fileOffset + section.size)),
-    )
-    if (candidateIndex < 0) continue
-    used.add(candidateIndex)
-    matchedBaselineSections.add(section)
-    const candidate = targetSections[candidateIndex]
+    let best
+    for (let index = 0; index < targetSections.length; index += 1) {
+      if (used.has(index)) continue
+      const candidate = targetSections[index]
+      if (candidate.name !== section.name || candidate.size !== section.size) continue
+      if (candidate.fileOffset + candidate.size > target.length) continue
+      let same = 0
+      for (let offset = 0; offset < section.size; offset += 1) {
+        if (target[candidate.fileOffset + offset] === baseline[section.fileOffset + offset]) same += 1
+      }
+      if (best === undefined || same > best.same) best = { index, candidate, same }
+    }
+    if (best === undefined) {
+      if ((section.flags & 0x2) !== 0) weakSections.push(`${section.name || '(unnamed)'}:missing`)
+      continue
+    }
+    used.add(best.index)
     ranges.push({
-      targetStart: candidate.fileOffset,
-      targetEnd: candidate.fileOffset + candidate.size,
+      targetStart: best.candidate.fileOffset,
+      targetEnd: best.candidate.fileOffset + best.candidate.size,
       baselineStart: section.fileOffset,
     })
+    if ((section.flags & 0x2) !== 0) {
+      allocatableBytes += section.size
+      matchedAllocatableBytes += best.same
+      if (best.same / section.size < MIN_BASELINE_SIMILARITY) {
+        weakSections.push(`${section.name || '(unnamed)'}:${(best.same / section.size * 100).toFixed(2)}%`)
+      }
+    }
   }
 
-  // Sum every baseline allocatable section, including those without an identical
-  // target counterpart, so a stripped or replaced runtime cannot pass.
-  let allocatableBytes = 0
-  let matchedAllocatableBytes = 0
+  // Sum every baseline allocatable section, including those without a target
+  // counterpart, so a stripped or replaced runtime cannot pass.
   for (const section of baselineSections) {
     if (section.size === 0 || (section.flags & 0x2) === 0) continue
-    allocatableBytes += section.size
-    if (matchedBaselineSections.has(section)) matchedAllocatableBytes += section.size
+    if (!ranges.some((range) => range.baselineStart === section.fileOffset && range.targetEnd - range.targetStart === section.size)) {
+      allocatableBytes += section.size
+    }
   }
   const similarity = allocatableBytes === 0 ? 0 : matchedAllocatableBytes / allocatableBytes
   if (similarity < MIN_BASELINE_SIMILARITY) {
-    const unmatched = baselineSections
-      .filter((section) => section.size > 0 && (section.flags & 0x2) !== 0 && !matchedBaselineSections.has(section))
-      .map((section) => `${section.name || '(unnamed)'}:${section.size}`)
-      .slice(0, 12)
-      .join(', ')
     throw new Error(
       `ELF 目标与 Node 基线可加载节匹配不足 ${(MIN_BASELINE_SIMILARITY * 100).toFixed(0)}%`
-      + `（实际 ${(similarity * 100).toFixed(2)}%；未匹配 ${unmatched}），拒绝按基线扫描`,
+      + `（实际 ${(similarity * 100).toFixed(2)}%；弱节 ${weakSections.slice(0, 12).join(', ')}），拒绝按基线扫描`,
     )
   }
   return {
