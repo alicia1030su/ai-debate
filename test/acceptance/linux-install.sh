@@ -244,7 +244,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
       cat "${WORK}/verify.log"
     fi
     cp /etc/systemd/system/ai-debate.service "${WORK}/invalid.service"
-    printf '\nThisDirectiveDoesNotExist=yes\n' >> "${WORK}/invalid.service"
+    printf '\nType=definitely-invalid-service-type\n' >> "${WORK}/invalid.service"
     if systemd-analyze verify "${WORK}/invalid.service" >"${WORK}/invalid-verify.log" 2>&1; then
       fail "systemd-analyze verify 对非法 unit 错误地返回 0"
     else
@@ -394,7 +394,15 @@ if [[ "$SYSTEMD" -eq 1 ]]; then
     sleep 0.5
   done
   [[ "$restarted" -eq 1 ]] && pass "受控 exit 75 后由 systemd 自动恢复" || fail "受控 exit 75 后未自动恢复"
-  if journalctl -u ai-debate --since '-3 min' --no-pager 2>/dev/null | grep -q 'status=75'; then
+  exit75_logged=0
+  for _ in $(seq 1 20); do
+    if journalctl -u ai-debate --since '-3 min' --no-pager 2>/dev/null | grep -q 'status=75'; then
+      exit75_logged=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ "$exit75_logged" -eq 1 ]]; then
     pass "journal 确认主进程以 75 退出"
   else
     fail "journal 未确认 exit 75"
@@ -418,8 +426,13 @@ if [[ "$SYSTEMD" -eq 1 ]]; then
     && pass "省略路径参数的升级安装成功" || { fail "升级安装失败"; cat "${WORK}/upgrade-install.log"; exit 1; }
   [[ "$(systemctl show -p ReadWritePaths --value ai-debate)" == "$DATA_DIR" ]] \
     && pass "升级保留自定义 DATA_DIR" || fail "升级丢失自定义 DATA_DIR"
-  [[ "$(systemctl show -p ExecStart --value ai-debate)" == "${PREFIX}/bin/ai-debate serve" ]] \
-    && pass "升级保留自定义 PREFIX" || fail "升级丢失自定义 PREFIX"
+  if grep -Fqx "ExecStart=${PREFIX}/bin/ai-debate serve" /etc/systemd/system/ai-debate.service \
+    && [[ -x "${PREFIX}/bin/ai-debate" ]]; then
+    pass "升级保留自定义 PREFIX"
+  else
+    fail "升级丢失自定义 PREFIX"
+    grep -F 'ExecStart=' /etc/systemd/system/ai-debate.service || true
+  fi
   grep -q "$TOKEN" "${DATA_DIR}/upgrade-marker" && pass "升级保留用户数据" || fail "升级丢失用户数据"
   wait_ready && pass "升级后服务可用" || fail "升级后服务不可用"
 
