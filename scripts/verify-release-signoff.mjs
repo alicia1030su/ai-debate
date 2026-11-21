@@ -136,6 +136,14 @@ function requireIsoTimestamp(value, label) {
   return parsed
 }
 
+function requireGithubTimestamp(value, label) {
+  const match = typeof value === 'string'
+    ? /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?Z$/.exec(value)
+    : null
+  if (match === null) throw new Error(`${label} 必须是 ISO UTC 时间`)
+  return requireIsoTimestamp(`${match[1]}.${(match[2] ?? '').padEnd(3, '0')}Z`, label)
+}
+
 function requireWatchdog(watchdog, label) {
   if (watchdog === undefined || watchdog === null || typeof watchdog !== 'object') throw new Error(`${label} 缺失`)
   requireCount(watchdog.samples, `${label}.samples`)
@@ -172,9 +180,17 @@ function verifyFreeze(root, signoff) {
     if (!files.has(path)) throw new Error(`freeze 缺少关键文件：${path}`)
   }
   for (const [path, expected] of files) {
-    const full = resolve(root, path)
-    if (!existsSync(full)) throw new Error(`freeze 文件不存在：${path}`)
-    requireEqual(sha256(readFileSync(full)), expected, `freeze 文件 ${path}`)
+    let blob
+    try {
+      blob = execFileSync('git', ['cat-file', 'blob', `HEAD:${path}`], {
+        cwd: root,
+        encoding: null,
+        maxBuffer: 64 * 1024 * 1024,
+      })
+    } catch {
+      throw new Error(`freeze 文件不在当前提交中：${path}`)
+    }
+    requireEqual(sha256(blob), expected, `freeze 文件 ${path}`)
   }
 }
 
@@ -404,16 +420,11 @@ function verifyGithubRun(signoff, runVerifier) {
     if (job === undefined) throw new Error(`CI 缺少必需 job：${name}`)
     requireEqual(job.status, 'completed', `CI job ${name} status`)
     requireEqual(job.conclusion, 'success', `CI job ${name} conclusion`)
-    if (typeof job.completedAt !== 'string' || Number.isNaN(Date.parse(job.completedAt))) {
-      throw new Error(`CI job ${name} completedAt 缺失或无效`)
-    }
-    derivedCompletedAtMs = Math.max(derivedCompletedAtMs, Date.parse(job.completedAt))
+    derivedCompletedAtMs = Math.max(derivedCompletedAtMs, requireGithubTimestamp(job.completedAt, `CI job ${name} completedAt`))
   }
   if (run.completedAt !== undefined) {
-    if (typeof run.completedAt !== 'string' || Number.isNaN(Date.parse(run.completedAt))) {
-      throw new Error('CI completedAt 缺失或无效')
-    }
-    if (Date.parse(run.completedAt) !== derivedCompletedAtMs) throw new Error('CI completedAt 与必需 job 完成时间不一致')
+    const runCompletedAtMs = requireGithubTimestamp(run.completedAt, 'CI completedAt')
+    if (runCompletedAtMs !== derivedCompletedAtMs) throw new Error('CI completedAt 与必需 job 完成时间不一致')
   }
 }
 
@@ -429,6 +440,11 @@ function verifyCommitBinding(root, signoff, currentCommit) {
   if (changed.length === 0) throw new Error('Tag 与候选 commit 完全相同，无法包含后生成的签字证据')
   for (const path of changed) {
     if (!path.startsWith('docs/')) throw new Error(`Tag 修改了签字允许范围之外的产品/构建文件：${path}`)
+  }
+  try {
+    execFileSync('git', ['diff', '--quiet', 'HEAD', '--', ...PROTECTED_PATHS], { cwd: root })
+  } catch {
+    throw new Error('受保护路径存在未提交改动')
   }
   execFileSync('git', ['diff', '--quiet', signoff.candidateCommit, currentCommit, '--', ...PROTECTED_PATHS], { cwd: root })
 }

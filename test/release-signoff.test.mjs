@@ -72,7 +72,10 @@ function fixture(t) {
   git(root, 'commit', '-qm', 'candidate')
   const candidateCommit = git(root, 'rev-parse', 'HEAD')
 
-  const freezeLines = REQUIRED_FREEZE_FILES.map((path) => `${sha256(readFileSync(join(root, path)))}  ${path}`)
+  const freezeLines = REQUIRED_FREEZE_FILES.map((path) => {
+    const blob = execFileSync('git', ['show', `${candidateCommit}:${path}`], { cwd: root, encoding: null })
+    return `${sha256(blob)}  ${path}`
+  })
   const freezeBytes = `${freezeLines.join('\n')}\n`
   write(root, 'docs/evidence/freeze.txt', freezeBytes)
 
@@ -300,6 +303,22 @@ test('有效签字：候选树、冻结字节、Soak、QA 与 CI 精确匹配', 
   assert.equal(result.ok, true, result.errors.join('\n'))
 })
 
+test('freeze 使用当前提交 blob 哈希', (t) => {
+  const context = fixture(t)
+  const freeze = readFileSync(join(context.root, 'docs/evidence/freeze.txt'), 'utf8')
+  const blob = execFileSync('git', ['show', 'HEAD:package.json'], { cwd: context.root, encoding: null })
+  assert.ok(freeze.includes(`${sha256(blob)}  package.json\n`))
+})
+
+test('签字拒绝受保护工作树脏改动', (t) => {
+  const context = fixture(t)
+  const productFile = join(context.root, 'packages/core/src/store.ts')
+  writeFileSync(productFile, `${readFileSync(productFile, 'utf8')}\n// dirty worktree\n`)
+  const result = verify(context)
+  assert.equal(result.ok, false)
+  assert.match(result.errors.join('\n'), /受保护路径存在未提交改动/)
+})
+
 test('签字拒绝被篡改的 Soak 证据字节', (t) => {
   const context = fixture(t)
   write(context.root, 'docs/evidence/soak-report.json', '{"status":"passed","completed":true}\n')
@@ -356,6 +375,15 @@ test('签字拒绝 CI 状态、job 状态与完成时间不一致', (t) => {
   invalidJobCompleted.jobs[0].completedAt = 'not-a-date'
   assert.match(verify(context, invalidJobCompleted).errors.join('\n'), /CI job .* completedAt/)
 
+  const impossibleJobCompleted = successfulRun(context.candidateCommit)
+  impossibleJobCompleted.jobs[0].completedAt = '2026-02-30T11:59:00Z'
+  assert.match(verify(context, impossibleJobCompleted).errors.join('\n'), /CI job .* completedAt/)
+
+  const nullRunCompleted = successfulRun(context.candidateCommit, { completedAt: null })
+  assert.match(verify(context, nullRunCompleted).errors.join('\n'), /CI completedAt/)
+  const invalidRunCompleted = successfulRun(context.candidateCommit, { completedAt: 'not-a-date' })
+  assert.match(verify(context, invalidRunCompleted).errors.join('\n'), /CI completedAt/)
+
   const mismatchedRunCompleted = successfulRun(context.candidateCommit, { completedAt: '2026-11-22T12:00:01Z' })
   assert.match(verify(context, mismatchedRunCompleted).errors.join('\n'), /completedAt 与必需 job 完成时间不一致/)
   const matchingRunCompleted = successfulRun(context.candidateCommit, { completedAt: '2026-11-22T11:59:00Z' })
@@ -368,6 +396,10 @@ test('签字拒绝 CI 状态、job 状态与完成时间不一致', (t) => {
   const duplicateJob = successfulRun(context.candidateCommit)
   duplicateJob.jobs[duplicateJob.jobs.length - 1].name = duplicateJob.jobs[0].name
   assert.match(verify(context, duplicateJob).errors.join('\n'), /job 名称重复/)
+
+  const duplicateExtraJob = successfulRun(context.candidateCommit)
+  duplicateExtraJob.jobs.push({ ...duplicateExtraJob.jobs[0] })
+  assert.match(verify(context, duplicateExtraJob).errors.join('\n'), /job 集合/)
 })
 
 test('签字拒绝阈值篡改、严格不变量非零与 QA 最终 EXE 复验次数不足', (t) => {
