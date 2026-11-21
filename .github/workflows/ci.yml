@@ -267,7 +267,7 @@ jobs:
           fi
           # A verifier failure must fail the job. The valid rendered unit is
           # verified by linux-install.sh after the real binary/user exist.
-          printf '\nType=definitely-invalid-service-type\n' >> "$tmp/ai-debate.service"
+          printf '\n[Service\n' >> "$tmp/ai-debate.service"
           if systemd-analyze verify "$tmp/ai-debate.service"; then
             echo "systemd-analyze 错误地接受了非法 unit" >&2
             exit 1
