@@ -402,13 +402,19 @@ test('verified 缓存：恢复 review 写失败时不得缓存，任务恢复完
   kit.identities.attachSession(IDENTITY_KEY, 'generation-session')
   kit.identities.markCandidate(IDENTITY_KEY, { sessionId: 'generation-session', candidateId: 'core-candidate' })
   const originalFinish = kit.tasks.finish.bind(kit.tasks)
+  const originalClaim = kit.tasks.claim.bind(kit.tasks)
   let failWrites = true
+  let blockClaims = true
   kit.tasks.finish = (id, state, detail = {}) => {
     if (state === 'needs_review' && failWrites) {
       throw new AtomicWriteError('io', 'tasks.json', 'injected recovered review failure')
     }
     return originalFinish(id, state, detail)
   }
+  // start() launches recovery and scheduling concurrently. Keep the recovered row
+  // pending while the write is injected to fail; otherwise a fast scheduler can
+  // claim it first and turn this cache regression into a lease-recovery timing test.
+  kit.tasks.claim = (...args: Parameters<AutoTaskStore['claim']>) => blockClaims ? undefined : originalClaim(...args)
   kit.engine.start()
   try {
     assert.equal(await tickUntil(kit, () => kit.tasks.all().some((task) => task.state === 'pending')), true)
@@ -416,7 +422,9 @@ test('verified 缓存：恢复 review 写失败时不得缓存，任务恢复完
     assert.equal(kit.tasks.all().some((task) => task.state === 'needs_review'), false)
 
     failWrites = false
+    blockClaims = false
     kit.tasks.finish = originalFinish
+    kit.tasks.claim = originalClaim
     assert.equal(await tickUntil(kit, () => kit.tasks.all().some((task) => task.state === 'needs_review')), true)
     const readsAfterReview = kit.calls.session
     for (let index = 0; index < 3; index += 1) {
@@ -427,6 +435,7 @@ test('verified 缓存：恢复 review 写失败时不得缓存，任务恢复完
     assert.equal(kit.calls.generate, 0)
   } finally {
     kit.tasks.finish = originalFinish
+    kit.tasks.claim = originalClaim
   }
 })
 

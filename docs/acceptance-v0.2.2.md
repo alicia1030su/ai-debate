@@ -10,7 +10,7 @@
 - 本机：Windows x64，Node.js `22.22.2`；CI 固定 Node.js `22.18.0`。
 - 最终候选冻结基线：UTC 2026-11-21 10:01:17；冻结清单见 `.tmp-data/soak-v022-continuous-final-20261121T100117Z/freeze.txt`。
 - 最终 `packages/server/src/monitor/engine.ts` SHA256：`8edbe73ffdad754daa23df220723616f06c76dc84ba54ee5e2747d0d798dab9b`。
-- 最终 `packages/server/test/monitor-engine.test.ts` SHA256：`d95fd3c130e7ab08789583ce8b1cc40d407524a8589d3f82980120e7aed506ad`。
+- 最终 `packages/server/test/monitor-engine.test.ts` SHA256：`c6b040188011180ff44db58e0fc66f8bbb4053cac5b3206be07ead4de8c6b473`。
 - 最终 `test/stress/soak-v022.ts` SHA256：`79fe364ca636eeee50fbd9ae1a150d73c92bf60d5c30a6a19f80861a6d36aa58`。
 - 既有 Windows EXE 构建于最终修复之前，已解除最终资产资格，必须重建；构建、测试与长跑证据不能相互替代。
 - 本次文档回填未 stage、未 commit；只更新六份发布文档，不改动产品代码、测试、工作流或 package 文件，也不把开发期或 CI 待办写成通过。
