@@ -43,6 +43,8 @@ export interface Layout {
   readonly monitorsFile: string
   /** Background task ledger for the monitoring pipeline (v0.2.0). */
   readonly autoTasksFile: string
+  /** Global platform+thread+reply identity fence (v0.2.2). */
+  readonly identitiesFile: string
 }
 
 /** The platform default data directory. */
@@ -93,6 +95,7 @@ export function layoutOf(dataDir: string): Layout {
     instanceFile: join(dir, 'run', 'instance.lock'),
     monitorsFile: join(dir, 'monitors.json'),
     autoTasksFile: join(dir, 'auto-tasks.json'),
+    identitiesFile: join(dir, 'reply-identities.json'),
     controlFile: join(dir, 'run', 'control.json'),
   }
 }

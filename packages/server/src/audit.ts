@@ -24,6 +24,9 @@ export type AuditEvent =
   | 'service.restart'
   | 'backup.created'
   | 'backup.restored'
+  | 'backup.restore_failed'
+  | 'backup.verified'
+  | 'diagnostic.exported'
   | 'legacy.scanned'
   | 'legacy.imported'
   | 'autostart.changed'
@@ -42,6 +45,7 @@ export type AuditEvent =
   | 'store.corrupt'
   | 'store.restored'
   | 'store.migrated'
+  | 'store.migrate_failed'
 
 export interface Auditor {
   write(event: AuditEvent, detail?: Record<string, unknown>): void

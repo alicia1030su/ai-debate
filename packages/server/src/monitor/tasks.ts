@@ -97,6 +97,14 @@ export interface AutoTask {
    * the fastest way to get rate limited by a busy thread.
    */
   readonly postIds?: readonly string[]
+  /** Global platform+thread+reply identity, independent of monitor/session. */
+  readonly identityKey?: string
+  /** Every reply covered by a batched analysis. */
+  readonly identityKeys?: readonly string[]
+  /** Durable execution lease. Renewed by the scheduler heartbeat. */
+  leaseToken?: string
+  leaseExpiresAt?: string
+  heartbeatAt?: string
   sessionId?: string
   /** Stable identity for de-duplication; unique while the task is not terminal. */
   readonly dedupeKey: string
@@ -141,6 +149,14 @@ export interface EnqueueInput {
   readonly monitorId: string
   readonly postId?: string
   readonly postIds?: readonly string[]
+  /** Global platform+thread+reply identity, independent of monitor/session. */
+  readonly identityKey?: string
+  /** Every reply covered by a batched analysis. */
+  readonly identityKeys?: readonly string[]
+  /** Durable execution lease. Renewed by the scheduler heartbeat. */
+  leaseToken?: string
+  leaseExpiresAt?: string
+  heartbeatAt?: string
   sessionId?: string
   readonly dedupeKey: string
   readonly maxAttempts?: number
@@ -286,6 +302,9 @@ export class AutoTaskStore {
         nextRunAt: at,
         updatedAt: at,
         recoveredAt: at,
+        leaseToken: undefined,
+        leaseExpiresAt: undefined,
+        heartbeatAt: undefined,
         lastError: inFlight
           ? '进程在模型调用期间退出：本次请求结果不确定，已重新排队（不会重复生成候选）'
           : '进程在任务执行中退出，已重新排队',
@@ -318,6 +337,46 @@ export class AutoTaskStore {
 
   get(id: string): AutoTask | undefined {
     return this.#tasks.find((task) => task.id === id)
+  }
+
+  /**
+   * Backfill global reply keys reconstructed from a pre-v0.2.2 task ledger.
+   *
+   * The identity ledger must be committed before this method is called. All
+   * assignments are persisted in one write; a failure is thrown and leaves the
+   * in-memory tasks unchanged. Re-running with the same assignments is a no-op,
+   * so startup can repair the crash window between the two ledger writes.
+   */
+  backfillIdentityKeys(assignments: ReadonlyMap<string, readonly string[]>, at = new Date().toISOString()): number {
+    let changed = 0
+    const next = this.#tasks.map((task) => {
+      const additions = assignments.get(task.id)?.filter((key) => key !== '') ?? []
+      if (additions.length === 0) return task
+      const merged = [...new Set([
+        ...(task.identityKey === undefined ? [] : [task.identityKey]),
+        ...(task.identityKeys ?? []),
+        ...additions,
+      ])]
+      const identityKey = task.identityKey ?? (merged.length === 1 ? merged[0] : undefined)
+      const identityKeys = merged.length > 1 || task.identityKeys !== undefined ? merged : undefined
+      const keysUnchanged = identityKeys === task.identityKeys || (
+        identityKeys !== undefined
+        && task.identityKeys !== undefined
+        && identityKeys.length === task.identityKeys.length
+        && identityKeys.every((key, index) => key === task.identityKeys?.[index])
+      )
+      const unchanged = identityKey === task.identityKey && keysUnchanged
+      if (unchanged) return task
+      changed += 1
+      return {
+        ...task,
+        ...(identityKey === undefined ? {} : { identityKey }),
+        ...(identityKeys === undefined ? {} : { identityKeys }),
+        updatedAt: at,
+      }
+    })
+    if (changed > 0) this.#commit(next)
+    return changed
   }
 
   /** A non-terminal task with the same key: the de-duplication fence. */
@@ -369,7 +428,11 @@ export class AutoTaskStore {
       .filter((task) => task.state === 'running' && task.startedAt !== undefined)
       .reduce<number>((acc, task) => Math.max(acc, now - Date.parse(task.startedAt as string)), 0)
     const stuck = this.#tasks.filter(
-      (task) => task.state === 'running' && task.startedAt !== undefined && now - Date.parse(task.startedAt) > stuckAfterMs,
+      (task) =>
+        task.state === 'running' &&
+        (task.leaseExpiresAt !== undefined
+          ? Date.parse(task.leaseExpiresAt) <= now
+          : task.startedAt !== undefined && now - Date.parse(task.startedAt) > stuckAfterMs),
     ).length
     const used = this.#tasks.length
     const oldestPendingAgeSec =
@@ -420,6 +483,8 @@ export class AutoTaskStore {
       monitorId: input.monitorId,
       ...(input.postId === undefined ? {} : { postId: input.postId }),
       ...(input.postIds === undefined ? {} : { postIds: [...input.postIds] }),
+      ...(input.identityKey === undefined ? {} : { identityKey: input.identityKey }),
+      ...(input.identityKeys === undefined ? {} : { identityKeys: [...input.identityKeys] }),
       ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
       dedupeKey: input.dedupeKey,
       state: 'pending',
@@ -434,8 +499,8 @@ export class AutoTaskStore {
     return { task, deduplicated: false }
   }
 
-  /** Claim one due task, respecting the concurrency caps. */
-  claim(now = Date.now()): AutoTask | undefined {
+  /** Claim one due task and give it a durable lease. */
+  claim(now = Date.now(), leaseMs = 10 * 60 * 1000): AutoTask | undefined {
     if (this.#paused) return undefined
     const candidate = this.#tasks
       .filter((entry) => (entry.state === 'pending' || entry.state === 'retry_wait') && Date.parse(entry.nextRunAt) <= now)
@@ -448,12 +513,24 @@ export class AutoTaskStore {
       attempts: candidate.attempts + 1,
       startedAt,
       updatedAt: startedAt,
+      leaseToken: randomUUID(),
+      leaseExpiresAt: new Date(now + leaseMs).toISOString(),
+      heartbeatAt: startedAt,
       // A fresh execution: any previous uncertainty belongs to the previous
       // attempt and stays in the log, not on the new call record.
       modelCall: undefined,
     }
     this.#commit(this.#replace(claimed))
     return claimed
+  }
+
+  /** Renew a live lease. A stale token cannot extend somebody else's work. */
+  renewLease(id: string, token: string | undefined, now = Date.now(), leaseMs = 10 * 60 * 1000): boolean {
+    const task = this.get(id)
+    if (task === undefined || task.state !== 'running' || task.leaseToken === undefined || task.leaseToken !== token) return false
+    const at = new Date(now).toISOString()
+    this.#commit(this.#replace({ ...task, heartbeatAt: at, leaseExpiresAt: new Date(now + leaseMs).toISOString(), updatedAt: at }))
+    return true
   }
 
   /**
@@ -473,8 +550,45 @@ export class AutoTaskStore {
         attempts: Math.max(0, task.attempts - 1),
         nextRunAt: new Date(Date.now() + 500).toISOString(),
         updatedAt: new Date().toISOString(),
+        leaseToken: undefined,
+        leaseExpiresAt: undefined,
+        heartbeatAt: undefined,
       }),
     )
+  }
+
+  /**
+   * Add newly claimed replies to an analysis batch that has not started yet.
+   *
+   * A running task already captured its target list, so appending to it would be a
+   * silent loss. The caller must queue a separate batch for those identities.
+   */
+  appendIdentities(
+    id: string,
+    additions: readonly { postId: string; identityKey: string }[],
+    at = new Date().toISOString(),
+  ): boolean {
+    const task = this.get(id)
+    if (task === undefined || task.kind !== 'analyze') return false
+    if (task.state !== 'pending' && task.state !== 'retry_wait') return false
+    const known = new Set(task.identityKeys ?? [])
+    const fresh = additions.filter((entry) => !known.has(entry.identityKey))
+    if (fresh.length === 0) return true
+    const postIds = [...(task.postIds ?? (task.postId === undefined ? [] : [task.postId]))]
+    const knownPosts = new Set(postIds)
+    for (const entry of fresh) {
+      if (!knownPosts.has(entry.postId)) {
+        postIds.push(entry.postId)
+        knownPosts.add(entry.postId)
+      }
+    }
+    this.#commit(this.#replace({
+      ...task,
+      postIds,
+      identityKeys: [...(task.identityKeys ?? []), ...fresh.map((entry) => entry.identityKey)],
+      updatedAt: at,
+    }))
+    return true
   }
 
   /** Record that a model call is about to be sent. */
@@ -535,6 +649,7 @@ export class AutoTaskStore {
         ...(detail.error === undefined ? {} : { lastError: detail.error }),
         ...(detail.errorKind === undefined ? {} : { lastErrorKind: detail.errorKind }),
         ...(detail.sessionId === undefined ? {} : { sessionId: detail.sessionId }),
+        ...(terminal ? { leaseToken: undefined, leaseExpiresAt: undefined, heartbeatAt: undefined } : {}),
       }),
     )
   }
@@ -553,6 +668,9 @@ export class AutoTaskStore {
         retryAfterMs: Math.max(1000, delayMs),
         lastError: detail.error,
         lastErrorKind: detail.errorKind,
+        leaseToken: undefined,
+        leaseExpiresAt: undefined,
+        heartbeatAt: undefined,
         updatedAt: at,
         logs: [...task.logs, {
           at,
@@ -567,7 +685,7 @@ export class AutoTaskStore {
     const task = this.get(id)
     if (task === undefined || isTerminal(task.state)) return false
     const at = new Date().toISOString()
-    this.#commit(this.#replace({ ...task, state: 'cancelled', finishedAt: at, updatedAt: at }))
+    this.#commit(this.#replace({ ...task, state: 'cancelled', finishedAt: at, updatedAt: at, leaseToken: undefined, leaseExpiresAt: undefined, heartbeatAt: undefined }))
     return true
   }
 
@@ -590,6 +708,9 @@ export class AutoTaskStore {
         nextRunAt: at,
         updatedAt: at,
         finishedAt: undefined,
+        leaseToken: undefined,
+        leaseExpiresAt: undefined,
+        heartbeatAt: undefined,
         lastError: undefined,
         lastErrorKind: undefined,
         retryAfterMs: undefined,
@@ -610,7 +731,10 @@ export class AutoTaskStore {
   reapStuck(now = Date.now(), timeoutMs = 10 * 60 * 1000): readonly string[] {
     const stuck = this.#tasks.filter(
       (task) =>
-        task.state === 'running' && task.startedAt !== undefined && now - Date.parse(task.startedAt) > timeoutMs,
+        task.state === 'running' &&
+        (task.leaseExpiresAt !== undefined
+          ? Date.parse(task.leaseExpiresAt) <= now
+          : task.startedAt !== undefined && now - Date.parse(task.startedAt) > timeoutMs),
     )
     if (stuck.length === 0) return []
     const at = new Date(now).toISOString()
@@ -624,6 +748,9 @@ export class AutoTaskStore {
             updatedAt: at,
             lastError: `任务超过 ${Math.round(timeoutMs / 1000)} 秒未结束，已判定为卡死`,
             lastErrorKind: 'stuck',
+            leaseToken: undefined,
+            leaseExpiresAt: undefined,
+            heartbeatAt: undefined,
             modelCall: task.modelCall === undefined ? undefined : { ...task.modelCall, uncertain: true },
             logs: [...task.logs, { at, level: 'error' as const, message: '超时，判定为卡死' }].slice(-MAX_LOGS),
           }

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to release (e.g. v0.2.1)'
+        description: 'Existing tag to release (e.g. v0.2.2)'
         required: true
 
 permissions:
@@ -15,6 +15,7 @@ permissions:
 
 env:
   NODE_VERSION: '22.18.0'
+  RELEASE_VERSION: '0.2.2'
 
 jobs:
   guard:
@@ -22,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - name: Check the release does not exist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -39,6 +42,12 @@ jobs:
         run: |
           set -euo pipefail
           PKG=$(node -p "require('./package.json').version")
+          # This workflow's real-upgrade gate is specifically for v0.2.2. Do not
+          # let a later tag silently reuse an older compatibility matrix.
+          if [ "$PKG" != "$RELEASE_VERSION" ]; then
+            echo "::error::此发布工作流只接受 package.json $RELEASE_VERSION，实际为 $PKG"
+            exit 1
+          fi
           # A tag that disagrees with package.json produces artefacts whose reported
           # version is not the one on the download page — the exact mismatch that
           # makes "which build is this?" unanswerable later.
@@ -47,15 +56,26 @@ jobs:
             exit 1
           fi
           echo "package.json 与标签一致：$TAG"
-      - name: Check the release notes exist
+      - name: Check the six required release documents
         env:
           TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          test -f "docs/release-notes-${TAG}.md" || {
-            echo "::error::缺少 docs/release-notes-${TAG}.md"
-            exit 1
-          }
+          DOCUMENTS=(
+            "architecture-${TAG}.md"
+            "reliability-${TAG}.md"
+            "security-audit-${TAG}.md"
+            "release-notes-${TAG}.md"
+            "upgrade-${TAG}.md"
+            "acceptance-${TAG}.md"
+          )
+          for document in "${DOCUMENTS[@]}"; do
+            test -s "docs/$document" || {
+              echo "::error::缺少或为空：docs/$document"
+              exit 1
+            }
+          done
+          echo "六份 ${TAG} 发布文档齐全"
 
   verify:
     name: Verify before release
@@ -63,6 +83,8 @@ jobs:
     needs: guard
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -71,14 +93,93 @@ jobs:
       - run: node scripts/scan-secrets.mjs
       - run: npm run typecheck
       - run: npm run build && npm run bundle
+      - name: Download and verify the published upgrade binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          download_legacy() {
+            local release_tag="$1"
+            local expected_version="$2"
+            local env_name="$3"
+            local work_dir="$4"
+            local asset='ai-debate-linux-x64.tgz'
+            local archive="$work_dir/$asset"
+            local sums="$work_dir/SHA256SUMS.txt"
+            local unpack="$work_dir/pkg"
+
+            rm -rf "$work_dir"
+            mkdir -p "$unpack"
+            gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset" --pattern 'SHA256SUMS.txt' \
+              --dir "$work_dir" --clobber
+            test -s "$archive" || {
+              echo "::error::$release_tag 缺少 $asset"
+              exit 1
+            }
+            test -s "$sums" || {
+              echo "::error::$release_tag 缺少官方 SHA256SUMS.txt"
+              exit 1
+            }
+
+            local checksums=()
+            mapfile -t checksums < <(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1 }' "$sums")
+            if [ "${#checksums[@]}" -ne 1 ]; then
+              echo "::error::$release_tag 的 SHA256SUMS.txt 必须恰好包含一条 $asset 记录"
+              exit 1
+            fi
+            local expected_sha="${checksums[0]}"
+            if [[ ! "$expected_sha" =~ ^[[:xdigit:]]{64}$ ]]; then
+              echo "::error::$release_tag 的 SHA256SUMS.txt 摘要格式无效"
+              exit 1
+            fi
+            printf '%s  %s\n' "$expected_sha" "$asset" | (cd "$work_dir" && sha256sum -c -)
+
+            tar -xzf "$archive" -C "$unpack"
+            local binaries=()
+            mapfile -t binaries < <(find "$unpack" -type f -path '*/bin/ai-debate' -print)
+            if [ "${#binaries[@]}" -ne 1 ]; then
+              echo "::error::$release_tag 的 TGZ 必须恰好包含一个 bin/ai-debate"
+              exit 1
+            fi
+            local binary="${binaries[0]}"
+            chmod +x "$binary"
+            local version_output
+            version_output=$(env -u AI_DEBATE_VERSION "$binary" --version 2>&1)
+            printf '%s --version: %s\n' "$release_tag" "$version_output"
+            if ! grep -Eq "(^|[^0-9])${expected_version//./\\.}([^0-9]|$)" <<< "$version_output"; then
+              echo "::error::$release_tag 二进制版本输出不是 $expected_version"
+              exit 1
+            fi
+            printf '%s=%s\n' "$env_name" "$binary" >> "$GITHUB_ENV"
+          }
+
+          download_legacy v0.2.1 0.2.1 V021_BIN /tmp/v021
+          download_legacy v0.2.0 0.2.0 V020_BIN /tmp/v020
       - run: npm run test:core
       - run: node --experimental-transform-types --test --test-concurrency=2 "packages/server/test/**/*.test.ts"
       - run: node --test packages/web/test/*.test.mjs
+      - run: npm run test:secrets
       - run: node --experimental-transform-types test/acceptance/standalone.ts
       - run: node --experimental-transform-types test/acceptance/automation.ts
       - run: node --experimental-transform-types test/acceptance/recovery.ts
       - run: node --experimental-transform-types test/acceptance/paging.ts
-      - run: node --experimental-transform-types test/acceptance/upgrade.ts
+      - name: Require real-binary upgrade evidence
+        run: |
+          set -euo pipefail
+          : "${V021_BIN:?v0.2.1 binary was not verified}"
+          : "${V020_BIN:?v0.2.0 binary was not verified}"
+          test -x "$V021_BIN"
+          test -x "$V020_BIN"
+          AI_DEBATE_V021_BIN="$V021_BIN" AI_DEBATE_V020_BIN="$V020_BIN" \
+            node --experimental-transform-types test/acceptance/upgrade.ts
+      - name: Upload the upgrade report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-upgrade-failure
+          path: /tmp/ai-debate-upgrade-*/**
+      - run: npm run test:soak:v022
       - run: node scripts/assert-no-dsh.mjs
       - name: Soak the pipeline for five minutes
         run: node --experimental-transform-types test/stress/soak.ts --seconds=300 --interval-ms=40
@@ -86,15 +187,23 @@ jobs:
   windows:
     name: Build Windows executable
     runs-on: windows-latest
-    needs: verify
+    needs: [guard, verify]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
       - run: npm ci
       - run: npm run package:windows
+      - name: Capture the Node runtime used by the SEA build
+        run: node -e "require('node:fs').copyFileSync(process.execPath, 'dist/node-baseline.bin')"
+      - name: Verify the Windows artefact before upload
+        run: node scripts/verify-release.mjs
+      - name: Scan the executable for embedded credentials
+        run: node scripts/scan-secrets.mjs --baseline dist/node-baseline.bin dist/AI-Debate-windows-x64.exe
       - shell: pwsh
         run: |
           & dist/AI-Debate-windows-x64.exe --version
@@ -115,20 +224,51 @@ jobs:
           path: |
             dist/AI-Debate-windows-x64.exe
             dist/AI-Debate-windows-x64.exe.sha256
+            dist/node-baseline.bin
           if-no-files-found: error
 
   linux:
     name: Build Linux archive
     runs-on: ubuntu-22.04
-    needs: verify
+    needs: [guard, verify]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
       - run: npm ci
       - run: npm run package:linux
+      - name: Capture the Node runtime used by the SEA build
+        run: node -e "require('node:fs').copyFileSync(process.execPath, 'dist/node-baseline.bin')"
+      - name: Verify the Linux artefact before upload
+        run: node scripts/verify-release.mjs
+      - name: Verify the packaged Linux binary version
+        run: |
+          set -euo pipefail
+          unpack=$(mktemp -d)
+          trap 'rm -rf "$unpack"' EXIT
+          tar -xzf dist/ai-debate-linux-x64.tgz -C "$unpack"
+          binary="$unpack/ai-debate-linux-x64/bin/ai-debate"
+          test -x "$binary"
+          version_output=$(env -u AI_DEBATE_VERSION "$binary" --version 2>&1)
+          printf 'packaged --version: %s\n' "$version_output"
+          if ! grep -Eq "(^|[^0-9])${RELEASE_VERSION//./\\.}([^0-9]|$)" <<< "$version_output"; then
+            echo "::error::Linux TGZ 的 bin/ai-debate 未报告 $RELEASE_VERSION"
+            exit 1
+          fi
+      - name: Scan the packaged Linux binary for embedded credentials
+        run: |
+          set -euo pipefail
+          unpack=$(mktemp -d)
+          trap 'rm -rf "$unpack"' EXIT
+          tar -xzf dist/ai-debate-linux-x64.tgz -C "$unpack"
+          binary="$unpack/ai-debate-linux-x64/bin/ai-debate"
+          test -x "$binary"
+          node scripts/scan-secrets.mjs "$unpack"
+          node scripts/scan-secrets.mjs --baseline dist/node-baseline.bin "$binary"
       - name: Prove this runner has a working systemd
         run: |
           set -euo pipefail
@@ -154,14 +294,17 @@ jobs:
           path: |
             dist/ai-debate-linux-x64.tgz
             dist/ai-debate-linux-x64.tgz.sha256
+            dist/node-baseline.bin
           if-no-files-found: error
 
   publish:
-    name: Publish the release
+    name: Create a draft release
     runs-on: ubuntu-latest
-    needs: [guard, windows, linux]
+    needs: [guard, verify, windows, linux]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -181,80 +324,202 @@ jobs:
         run: |
           set -euo pipefail
           # The repository scan covers tracked files; an archive can still carry
-          # something that was never committed. Unpack, scan, and fail the release.
-          mkdir -p /tmp/unpack
-          tar -xzf release/ai-debate-linux-x64.tgz -C /tmp/unpack
-          node scripts/scan-secrets.mjs /tmp/unpack
-      - name: Create release
+          # something that was never committed. Scan the unpacked text/assets and
+          # the large SEA executable separately (directory scans skip >4MB files).
+          unpack=$(mktemp -d)
+          trap 'rm -rf "$unpack"' EXIT
+          tar -xzf release/ai-debate-linux-x64.tgz -C "$unpack"
+          binary="$unpack/ai-debate-linux-x64/bin/ai-debate"
+          test -x "$binary"
+          node scripts/scan-secrets.mjs "$unpack"
+          node scripts/scan-secrets.mjs --baseline artifacts/release-linux/node-baseline.bin "$binary"
+          node scripts/scan-secrets.mjs --baseline artifacts/release-windows/node-baseline.bin release/AI-Debate-windows-x64.exe
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          # `prerelease=false` is explicit: this workflow publishes production
-          # releases only, and an RC must never be produced by it.
+          # Nothing is public until verify-assets has downloaded the draft and
+          # re-checked every uploaded byte. `prerelease=false` is explicit: this
+          # workflow publishes production releases only, never an RC.
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
             --title "AI Debate $TAG" \
             --notes-file "docs/release-notes-${TAG}.md" \
+            --draft \
             --prerelease=false \
             release/AI-Debate-windows-x64.exe \
             release/ai-debate-linux-x64.tgz \
             release/SHA256SUMS.txt
 
   verify-assets:
-    name: Download the published assets and re-check them
+    name: Download the draft assets and re-check them
     runs-on: ubuntu-latest
     needs: publish
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - name: Download what was published
+      - name: Download the trusted Node baselines from this workflow run
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: baselines/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: baselines/linux
+      - name: Download every draft asset and verify checksums
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          mkdir -p downloaded
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir downloaded --clobber
-          cd downloaded
-          sha256sum -c SHA256SUMS.txt
-          echo "--- 已发布资产 ---"
-          ls -la
-      - name: Check the published checksums match the release metadata
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
-            --jq '.assets[] | "\(.name) \(.digest)"'
-      - name: Unpack and scan the published Linux archive
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/published
-          tar -xzf downloaded/ai-debate-linux-x64.tgz -C /tmp/published
-          node scripts/scan-secrets.mjs /tmp/published
-      - name: Confirm the release is the latest and not a prerelease
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-          # `gh release view --json` has no `isLatest` field, so asking for it fails
-          # the step with "Unknown JSON field" — which is how the first v0.2.1 run
-          # went red *after* a successful publish. The answer comes from the
-          # `/releases/latest` endpoint instead.
-          IS_PRE=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
-          LATEST=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
-          echo "prerelease=$IS_PRE latest=$LATEST tag=$TAG"
-          if [ "$IS_PRE" != "false" ]; then
-            echo "::error::这是一个预发布版本，正式发行不允许"
+          IS_DRAFT=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::$TAG 在资产核验前不是 draft"
             exit 1
           fi
-          if [ "$LATEST" != "$TAG" ]; then
-            echo "::error::$TAG 不是 Latest（当前是 $LATEST）"
+          rm -rf downloaded
+          mkdir -p downloaded
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir downloaded --clobber
+          actual=$(find downloaded -maxdepth 1 -type f -printf '%f\n' | sort)
+          expected=$(printf '%s\n' \
+            AI-Debate-windows-x64.exe \
+            ai-debate-linux-x64.tgz \
+            SHA256SUMS.txt | sort)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::draft 附件集合与预期不符"
+            printf 'actual:\n%s\nexpected:\n%s\n' "$actual" "$expected"
+            exit 1
+          fi
+          cd downloaded
+          sha256sum -c SHA256SUMS.txt
+          checked=$(awk 'NF >= 2 { name = $2; sub(/^\*/, "", name); print name }' SHA256SUMS.txt | sort)
+          expected_checked=$(printf '%s\n' AI-Debate-windows-x64.exe ai-debate-linux-x64.tgz | sort)
+          if [ "$checked" != "$expected_checked" ]; then
+            echo "::error::SHA256SUMS.txt 必须恰好覆盖 EXE 与 TGZ"
+            exit 1
+          fi
+          echo "--- draft 资产 ---"
+          ls -la
+      - name: Verify every GitHub asset digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          digests_file=$(mktemp)
+          trap 'rm -f "$digests_file"' EXIT
+          count=0
+          # GitHub computes asset digests asynchronously. Wait for all three, but
+          # never accept a missing digest as a successful verification.
+          for attempt in $(seq 1 30); do
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+              --jq '.assets[] | select(.digest != null) | [.name, .digest] | @tsv' > "$digests_file"; then
+              count=$(wc -l < "$digests_file")
+              if [ "$count" -eq 3 ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ "$count" -ne 3 ]; then
+            echo "::error::GitHub 未为全部三个附件提供 digest"
+            cat "$digests_file"
+            exit 1
+          fi
+          for asset in AI-Debate-windows-x64.exe ai-debate-linux-x64.tgz SHA256SUMS.txt; do
+            expected="sha256:$(sha256sum "downloaded/$asset" | cut -d ' ' -f1)"
+            actual=$(awk -F '\t' -v name="$asset" '$1 == name { print $2 }' "$digests_file")
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$asset 的 GitHub digest 与下载字节不一致"
+              exit 1
+            fi
+            echo "$asset digest 一致：$actual"
+          done
+      - name: Unpack, version-check and scan the draft assets
+        run: |
+          set -euo pipefail
+          unpack=$(mktemp -d)
+          trap 'rm -rf "$unpack"' EXIT
+          tar -xzf downloaded/ai-debate-linux-x64.tgz -C "$unpack"
+          binary="$unpack/ai-debate-linux-x64/bin/ai-debate"
+          test -x "$binary"
+          version_output=$(env -u AI_DEBATE_VERSION "$binary" --version 2>&1)
+          printf 'published --version: %s\n' "$version_output"
+          if ! grep -Eq "(^|[^0-9])${RELEASE_VERSION//./\\.}([^0-9]|$)" <<< "$version_output"; then
+            echo "::error::draft Linux TGZ 的 bin/ai-debate 未报告 $RELEASE_VERSION"
+            exit 1
+          fi
+          node scripts/scan-secrets.mjs "$unpack"
+          node scripts/scan-secrets.mjs --baseline baselines/linux/node-baseline.bin "$binary"
+          node scripts/scan-secrets.mjs --baseline baselines/windows/node-baseline.bin downloaded/AI-Debate-windows-x64.exe
+      - name: Confirm the draft is a production release candidate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          IS_PRE=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+          IS_DRAFT=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          echo "prerelease=$IS_PRE draft=$IS_DRAFT tag=$TAG"
+          if [ "$IS_PRE" != "false" ] || [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::正式化前必须仍是 draft 且不是 prerelease"
+            exit 1
+          fi
+
+  finalize:
+    name: Formalize the verified release
+    runs-on: ubuntu-latest
+    needs: verify-assets
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - name: Publish and mark latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Re-check immediately before exposing the release. Every preceding
+          # asset, digest, version and secret-scan gate must have passed.
+          IS_DRAFT=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          IS_PRE=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+          if [ "$IS_DRAFT" != "true" ] || [ "$IS_PRE" != "false" ]; then
+            echo "::error::拒绝正式化：release 必须仍是 draft 且不是 prerelease"
+            exit 1
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+      - name: Confirm the public release is latest and not a prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # `gh release view --json` has no `isLatest` field, so read the public
+          # /releases/latest endpoint after formalization.
+          IS_PRE=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+          IS_DRAFT=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          LATEST=''
+          # The public latest pointer can lag the edit briefly; require the
+          # expected tag rather than accepting the previous release.
+          for attempt in $(seq 1 30); do
+            if LATEST=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name'); then
+              if [ "$LATEST" = "$TAG" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          echo "prerelease=$IS_PRE draft=$IS_DRAFT latest=$LATEST tag=$TAG"
+          if [ "$IS_PRE" != "false" ] || [ "$IS_DRAFT" != "false" ] || [ "$LATEST" != "$TAG" ]; then
+            echo "::error::$TAG 未正确正式化为 Latest 正式版"
             exit 1
           fi

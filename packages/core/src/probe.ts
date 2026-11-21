@@ -89,6 +89,10 @@ function toProbed(entry: TimelineEntry): ProbedReply {
     ...(entry.floorNumber === undefined ? {} : { floorNumber: entry.floorNumber }),
     order: entry.order,
     fingerprint: fingerprintOf(entry),
+    // Tieba's floor and nested endpoints expose durable post ids. Other adapters
+    // must opt in explicitly as they are verified; until then a content hash is a
+    // fallback, not a claim of stable identity.
+    identityQuality: entry.platform === 'tieba' ? 'stable' : 'fallback',
   }
 }
 
@@ -106,6 +110,7 @@ function nestedAsProbed(nested: NestedReply, floorPostId: string, floorNumber: n
     floorPostId: nested.parentPostId === '' ? floorPostId : nested.parentPostId,
     ...(floorNumber === undefined ? {} : { floorNumber }),
     order,
+    identityQuality: nested.platform === 'tieba' ? 'stable' : 'fallback',
     fingerprint: fingerprintOf({
       kind: 'nested',
       ...(nested.authorId === undefined ? {} : { authorId: nested.authorId }),
@@ -262,6 +267,7 @@ export async function probeThread(runtime: Runtime, input: ProbeOptions): Promis
       ...root,
       order: 0,
       fingerprint: fingerprintOf(root),
+      identityQuality: ref.platform === 'tieba' ? 'stable' : 'fallback',
     })
   }
 
@@ -286,6 +292,7 @@ export async function probeThread(runtime: Runtime, input: ProbeOptions): Promis
           ...(floor.floorNumber === undefined ? {} : { floorNumber: floor.floorNumber }),
           order: 0,
           fingerprint: fingerprintOf(floorFields),
+          identityQuality: ref.platform === 'tieba' ? 'stable' : 'fallback',
         })
       }
 

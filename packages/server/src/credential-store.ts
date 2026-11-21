@@ -14,7 +14,7 @@
  * key file; that is stated in `docs/security.md` rather than papered over.
  */
 import { createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from 'node:crypto'
-import { chmodSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, constants as fsConstants, copyFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readJsonQuarantine, writeJson } from './atomic.ts'
@@ -66,20 +66,40 @@ export class CredentialStore implements CredentialSeam {
     this.#log = options.log ?? { warn: () => undefined }
   }
 
-  /** Load and (if needed) create the key. Returns whether a store already existed. */
+  /**
+   * Load an existing store without creating a key.
+   *
+   * A fresh installation must stay keyless until the owner actually saves a
+   * credential. Creating a throwaway key at boot would make a later restore see a
+   * mismatched key and reject an otherwise portable encrypted backup.
+   */
   load(): { loaded: boolean; corrupt: boolean } {
-    this.#key = this.#readOrCreateKey()
+    this.#entries = {}
+    if (!existsSync(this.#file)) return { loaded: false, corrupt: false }
+    const key = this.#readExistingKey()
     const { value, corrupt } = readJsonQuarantine<CredentialDocument>(this.#file)
-    if (value === undefined) {
-      this.#entries = {}
-      return { loaded: false, corrupt }
-    }
+    if (value === undefined) return { loaded: false, corrupt }
     if (value.version !== 1 || typeof value.entries !== 'object' || value.entries === null) {
       this.#log.warn('凭据文件结构不认识，已忽略（原文件保留）')
-      this.#entries = {}
       return { loaded: false, corrupt: true }
     }
+    // Keep the sealed records even when the key is missing. They cannot be read,
+    // but a later key recovery or restore may decrypt them; clearing the map here
+    // would make the next `set()` silently erase every other credential.
     this.#entries = value.entries
+    if (key === undefined) {
+      const aside = `${this.#file}.keyless-${Date.now()}`
+      try {
+        copyFileSync(this.#file, aside, fsConstants.COPYFILE_EXCL)
+        chmodSync(aside, 0o600)
+      } catch {
+        // Best effort: the warning below still tells the owner not to assume the
+        // old credentials survived.
+      }
+      this.#log.warn(`凭据文件存在但密钥缺失或损坏，拒绝用新密钥解密；原文件已另存为 ${aside}，请重新填写凭据。`)
+      return { loaded: false, corrupt: true }
+    }
+    this.#key = key
     return { loaded: true, corrupt: false }
   }
 
@@ -138,7 +158,11 @@ export class CredentialStore implements CredentialSeam {
   }
 
   #open(ref: string, sealed: SealedEntry): string | undefined {
-    const key = this.#requireKey()
+    if (this.#key === undefined) {
+      this.#log.warn(`凭据 ${ref} 无法读取：密钥缺失，请重新填写凭据。`)
+      return undefined
+    }
+    const key = this.#key
     try {
       const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(sealed.iv, 'base64'))
       decipher.setAAD(Buffer.from(ref, 'utf8'))
@@ -160,6 +184,21 @@ export class CredentialStore implements CredentialSeam {
   #requireKey(): Buffer {
     if (this.#key === undefined) this.#key = this.#readOrCreateKey()
     return this.#key
+  }
+
+  #readExistingKey(): Buffer | undefined {
+    if (!existsSync(this.#keyFile)) return undefined
+    const text = readFileSync(this.#keyFile, 'utf8').trim()
+    const decoded = Buffer.from(text, 'base64')
+    if (decoded.length === KEY_BYTES) return decoded
+    const aside = `${this.#keyFile}.damaged-${Date.now()}`
+    try {
+      writeFileSync(aside, text, { mode: 0o600 })
+    } catch {
+      // Best effort.
+    }
+    this.#log.warn(`凭据密钥长度异常（${decoded.length} 字节），原密钥已另存为 ${aside}`)
+    return undefined
   }
 
   #readOrCreateKey(): Buffer {

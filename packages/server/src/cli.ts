@@ -272,6 +272,7 @@ const HELP = `AI Debate — 独立讨论分析与回复工作台
   --host <地址>        监听地址，默认 127.0.0.1
   --data-dir <目录>    数据目录
   --log-level <级别>   debug | info | warn | error
+  --secure-cookies    会话 Cookie 加 Secure（仅 HTTPS 反代使用；也可 AI_DEBATE_SECURE_COOKIES=1）
 `
 
 function flagString(flags: Record<string, string | true>, name: string): string | undefined {
@@ -279,11 +280,19 @@ function flagString(flags: Record<string, string | true>, name: string): string 
   return typeof value === 'string' ? value : undefined
 }
 
+function secureCookiesFor(flags: Record<string, string | true>): boolean {
+  const value = flags['secure-cookies']
+  if (value === '0' || value === 'false') return false
+  if (value === true || value === '1' || value === 'true') return true
+  return process.env.AI_DEBATE_SECURE_COOKIES === '1'
+}
+
 export async function runCli(argv: readonly string[]): Promise<void> {
   const parsed = parse(argv)
   const dataDir = resolveDataDir({ flag: flagString(parsed.flags, 'data-dir') })
   const portFlag = Number(flagString(parsed.flags, 'port') ?? '')
   const hostFlag = flagString(parsed.flags, 'host')
+  const secureCookies = secureCookiesFor(parsed.flags)
 
   if (parsed.flags.version === true || parsed.command === 'version') {
     process.stdout.write(`AI Debate ${version()} (${process.platform}-${process.arch})\n`)
@@ -300,6 +309,7 @@ export async function runCli(argv: readonly string[]): Promise<void> {
       port: Number.isFinite(portFlag) && portFlag > 0 ? portFlag : Number(process.env.AI_DEBATE_PORT ?? DEFAULT_PORT),
       dataDir,
       logLevel: (flagString(parsed.flags, 'log-level') ?? process.env.AI_DEBATE_LOG_LEVEL ?? 'info') as LogLevel,
+      secureCookies,
     })
     return
   }
@@ -310,6 +320,7 @@ export async function runCli(argv: readonly string[]): Promise<void> {
       port: Number.isFinite(portFlag) && portFlag > 0 ? portFlag : Number(process.env.AI_DEBATE_PORT ?? DEFAULT_PORT),
       dataDir,
       logLevel: (flagString(parsed.flags, 'log-level') ?? process.env.AI_DEBATE_LOG_LEVEL ?? 'info') as LogLevel,
+      secureCookies,
     })
     return
   }
@@ -389,13 +400,14 @@ export async function runCli(argv: readonly string[]): Promise<void> {
   }
 
   // No command: the double-click path.
-  await launch({ dataDir, portFlag, hostFlag, openBrowser: browserAllowed(parsed.flags) })
+  await launch({ dataDir, portFlag, hostFlag, secureCookies, openBrowser: browserAllowed(parsed.flags) })
 }
 
 async function launch(options: {
   dataDir: string
   portFlag: number
   hostFlag: string | undefined
+  secureCookies: boolean
   openBrowser: boolean
 }): Promise<void> {
   const run = readRunFile(options.dataDir)
@@ -416,6 +428,7 @@ async function launch(options: {
   const args = packaged ? ['supervise'] : [process.argv[1] ?? '', 'supervise']
   if (options.portFlag > 0) args.push('--port', String(options.portFlag))
   if (options.hostFlag !== undefined) args.push('--host', options.hostFlag)
+  args.push('--secure-cookies', options.secureCookies ? '1' : '0')
   args.push('--data-dir', options.dataDir)
 
   const child = spawn(process.execPath, args, {
@@ -444,7 +457,7 @@ async function launch(options: {
   process.exitCode = 1
 }
 
-async function serveForeground(options: { host: string; port: number; dataDir: string; logLevel: LogLevel }): Promise<void> {
+async function serveForeground(options: { host: string; port: number; dataDir: string; logLevel: LogLevel; secureCookies: boolean }): Promise<void> {
   const existing = await liveInstance(options.dataDir)
   if (existing !== undefined) {
     // Exit code 3 is "already running", not "failed": the launcher and scripts
@@ -465,6 +478,7 @@ async function serveForeground(options: { host: string; port: number; dataDir: s
     dataDir: options.dataDir,
     version: version(),
     logLevel: options.logLevel,
+    secureCookies: options.secureCookies,
     webDir: resolveWebDir(),
   })
 
@@ -505,7 +519,7 @@ export function logSizeOf(dataDir: string): number {
  * the service exits cleanly (which is what the `stop` action does) so that an
  * intentional shutdown is not fought by the supervisor.
  */
-async function supervise(options: { host: string; port: number; dataDir: string; logLevel: LogLevel }): Promise<void> {
+async function supervise(options: { host: string; port: number; dataDir: string; logLevel: LogLevel; secureCookies: boolean }): Promise<void> {
   const packaged = await isSea()
   const layout = layoutOf(options.dataDir)
   let stopping = false
@@ -522,6 +536,7 @@ async function supervise(options: { host: string; port: number; dataDir: string;
   while (!stopping) {
     const args = packaged ? ['serve'] : [process.argv[1] ?? '', 'serve']
     args.push('--host', options.host, '--port', String(options.port), '--data-dir', options.dataDir, '--log-level', options.logLevel)
+    args.push('--secure-cookies', options.secureCookies ? '1' : '0')
     // `ignore`, not `inherit`: the supervisor is spawned detached by the launcher,
     // where inheriting a console that no longer exists would fail on Windows. The
     // service writes its own log file, which is what `ai-debate logs` reads.

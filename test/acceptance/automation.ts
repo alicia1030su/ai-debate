@@ -31,6 +31,7 @@ import { probeThread } from '../../packages/core/lib/probe.js'
 import { runAnalysis, runGeneration } from '../../packages/core/lib/runtime.js'
 import { MonitorStore } from '../../packages/server/src/monitor/store.ts'
 import { AutoTaskStore } from '../../packages/server/src/monitor/tasks.ts'
+import { ReplyIdentityStore } from '../../packages/server/src/monitor/identities.ts'
 import { AutomationEngine, classifyFailure, isOwnerPost } from '../../packages/server/src/monitor/engine.ts'
 import { FakeAdapter, type FakeReplySeed } from '../support/fake-adapter.ts'
 import type { DebateProductApi } from '../../packages/core/lib/product-api.js'
@@ -89,6 +90,7 @@ interface Harness {
   api: DebateProductApi
   monitors: MonitorStore
   tasks: AutoTaskStore
+  identities: ReplyIdentityStore
   engine: AutomationEngine
   adapter: FakeAdapter
   dir: string
@@ -247,9 +249,12 @@ async function harness(options: { modelPort: number; replies?: FakeReplySeed[]; 
   monitors.load()
   const tasks = new AutoTaskStore({ file: join(dir, 'auto-tasks.json'), log })
   tasks.load()
+  const identities = new ReplyIdentityStore({ file: join(dir, 'reply-identities.json'), log })
+  identities.load()
   const engine = new AutomationEngine({
     monitors,
     tasks,
+    identities,
     api: () => api,
     log: log as never,
     tickMs: 3_600_000, // the test drives ticks by hand; no timer races
@@ -261,6 +266,7 @@ async function harness(options: { modelPort: number; replies?: FakeReplySeed[]; 
     api,
     monitors,
     tasks,
+    identities,
     engine,
     adapter,
     dir,
@@ -324,8 +330,10 @@ test('挂机链路：基线 → 发现新回复 → 分析 → 生成 → 待审
     //    The key is scoped to the monitor and the reply, not to the session: a second
     //    analysis of the same thread yields a *new* session id, and a session-scoped
     //    key would let the same reply collect a second candidate under it.
-    const key = `generate:${monitor.id}:f3`
-    const again = kit.tasks.enqueue({ kind: 'generate', monitorId: monitor.id, postId: 'f3', sessionId: review[0]!.sessionId, dedupeKey: key })
+    const identity = kit.identities.all().find((entry) => entry.postId === 'f3')
+    assert.ok(identity !== undefined, '应已建立全局回复身份')
+    const key = `generate:${identity.key}`
+    const again = kit.tasks.enqueue({ kind: 'generate', monitorId: monitor.id, postId: 'f3', identityKey: identity.key, sessionId: review[0]!.sessionId, dedupeKey: key })
     assert.equal(again.deduplicated, true, '同一回复只能有一个生成任务')
 
     // 5. A fresh session for the same thread must not reopen the question.
@@ -334,7 +342,8 @@ test('挂机链路：基线 → 发现新回复 → 分析 → 生成 → 待审
       monitorId: monitor.id,
       postId: 'f3',
       sessionId: 'a-different-session',
-      dedupeKey: `generate:${monitor.id}:f3`,
+      identityKey: identity.key,
+      dedupeKey: `generate:${identity.key}`,
     })
     assert.equal(reanalyzed.deduplicated, true, '换一个会话也不能为同一回复再生成一个候选')
   } finally {
@@ -495,4 +504,40 @@ test('自己的发言不会被当成新回复去回复', () => {
   assert.equal(isOwnerPost({ authorId: 'un-name' }, { handle: 'un-name' }), true)
   assert.equal(isOwnerPost({ authorName: '昵称' }, { userName: '昵称' }), true)
   assert.equal(isOwnerPost({ authorName: '别人' }, { handle: 'un-name' }), false)
+})
+
+test('跨监控全局幂等：两个目标同时发现同一回复只生成一个候选', async () => {
+  const model = await startModel()
+  const kit = await harness({ modelPort: model.port })
+  try {
+    const one = kit.monitors.create({ name: '目标 A', url: THREAD_URL }, { platform: PLATFORM, threadId: '9001' })
+    const two = kit.monitors.create({ name: '目标 B', url: THREAD_URL }, { platform: PLATFORM, threadId: '9001' })
+    for (const monitor of [one, two]) {
+      kit.tasks.enqueue({ kind: 'probe', monitorId: monitor.id, dedupeKey: `probe:${monitor.id}` })
+    }
+    assert.equal(
+      await tickUntil(kit.engine, () => [one, two].every((monitor) => kit.monitors.get(monitor.id)?.baselineAt !== undefined)),
+      true,
+    )
+    kit.adapter.setReplies([
+      ...baseReplies(),
+      { postId: 'shared-1', author: '对方', authorId: 'rival', content: '两个监控都会看到这一条新回复。' },
+    ])
+    for (const monitor of [one, two]) {
+      kit.tasks.enqueue({ kind: 'probe', monitorId: monitor.id, dedupeKey: `probe:${monitor.id}` })
+    }
+    assert.equal(await tickUntil(kit.engine, () => kit.tasks.list().some((task) => task.state === 'needs_review')), true)
+    // Give the second probe a chance to run; it must not create another task.
+    for (let index = 0; index < 20; index += 1) await kit.engine.tick()
+    const identities = kit.identities.all().filter((entry) => entry.postId === 'shared-1')
+    const generates = kit.tasks.all().filter((task) => task.kind === 'generate' && task.postId === 'shared-1')
+    const reviews = kit.tasks.all().filter((task) => task.state === 'needs_review' && task.postId === 'shared-1')
+    assert.equal(identities.length, 1, '同一平台+帖子+回复只能有一个全局身份')
+    assert.equal(generates.length, 1, '同一回复只能有一个生成任务')
+    assert.equal(reviews.length, 1, '同一回复只能有一个待审核任务')
+    assert.equal(model.calls(), 1, '第二个监控不得触发第二次模型调用')
+  } finally {
+    await kit.dispose()
+    model.server.close()
+  }
 })

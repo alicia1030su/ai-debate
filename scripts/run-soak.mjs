@@ -182,6 +182,7 @@ function failureReport(options, stateFile, startedAt, endedAt, restarts, attempt
       convergenceLag: 0,
       convergenceLagPeak: 0,
       stuckIdentity: 0,
+      authBlockedIdentity: 0,
       coreLockTimeouts: 0,
       lockTimeoutEvents: [],
       cursorRegressions: 0,

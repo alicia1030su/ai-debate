@@ -27,6 +27,7 @@ import type { JobQueue } from './jobs.ts'
 import type { Auditor } from './audit.ts'
 import type { Logger } from './logger.ts'
 import type { WebServerRegistry } from './registry.ts'
+import type { BackupListEntry, BackupVerification } from './backup.ts'
 
 export interface HttpDeps {
   readonly auth: AuthService
@@ -39,8 +40,12 @@ export interface HttpDeps {
   readonly startedAt: string
   readonly secureCookies: boolean
   readonly host: string
+  /** Exact hostnames this deployment answers to; never inferred from the request. */
+  readonly trustedHosts: readonly string[]
   readonly port: () => number
   readonly info: () => Record<string, unknown>
+  /** Secret-free support diagnostics. */
+  readonly diagnostics: () => Record<string, unknown>
   /** Local-only token that lets the CLI stop or restart the service. */
   readonly controlToken: string
   readonly audit: Auditor
@@ -55,6 +60,7 @@ export interface HttpDeps {
     status(): Record<string, unknown>
     /** Runtime facts (memory, disk, uptime) for the status centre. */
     health(): Record<string, unknown>
+    identities(): Record<string, unknown>
     monitors(): readonly Record<string, unknown>[]
     tasks(limit: number): readonly unknown[]
     reviews(): readonly Record<string, unknown>[]
@@ -64,6 +70,8 @@ export interface HttpDeps {
       patch: { name?: string; intervalSec?: number; enabled?: boolean; accountLabel?: string; compensationHours?: number },
     ): unknown
     removeMonitor(id: string): boolean
+    /** Read-only platform probe; never advances a monitor cursor. */
+    platformCheck(id: string): Promise<Record<string, unknown>>
     checkNow(id: string): { ok: boolean; message?: string }
     scanNow(id: string, mode: 'compensate' | 'full'): { ok: boolean; message?: string }
     pauseAll(): void
@@ -80,7 +88,8 @@ export interface HttpDeps {
   }
   /** The backups on disk, newest first — what the restore action may name. */
   readonly backups: {
-    list(): readonly { name: string; createdAt: string; files: number; bytes: number }[]
+    list(): readonly BackupListEntry[]
+    verify(name: string): BackupVerification
   }
   readonly actions: {
     shutdown(reason: string): void
@@ -144,6 +153,26 @@ function remoteAddressOf(request: IncomingMessage): string {
   return request.socket.remoteAddress ?? ''
 }
 
+/** Normalise a Host header or configured hostname to a comparable form. */
+function hostnameOf(value: string): string | undefined {
+  try {
+    const parsed = new URL(`http://${value}`)
+    if (parsed.username !== '' || parsed.password !== '') return undefined
+    return parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  } catch {
+    return undefined
+  }
+}
+
+function trustedHostReason(request: IncomingMessage, trustedHosts: readonly string[]): string | undefined {
+  const raw = request.headers.host
+  if (typeof raw !== 'string' || raw === '') return 'missing host'
+  const hostname = hostnameOf(raw)
+  if (hostname === undefined) return 'unparseable host'
+  const allowed = new Set(trustedHosts.map((entry) => hostnameOf(entry)).filter((entry): entry is string => entry !== undefined))
+  return allowed.has(hostname) ? undefined : `host ${hostname} is not trusted`
+}
+
 /**
  * Refuse a request that a browser would have marked as cross-site.
  *
@@ -176,6 +205,16 @@ export function createHttpServer(deps: HttpDeps): Server {
     try {
       if (pathname === '/healthz') {
         writeJson(response, 200, { ok: true, version: deps.version, uptimeSec: Math.round(process.uptime()) })
+        return
+      }
+
+      // Host allow-listing is the DNS-rebinding fence. It runs before auth setup,
+      // because "the socket peer is loopback" is not enough when an attacker owns a
+      // domain that resolves to 127.0.0.1.
+      const hostReason = trustedHostReason(request, deps.trustedHosts)
+      if (hostReason !== undefined) {
+        deps.log.warn(`拒绝不受信 Host：${method} ${pathname}（${hostReason}）`)
+        writeJson(response, 403, { error: 'forbidden: 请求 Host 不在可信列表中。' })
         return
       }
 
@@ -215,6 +254,8 @@ export function createHttpServer(deps: HttpDeps): Server {
         // platforms and spends model calls, so it sits behind the same session as
         // the settings page. The control token is not widened to cover it.
         pathname.startsWith('/api/ai-debate/automation') ||
+        pathname.startsWith('/api/ai-debate/backups') ||
+        pathname === '/api/ai-debate/diagnostics' ||
         // The queue switch is its own path because it is not about one job: "stop
         // doing background work" applies to everything queued. It is named here in
         // the same fence, so a pause is exactly as authenticated as a cancel.
@@ -225,7 +266,9 @@ export function createHttpServer(deps: HttpDeps): Server {
         // token that only a process able to read the data directory can obtain —
         // which is the same trust level as being able to delete the state file.
         const control = request.headers['x-ai-debate-control']
-        const viaControlToken = typeof control === 'string' && control.length >= 16 && control === deps.controlToken
+        const hostname = hostnameOf(String(request.headers.host ?? ''))
+        const localOnly = isLoopback(remoteAddressOf(request)) && (hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1')
+        const viaControlToken = localOnly && typeof control === 'string' && control.length >= 16 && control === deps.controlToken
         const session = viaControlToken ? { username: 'local-cli' } : deps.auth.validate(cookieOf(request))
         if (session === undefined) {
           writeJson(response, 401, { error: 'unauthorized: 需要先登录管理后台。' })
@@ -329,7 +372,11 @@ async function handleAuth(
       writeJson(response, 409, { error: '已经初始化过了。请直接登录。' })
       return
     }
-    const allowed = deps.auth.setupAllowed(remoteAddressOf(request), typeof body.token === 'string' ? body.token : undefined)
+    const hostname = hostnameOf(String(request.headers.host ?? ''))
+    const localBrowser = isLoopback(remoteAddressOf(request)) && (hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1')
+    // A loopback peer with a LAN Host is not "local setup": that is the DNS
+    // rebinding shape. It must present the one-time token just like a remote peer.
+    const allowed = deps.auth.setupAllowed(localBrowser ? remoteAddressOf(request) : undefined, typeof body.token === 'string' ? body.token : undefined)
     if (!allowed.ok) {
       writeJson(response, 403, { error: allowed.reason })
       return
@@ -433,13 +480,96 @@ async function handleOperator(
   session: { username: string },
   viaControlToken: boolean,
 ): Promise<void> {
+  let controlActionBody: Record<string, unknown> | undefined
   if (viaControlToken) {
-    const allowed = new Set(['/api/ai-debate/system/status', '/api/ai-debate/system/action'])
-    if (!allowed.has(pathname)) {
+    if (pathname === '/api/ai-debate/system/status' && method === 'GET') {
+      // Read-only status is the only non-action control-token route.
+    } else if (pathname === '/api/ai-debate/system/action' && method === 'POST') {
+      const body = await readJsonBody(request)
+      if (body === undefined) {
+        writeJson(response, 400, { error: '请求体不是合法 JSON。' })
+        return
+      }
+      if (body.action !== 'restart' && body.action !== 'stop') {
+        writeJson(response, 403, { error: '本机控制令牌只能用于停止或重启。' })
+        return
+      }
+      controlActionBody = body
+    } else {
       writeJson(response, 403, { error: '本机控制令牌只能用于状态查询与停止/重启。' })
       return
     }
   }
+
+  if (pathname === '/api/ai-debate/backups' && method === 'GET') {
+    writeJson(response, 200, { ok: true, backups: deps.backups.list() })
+    return
+  }
+
+  if (pathname === '/api/ai-debate/backups' && method === 'POST') {
+    const body = await readJsonBody(request)
+    if (body === undefined) {
+      writeJson(response, 400, { error: '请求体不是合法 JSON。' })
+      return
+    }
+    const kind = body.kind
+    if (kind !== 'manual' && kind !== 'daily' && kind !== 'weekly') {
+      writeJson(response, 400, { error: 'kind 只能是 manual、daily 或 weekly。' })
+      return
+    }
+    const { job, deduplicated } = deps.queue.enqueue({ type: 'backup.create', key: `backup-${kind}`, payload: { kind } })
+    writeJson(response, 202, { ok: true, jobId: job.id, deduplicated, message: '备份任务已排队。' })
+    return
+  }
+
+  const backupVerify = /^\/api\/ai-debate\/backups\/([^/]+)\/verify$/.exec(pathname)
+  if (backupVerify !== null && method === 'POST') {
+    let name: string
+    try {
+      name = decodeURIComponent(backupVerify[1] as string)
+    } catch {
+      writeJson(response, 400, { error: '备份名称不合法。' })
+      return
+    }
+    const result = deps.backups.verify(name)
+    deps.audit.write('backup.verified', { name, valid: result.valid, by: session.username })
+    if (!result.valid) {
+      writeJson(response, 422, { ok: false, valid: false, error: result.error ?? '备份校验失败。' })
+      return
+    }
+    writeJson(response, 200, { ok: true, valid: true, message: '备份校验通过。' })
+    return
+  }
+
+  const backupRestore = /^\/api\/ai-debate\/backups\/([^/]+)\/restore$/.exec(pathname)
+  if (backupRestore !== null && method === 'POST') {
+    const body = await readJsonBody(request)
+    if (body === undefined || body.confirmed !== true) {
+      writeJson(response, 400, { error: '恢复备份必须明确确认（confirmed:true）。' })
+      return
+    }
+    let name: string
+    try {
+      name = decodeURIComponent(backupRestore[1] as string)
+    } catch {
+      writeJson(response, 400, { error: '备份名称不合法。' })
+      return
+    }
+    const { job } = deps.queue.enqueue({
+      type: 'backup.restore',
+      key: `restore-${name}`,
+      payload: { name, confirmed: true },
+    })
+    writeJson(response, 202, { ok: true, jobId: job.id, message: '恢复任务已排队；服务将在成功后重启。' })
+    return
+  }
+
+  if (pathname === '/api/ai-debate/diagnostics' && method === 'GET') {
+    deps.audit.write('diagnostic.exported', { by: session.username })
+    writeJson(response, 200, { ok: true, diagnostics: deps.diagnostics() })
+    return
+  }
+
   if (pathname === '/api/ai-debate/automation/status' && method === 'GET') {
     // `monitors` is the summary object from `status()`; the list is a separate
     // field. Overwriting one with the other would make `status.monitors.total`
@@ -447,6 +577,7 @@ async function handleOperator(
     writeJson(response, 200, {
       ...deps.automation.status(),
       health: deps.automation.health(),
+      identities: deps.automation.identities(),
       monitorList: deps.automation.monitors(),
       reviews: deps.automation.reviews(),
       loadErrors: deps.automation.loadErrors(),
@@ -486,7 +617,7 @@ async function handleOperator(
     return
   }
 
-  const monitorMatch = /^\/api\/ai-debate\/automation\/monitors\/([^/]+)(?:\/(check|scan|pause|resume))?$/.exec(pathname)
+  const monitorMatch = /^\/api\/ai-debate\/automation\/monitors\/([^/]+)(?:\/(platform-check|check|scan|pause|resume))?$/.exec(pathname)
   if (monitorMatch !== null) {
     const id = decodeURIComponent(monitorMatch[1] as string)
     const action = monitorMatch[2]
@@ -494,6 +625,11 @@ async function handleOperator(
       const body = await readJsonBody(request)
       if (body === undefined) {
         writeJson(response, 400, { error: '请求体不是合法 JSON。' })
+        return
+      }
+      if (action === 'platform-check') {
+        const outcome = await deps.automation.platformCheck(id)
+        writeJson(response, outcome.notFound === true ? 404 : 200, outcome)
         return
       }
       if (action === 'check') {
@@ -608,7 +744,7 @@ async function handleOperator(
   }
 
   if (pathname === '/api/ai-debate/system/action' && method === 'POST') {
-    const body = await readJsonBody(request)
+    const body = controlActionBody ?? await readJsonBody(request)
     if (body === undefined) {
       writeJson(response, 400, { error: '请求体不是合法 JSON。' })
       return
@@ -624,8 +760,8 @@ async function handleOperator(
         deps.actions.shutdown(`管理员 ${session.username} 请求停止`)
         return
       case 'backup': {
-        const { job, deduplicated } = deps.queue.enqueue({ type: 'backup.create', key: 'manual-backup' })
-        writeJson(response, 200, { ok: true, jobId: job.id, deduplicated })
+        const { job, deduplicated } = deps.queue.enqueue({ type: 'backup.create', key: 'backup-manual', payload: { kind: 'manual' } })
+        writeJson(response, 202, { ok: true, jobId: job.id, deduplicated, message: '备份任务已排队。' })
         return
       }
       case 'rotate-logs': {
@@ -638,13 +774,13 @@ async function handleOperator(
         // copy: the job takes its own `pre-restore` snapshot first and reports what
         // it did in its log, which a synchronous request could not do before the
         // response and could not survive a crash in the middle of.
-        const dir = typeof body.dir === 'string' ? body.dir : ''
-        if (!/^\d{4}-\d{2}-\d{2}T[\w-]+$/.test(dir)) {
-          writeJson(response, 400, { error: '缺少或非法的备份目录名（应为 backups/ 下的时间戳目录）。' })
+        const dir = typeof body.name === 'string' ? body.name : typeof body.dir === 'string' ? body.dir : ''
+        if (dir === '' || dir.length > 128 || body.confirmed !== true) {
+          writeJson(response, 400, { error: '缺少或非法的备份名称，且恢复必须 confirmed:true。' })
           return
         }
-        const { job } = deps.queue.enqueue({ type: 'backup.restore', key: `restore-${dir}`, payload: { dir } })
-        writeJson(response, 202, { ok: true, jobId: job.id, message: '恢复任务已排队；恢复前的数据会另存为 pre-restore-<时间>。' })
+        const { job } = deps.queue.enqueue({ type: 'backup.restore', key: `restore-${dir}`, payload: { name: dir, confirmed: true } })
+        writeJson(response, 202, { ok: true, jobId: job.id, message: '恢复任务已排队；服务将在成功后重启。' })
         return
       }
       case 'backups': {

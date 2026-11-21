@@ -27,19 +27,22 @@
 
 import { appendFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { lookup } from 'node:dns/promises'
+import { isIP } from 'node:net'
 
 /** 出网模式。 */
 export type EgressMode =
-  /** 什么都不限制（默认）：平台读取与模型都可用。 */
+  /** 不限制公网目的地（默认）；仅显式配置的初始模型 origin 可用本机/私网。 */
   | 'open'
   /**
    * 手动导入：只允许用户配置的模型地址与本机回环，**禁止任何平台主机**。
+   * 模型传输层只对初始 origin 的显式本机/私网端点放行，重定向到其他 origin 不继承该例外。
    *
    * 这条模式存在的意义是把产品承诺写进代码：粘贴一段讨论、生成回复、复制，
    * 整个过程不应该碰微博或贴吧一个字节。
    */
   | 'manual'
-  /** 完全离线：除回环外一律拒绝。用于离线验收与「拔网线也要能用」的场景。 */
+  /** 完全离线：模型与平台传输层均拒绝私网/回环。用于离线验收场景。 */
   | 'offline'
 
 /** 这次出网是为了什么。 */
@@ -71,6 +74,442 @@ export class EgressBlockedError extends Error {
   }
 }
 
+/** One validated DNS answer. The family is explicit so A and AAAA cannot be mixed accidentally. */
+export interface DnsAnswer {
+  readonly address: string
+  readonly family: 4 | 6
+}
+
+/** Resolve exactly one address family. Injectable for tests and host-specific DNS policies. */
+export type DnsResolver = (
+  hostname: string,
+  family: 4 | 6,
+) => Promise<readonly DnsAnswer[]>
+
+/** System resolver used by both the platform transport and the model transport. */
+export const systemDnsResolver: DnsResolver = async (hostname, family) => {
+  const answers = await lookup(hostname, { family, all: true, verbatim: true })
+  return answers.map((answer) => ({ address: answer.address, family: answer.family as 4 | 6 }))
+}
+
+const ipv4 = (address: string): readonly [number, number, number, number] | undefined => {
+  const parts = address.split('.')
+  if (parts.length !== 4) return undefined
+  const octets = parts.map((part) => Number(part))
+  if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return undefined
+  return octets as [number, number, number, number]
+}
+
+const ipv4PrivateEndpoint = (address: string): boolean => {
+  const parts = ipv4(address)
+  if (parts === undefined) return false
+  const [a, b] = parts
+  return (
+    a === 127 ||
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127)
+  )
+}
+
+const ipv4Blocked = (address: string): boolean => {
+  const parts = ipv4(address)
+  if (parts === undefined) return false
+  const [a, b] = parts
+  return (
+    ipv4PrivateEndpoint(address) ||
+    a === 0 ||
+    a >= 224 ||
+    (a === 169 && b === 254) ||
+    (a === 192 && b === 0) ||
+    (a === 192 && b === 2) ||
+    (a === 192 && b === 88 && parts[2] === 99) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    (a === 198 && b === 51 && parts[2] === 100) ||
+    (a === 203 && b === 0 && parts[2] === 113)
+  )
+}
+
+/** Expand IPv6 (including dotted IPv4 tails) into eight 16-bit words. */
+const ipv6Words = (address: string): readonly number[] | undefined => {
+  let normalized = address.toLowerCase().split('%', 1)[0] ?? ''
+  const dotted = /(\d+\.\d+\.\d+\.\d+)$/.exec(normalized)
+  if (dotted !== null) {
+    const parts = ipv4(dotted[1] ?? '')
+    if (parts === undefined) return undefined
+    normalized = `${normalized.slice(0, dotted.index)}${((parts[0] << 8) | parts[1]).toString(16)}:${((parts[2] << 8) | parts[3]).toString(16)}`
+  }
+  const halves = normalized.split('::')
+  if (halves.length > 2) return undefined
+  const parseHalf = (half: string): number[] | undefined => {
+    if (half === '') return []
+    const words: number[] = []
+    for (const part of half.split(':')) {
+      if (!/^[0-9a-f]{1,4}$/.test(part)) return undefined
+      words.push(Number.parseInt(part, 16))
+    }
+    return words
+  }
+  const left = parseHalf(halves[0] ?? '')
+  const right = halves.length === 2 ? parseHalf(halves[1] ?? '') : []
+  if (left === undefined || right === undefined) return undefined
+  if (halves.length === 1) return left.length === 8 ? left : undefined
+  if (left.length + right.length >= 8) return undefined
+  return [...left, ...Array<number>(8 - left.length - right.length).fill(0), ...right]
+}
+
+const ipv4OfTwoWords = (high: number | undefined, low: number | undefined): string =>
+  `${(high ?? 0) >> 8}.${(high ?? 0) & 255}.${(low ?? 0) >> 8}.${(low ?? 0) & 255}`
+
+const ipv4OfWords = (words: readonly number[]): string | undefined => {
+  const mapped = words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff
+  const translated = words.slice(0, 4).every((word) => word === 0) && words[4] === 0xffff && words[5] === 0
+  const compatible = words.slice(0, 6).every((word) => word === 0)
+  if (!mapped && !translated && !compatible) return undefined
+  return ipv4OfTwoWords(words[6], words[7])
+}
+
+const ipv6Blocked = (address: string): boolean => {
+  const words = ipv6Words(address)
+  if (words === undefined) return true
+  if (words.every((word) => word === 0)) return true
+  if (words.slice(0, 7).every((word) => word === 0) && words[7] === 1) return true
+
+  // IPv4-mapped, translated and compatible IPv6 must be judged as IPv4.
+  const embedded = ipv4OfWords(words)
+  if (embedded !== undefined) return ipv4Blocked(embedded)
+
+  const first = words[0] ?? 0
+  // 6to4 and the well-known NAT64 prefix carry an IPv4 destination in the tail.
+  if (first === 0x2002 && ipv4Blocked(ipv4OfTwoWords(words[1], words[2]))) return true
+  if (
+    first === 0x64 && words[1] === 0xff9b &&
+    words.slice(2, 6).every((word) => word === 0) &&
+    ipv4Blocked(ipv4OfTwoWords(words[6], words[7]))
+  ) return true
+  // Teredo obfuscates the client IPv4 address by XORing every bit with one.
+  if (first === 0x2001 && words[1] === 0) {
+    const server = ipv4OfTwoWords(words[2], words[3])
+    const client = ipv4OfTwoWords((words[6] ?? 0) ^ 0xffff, (words[7] ?? 0) ^ 0xffff)
+    if (ipv4Blocked(server) || ipv4Blocked(client)) return true
+  }
+
+  // fc00::/7, fe80::/10, fec0::/10, multicast, and the documentation prefix.
+  return (
+    (first & 0xfe00) === 0xfc00 ||
+    (first & 0xffc0) === 0xfe80 ||
+    (first & 0xffc0) === 0xfec0 ||
+    (first & 0xff00) === 0xff00 ||
+    (first === 0x2001 && words[1] === 0x0db8)
+  )
+}
+
+/** Whether an address is loopback, including expanded and IPv4-mapped IPv6. */
+export function isLoopbackAddress(address: string): boolean {
+  const host = address.toLowerCase().replace(/^\[|\]$/g, '')
+  const parts = ipv4(host)
+  if (parts !== undefined) return parts[0] === 127
+  const words = ipv6Words(host)
+  if (words === undefined) return false
+  if (words.slice(0, 7).every((word) => word === 0) && words[7] === 1) return true
+  const embedded = ipv4OfWords(words)
+  return embedded !== undefined && ipv4(embedded)?.[0] === 127
+}
+
+/**
+ * Whether an address is an explicitly configurable local/private model destination.
+ * Link-local, metadata, multicast and documentation addresses remain forbidden.
+ */
+export function isPrivateEndpointAddress(address: string): boolean {
+  const host = address.toLowerCase().replace(/^\[|\]$/g, '')
+  if (isIP(host) === 4) return ipv4PrivateEndpoint(host)
+  if (isIP(host) !== 6) return false
+  if (isLoopbackAddress(host)) return true
+  const words = ipv6Words(host)
+  if (words === undefined) return false
+  if (((words[0] ?? 0) & 0xfe00) === 0xfc00) return true
+  const embedded = ipv4OfWords(words)
+  return embedded !== undefined && ipv4PrivateEndpoint(embedded)
+}
+
+/**
+ * Whether an IP is forbidden for untrusted egress.
+ *
+ * The list is deliberately fail-closed for local, private, carrier-grade NAT and
+ * metadata ranges. It is shared by literal-URL checks and the socket lookup, so a
+ * hostname cannot pass one check and resolve to a different class of address at
+ * connection time.
+ */
+export function isBlockedNetworkAddress(address: string): boolean {
+  const host = address.toLowerCase().replace(/^\[|\]$/g, '')
+  if (isIP(host) === 4) return ipv4Blocked(host)
+  if (isIP(host) === 6) return ipv6Blocked(host)
+  // Unknown address formats are never safe to connect to.
+  return true
+}
+
+/** Options for resolving and validating every A/AAAA answer before a socket opens. */
+export interface ResolveNetworkHostOptions {
+  readonly resolver?: DnsResolver
+  /** Only for an explicitly configured local model endpoint; every answer must be loopback. */
+  readonly allowLoopback?: boolean
+  /** Only for the configured initial model origin; permits loopback/RFC1918/CGNAT/ULA, never metadata. */
+  readonly allowPrivateEndpoint?: boolean
+  readonly purpose?: EgressPurpose
+  readonly mode?: EgressMode
+}
+
+/** Apply the destination class policy to a complete, family-validated answer set. */
+function assertAllowedAnswers(
+  host: string,
+  answers: readonly DnsAnswer[],
+  options: ResolveNetworkHostOptions,
+): void {
+  const purpose = options.purpose ?? 'other'
+  const mode = options.mode ?? 'open'
+  if (options.allowPrivateEndpoint === true) {
+    const allPrivate = answers.every((answer) => isPrivateEndpointAddress(answer.address))
+    const allPublic = answers.every((answer) => !isBlockedNetworkAddress(answer.address))
+    if (!allPrivate && !allPublic) {
+      throw new EgressBlockedError(
+        host,
+        purpose,
+        mode,
+        '显式模型端点的 DNS 答案必须全部为本机/私网或全部为公网，不能混合或包含元数据/链路本地地址',
+      )
+    }
+    return
+  }
+  if (options.allowLoopback === true) {
+    if (!answers.every((answer) => isLoopbackAddress(answer.address))) {
+      throw new EgressBlockedError(host, purpose, mode, '本机模型端点不得解析到非回环地址')
+    }
+    return
+  }
+  const unsafe = answers.find((answer) => isBlockedNetworkAddress(answer.address))
+  if (unsafe !== undefined) {
+    throw new EgressBlockedError(host, purpose, mode, `拒绝私网、回环、链路本地或元数据地址 ${unsafe.address}`)
+  }
+}
+
+/**
+ * Resolve both address families and reject the host if any answer is unsafe.
+ *
+ * A missing family (`ENOTFOUND`) is normal for an IPv4-only or IPv6-only host.
+ * Any other resolver failure fails closed rather than silently using a partial
+ * answer set. Returned answers are the exact addresses the transport must pin.
+ */
+export async function resolveNetworkHost(
+  hostname: string,
+  options: ResolveNetworkHostOptions = {},
+): Promise<readonly DnsAnswer[]> {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  const purpose = options.purpose ?? 'other'
+  const mode = options.mode ?? 'open'
+  const resolver = options.resolver ?? systemDnsResolver
+  const literalFamily = isIP(host)
+  let answers: readonly DnsAnswer[]
+
+  if (literalFamily !== 0) {
+    answers = [{ address: host, family: literalFamily as 4 | 6 }]
+  } else {
+    const settled = await Promise.allSettled([
+      resolver(host, 4),
+      resolver(host, 6),
+    ])
+    const failures = settled
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map((result) => result.reason as NodeJS.ErrnoException | undefined)
+    const unexpected = failures.find((failure) => failure?.code !== 'ENOTFOUND')
+    if (unexpected !== undefined) throw unexpected
+    if (settled.every((result) => result.status === 'rejected')) {
+      throw failures[0] ?? new Error(`DNS 解析失败：${host}`)
+    }
+    answers = settled.flatMap((result) => result.status === 'fulfilled' ? [...result.value] : [])
+    if (answers.length === 0) throw failures[0] ?? new Error(`DNS 没有返回可用地址：${host}`)
+  }
+
+  for (const answer of answers) {
+    if (isIP(answer.address) !== answer.family) {
+      throw new EgressBlockedError(host, purpose, mode, `DNS 返回了无效的 IPv${answer.family} 地址`)
+    }
+  }
+  assertAllowedAnswers(host, answers, options)
+  return [...new Map(answers.map((answer) => [`${answer.family}:${answer.address}`, answer])).values()]
+}
+
+interface AgentConstructor {
+  new (options: {
+    connect: {
+      lookup: (
+        hostname: string,
+        options: { family?: number; all?: boolean },
+        callback: (
+          error: NodeJS.ErrnoException | null,
+          addressOrAddresses: string | DnsAnswer | readonly DnsAnswer[],
+          family?: 4 | 6,
+        ) => void,
+      ) => void
+    }
+  }): {
+    close: () => Promise<void>
+  }
+}
+
+const nativeFetch: typeof fetch = globalThis.fetch
+const UNDICI_DISPATCHER = Symbol.for('undici.globalDispatcher.1')
+
+/** Per-host policy used by the connection-time resolver. */
+export interface PinnedHostOptions {
+  readonly resolver?: DnsResolver
+  readonly allowLoopback?: boolean
+  readonly allowPrivateEndpoint?: boolean
+  readonly purpose?: EgressPurpose
+  readonly mode?: EgressMode
+}
+
+interface PinnedHost {
+  options: PinnedHostOptions
+  values: readonly DnsAnswer[] | undefined
+  pending: Promise<readonly DnsAnswer[]> | undefined
+  pinned: boolean
+}
+
+/**
+ * An Undici Agent that resolves and validates all A/AAAA answers at the first
+ * real socket lookup, then pins that exact set for every later connection.
+ *
+ * Node bundles Undici inside `fetch` but does not expose it as an installable
+ * package. Reusing the global fetch Agent constructor avoids a dependency while
+ * preserving Host/SNI. Failure to create this Agent is fatal: silently falling
+ * back to system lookup would reintroduce DNS rebinding.
+ */
+export class PinnedDnsAgent {
+  readonly pinned = true
+  private readonly dispatcher: { close: () => Promise<void> }
+  private readonly hosts = new Map<string, PinnedHost>()
+
+  private constructor(dispatcher: { close: () => Promise<void> }, hosts: Map<string, PinnedHost>) {
+    this.dispatcher = dispatcher
+    this.hosts = hosts
+  }
+
+  /** Create the agent, initializing Node's bundled fetch dispatcher when necessary. */
+  static async create(
+    hostname = '<unknown>',
+    purpose: EgressPurpose = 'other',
+    mode: EgressMode = 'open',
+  ): Promise<PinnedDnsAgent> {
+    let globalDispatcher = (globalThis as unknown as Record<symbol, unknown>)[UNDICI_DISPATCHER] as
+      | { constructor?: unknown }
+      | undefined
+    if (globalDispatcher === undefined) {
+      // A data URL performs no network I/O but initializes Node's fetch dispatcher.
+      try {
+        const warmup = await nativeFetch('data:text/plain,')
+        await warmup.arrayBuffer()
+      } catch (error) {
+        throw new EgressBlockedError(hostname, purpose, mode, `无法初始化固定 DNS 的 Undici Agent：${String(error)}`)
+      }
+      globalDispatcher = (globalThis as unknown as Record<symbol, unknown>)[UNDICI_DISPATCHER] as
+        | { constructor?: unknown }
+        | undefined
+    }
+    const Agent = globalDispatcher?.constructor as AgentConstructor | undefined
+    if (typeof Agent !== 'function') {
+      throw new EgressBlockedError(hostname, purpose, mode, '当前环境不提供可固定 DNS 的 Undici Agent，已拒绝出网')
+    }
+
+    const hosts = new Map<string, PinnedHost>()
+    let instance: { close: () => Promise<void> }
+    try {
+      instance = new Agent({
+        connect: {
+          lookup: (requestedHost, lookupOptions, callback): void => {
+            const host = requestedHost.toLowerCase().replace(/^\[|\]$/g, '')
+            const entry = hosts.get(host)
+            if (entry === undefined) {
+              callback(Object.assign(new Error(`没有为 ${host} 配置连接期 DNS 校验`), { code: 'ENOTFOUND' }), [])
+              return
+            }
+            // The first socket lookup resolves and pins both families. Concurrent
+            // lookups share that work; every later socket reuses the exact answers.
+            const resolve = entry.values === undefined
+              ? entry.pending ??= resolveNetworkHost(host, {
+                resolver: entry.options.resolver,
+                allowLoopback: entry.options.allowLoopback,
+                allowPrivateEndpoint: entry.options.allowPrivateEndpoint,
+                purpose: entry.options.purpose,
+                mode: entry.options.mode,
+              }).then((answers) => {
+                entry.values = answers
+                return answers
+              }).finally(() => {
+                entry.pending = undefined
+              })
+              : Promise.resolve(entry.values)
+
+            void resolve.then((answers) => {
+              const family = lookupOptions.family === 6 ? 6 : lookupOptions.family === 4 ? 4 : undefined
+              try {
+                // Redirects can tighten the policy without changing the pinned
+                // destinations, so re-check the complete set before selecting.
+                assertAllowedAnswers(host, answers, entry.options)
+              } catch (error) {
+                callback(error as NodeJS.ErrnoException, [])
+                return
+              }
+              const selected = answers.filter((answer) => family === undefined || answer.family === family)
+              if (selected.length === 0) {
+                callback(Object.assign(new Error(`没有 IPv${family} 的已验证地址`), { code: 'ENOTFOUND' }), [])
+                return
+              }
+              if (lookupOptions.all === true) callback(null, selected)
+              else callback(null, selected[0]?.address ?? '', selected[0]?.family)
+              entry.pinned = true
+            }).catch((error: unknown) => {
+              callback(error as NodeJS.ErrnoException, [])
+            })
+          },
+        },
+      })
+    } catch (error) {
+      throw new EgressBlockedError(hostname, purpose, mode, `无法创建固定 DNS 的 Undici Agent：${String(error)}`)
+    }
+    return new PinnedDnsAgent(instance, hosts)
+  }
+
+  /** Register the resolver/policy for a hostname; answers are pinned only at socket lookup. */
+  remember(hostname: string, options: PinnedHostOptions = {}): void {
+    const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    const existing = this.hosts.get(host)
+    if (existing === undefined) {
+      this.hosts.set(host, { options: { ...options }, values: undefined, pending: undefined, pinned: false })
+    } else {
+      // Keep already pinned values across redirects, but apply the strictest
+      // current policy when the socket lookup selects from them.
+      existing.options = { ...options }
+    }
+  }
+
+  /** Whether this hostname has completed at least one validated socket lookup. */
+  isPinned(hostname: string): boolean {
+    const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    return this.hosts.get(host)?.pinned === true
+  }
+
+  /** Undici accepts this non-standard RequestInit field on Node's native fetch. */
+  get dispatcherOption(): unknown {
+    return this.dispatcher
+  }
+
+  /** Close idle sockets after the response body has been consumed. */
+  async close(): Promise<void> {
+    await this.dispatcher.close()
+  }
+}
+
 /** 守卫需要的策略。 */
 export interface EgressPolicy {
   readonly mode: EgressMode
@@ -82,6 +521,11 @@ export interface EgressPolicy {
    * 配置失误就能让「手动导入不碰平台」这条承诺失效。
    */
   readonly allowedHosts: readonly string[]
+  /**
+   * Exact configured model origins. Only the initial request at one of these
+   * origins may use the local/private endpoint exception; redirects cannot.
+   */
+  readonly allowedOrigins?: readonly string[]
 }
 
 /** 平台主机：出现在这里的地址在 manual / offline 下一律拒绝。 */
@@ -93,10 +537,52 @@ export const PLATFORM_HOSTS: readonly RegExp[] = [
   /(^|\.)tieba\.com$/i,
 ]
 
-/** 本机回环：无论哪种模式都允许。 */
+/** 本机回环：策略层识别主机名；传输层仍会校验解析出的具体地址。 */
 function isLoopback(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
-  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.localhost')
+  return host === 'localhost' || host.endsWith('.localhost') || isLoopbackAddress(host)
+}
+
+/** Model fetch follows at most five redirects, matching the platform transport. */
+const MAX_MODEL_REDIRECTS = 5
+const MODEL_REDIRECT_STATUSES: ReadonlySet<number> = new Set([301, 302, 303, 307, 308])
+
+/** Validate a model URL before either policy or DNS checks see it. */
+function modelUrl(raw: string, mode: EgressMode): string {
+  let parsed: URL
+  try {
+    parsed = new URL(raw)
+  } catch {
+    throw new EgressBlockedError(raw, 'model', mode, '模型请求地址不是有效的绝对 URL')
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new EgressBlockedError(parsed.hostname, 'model', mode, '模型请求使用了不安全的协议')
+  }
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw new EgressBlockedError(parsed.hostname, 'model', mode, '模型请求地址不得内嵌用户名或密码')
+  }
+  parsed.hash = ''
+  return parsed.href
+}
+
+/** Remove credentials and origin-bearing headers before a cross-origin model redirect. */
+function stripModelCredentials(headers: Headers): void {
+  for (const name of ['authorization', 'cookie', 'proxy-authorization', 'referer', 'origin', 'host']) {
+    headers.delete(name)
+  }
+}
+
+/** Find an egress refusal wrapped by native fetch/Undici without losing its code. */
+function findEgressBlockedError(error: unknown): EgressBlockedError | undefined {
+  let current: unknown = error
+  for (let depth = 0; depth < 4 && current !== null && typeof current === 'object'; depth += 1) {
+    const candidate = current as { name?: unknown; code?: unknown; cause?: unknown }
+    if (candidate.code === 'egress_blocked' && candidate.name === 'EgressBlockedError') {
+      return current as EgressBlockedError
+    }
+    current = candidate.cause
+  }
+  return undefined
 }
 
 /** 主机是否是平台。 */
@@ -172,10 +658,12 @@ export class EgressLog {
 export class EgressGuard {
   private readonly policy: EgressPolicy
   private readonly log: EgressLog
+  private readonly resolver: DnsResolver
 
-  constructor(policy: EgressPolicy, log: EgressLog) {
+  constructor(policy: EgressPolicy, log: EgressLog, options: { resolver?: DnsResolver } = {}) {
     this.policy = policy
     this.log = log
+    this.resolver = options.resolver ?? systemDnsResolver
   }
 
   mode(): EgressMode {
@@ -210,36 +698,176 @@ export class EgressGuard {
     if (mode === 'open') return { allowed: true, reason: 'open 模式不限制出网' }
 
     const loopback = isLoopback(host)
-    if (loopback) return { allowed: true, reason: '本机回环' }
 
     // 平台主机先判：即使有人把它写进 allowedHosts，manual / offline 也不放行。
     if (isPlatformHost(host)) {
       return { allowed: false, reason: `${mode} 模式禁止访问平台主机` }
     }
     if (mode === 'offline') {
-      return { allowed: false, reason: 'offline 模式只允许本机回环' }
+      return { allowed: false, reason: 'offline 模式禁止模型与平台访问私网/回环' }
     }
-    // manual：只放模型用途 + 白名单里的主机。
-    if (this.policy.allowedHosts.some((entry) => entry.toLowerCase() === host.toLowerCase())) {
-      return { allowed: true, reason: purpose === 'model' ? '手动导入模式下允许的模型地址' : '在允许清单里' }
+    if (loopback) return { allowed: true, reason: '本机回环' }
+    // manual：只放模型用途 + 白名单里的主机。平台请求不能借用模型白名单。
+    if (purpose === 'model' && this.policy.allowedHosts.some((entry) => entry.toLowerCase() === host.toLowerCase())) {
+      return { allowed: true, reason: '手动导入模式下允许的模型地址' }
     }
     return { allowed: false, reason: 'manual 模式只允许配置的模型地址与本机回环' }
   }
 
-  /** 包一层 fetch：先判断，再真正发出。 */
+  /**
+   * Wrap model fetch with policy checks, DNS pinning and manual redirects.
+   *
+   * Every redirect is new egress. Credentials never cross origins, request
+   * bodies are never replayed by 307/308 to another origin, and TLS is never
+   * downgraded. In open/manual mode, an explicitly configured initial model
+   * origin may resolve to loopback/RFC1918/CGNAT/ULA. Redirects never inherit
+   * that exception, and offline mode always refuses private destinations.
+   */
   fetch(base: typeof fetch = fetch): typeof fetch {
-    const guarded = async (input: string | URL | { url: string }, init?: RequestInit): Promise<Response> => {
-      // 兼容 Request 对象：取它的 url。
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : (input as Request).url
-      this.check(url, 'model')
-      return base(input as Parameters<typeof base>[0], init)
+    const guarded = async (input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? new Request(input, init) : new Request(input, init)
+      request.signal.throwIfAborted()
+      let currentUrl = modelUrl(request.url, this.policy.mode)
+      const initialOrigin = new URL(currentUrl).origin
+      let currentMethod = request.method.toUpperCase()
+      let currentBody: Uint8Array | undefined = request.body === null
+        ? undefined
+        : new Uint8Array(await request.arrayBuffer())
+      const requestHeaders = new Headers(request.headers)
+      const visited = new Set<string>()
+      const initialHost = new URL(currentUrl).hostname
+      const agent = await PinnedDnsAgent.create(initialHost, 'model', this.policy.mode)
+      const configuredOrigin = this.policy.allowedOrigins === undefined
+        ? this.policy.allowedHosts.some((host) => host.toLowerCase() === initialHost.toLowerCase())
+        : this.policy.allowedOrigins.includes(initialOrigin)
+      let finalResponse: Response | undefined
+
+      try {
+        for (let hop = 0; ; hop += 1) {
+          if (hop > MAX_MODEL_REDIRECTS) {
+            throw new EgressBlockedError(currentUrl, 'model', this.policy.mode, `模型重定向超过 ${MAX_MODEL_REDIRECTS} 次`)
+          }
+          if (visited.has(currentUrl)) {
+            throw new EgressBlockedError(currentUrl, 'model', this.policy.mode, '检测到模型 HTTP 重定向循环')
+          }
+          visited.add(currentUrl)
+
+          const current = new URL(currentUrl)
+          this.check(currentUrl, 'model')
+          const allowPrivateEndpoint =
+            this.policy.mode !== 'offline' &&
+            configuredOrigin &&
+            current.origin === initialOrigin
+          try {
+            if (!agent.isPinned(current.hostname)) {
+              await resolveNetworkHost(current.hostname, {
+                resolver: this.resolver,
+                allowPrivateEndpoint,
+                purpose: 'model',
+                mode: this.policy.mode,
+              })
+            }
+          } catch (error) {
+            if (error instanceof EgressBlockedError) this.recordNetworkDenial(current.hostname, error)
+            throw error
+          }
+          agent.remember(current.hostname, {
+            resolver: this.resolver,
+            allowPrivateEndpoint,
+            purpose: 'model',
+            mode: this.policy.mode,
+          })
+          request.signal.throwIfAborted()
+
+          let response: Response
+          try {
+            response = await base(currentUrl, {
+              method: currentMethod,
+              headers: requestHeaders,
+              body: currentBody,
+              redirect: 'manual',
+              signal: request.signal,
+              dispatcher: agent.dispatcherOption,
+            } as RequestInit)
+          } catch (error) {
+            const blocked = findEgressBlockedError(error)
+            if (blocked !== undefined) {
+              const refusal = new EgressBlockedError(
+                current.hostname,
+                'model',
+                this.policy.mode,
+                `连接期 DNS 校验拒绝：${blocked.message}`,
+              )
+              this.recordNetworkDenial(current.hostname, refusal)
+              throw refusal
+            }
+            throw error
+          }
+          const redirecting = MODEL_REDIRECT_STATUSES.has(response.status)
+          const location = response.headers.get('location')
+          if (redirecting && (location === null || location.trim() === '')) {
+            throw new EgressBlockedError(currentUrl, 'model', this.policy.mode, '模型重定向响应缺少 Location')
+          }
+          const nextUrl = redirecting
+            ? modelUrl(new URL(location as string, currentUrl).href, this.policy.mode)
+            : undefined
+
+          if (redirecting && nextUrl !== undefined) {
+            const sameOrigin = new URL(nextUrl).origin === current.origin
+            if (current.protocol === 'https:' && new URL(nextUrl).protocol === 'http:') {
+              throw new EgressBlockedError(nextUrl, 'model', this.policy.mode, '拒绝模型请求从 HTTPS 降级到 HTTP')
+            }
+            if (!sameOrigin) {
+              stripModelCredentials(requestHeaders)
+              if ((response.status === 307 || response.status === 308) && currentBody !== undefined) {
+                throw new EgressBlockedError(nextUrl, 'model', this.policy.mode, '拒绝把模型请求体跨域重定向')
+              }
+              // The pinned Agent re-resolves and validates this new hostname at
+              // its first socket lookup; credentials have already been removed.
+            }
+            if (
+              currentMethod === 'POST' &&
+              (response.status === 301 || response.status === 302 || response.status === 303)
+            ) {
+              currentMethod = 'GET'
+              currentBody = undefined
+              requestHeaders.delete('content-type')
+              requestHeaders.delete('content-length')
+            }
+            void response.body?.cancel().catch(() => undefined)
+            currentUrl = nextUrl
+            continue
+          }
+
+          finalResponse = response
+          return response
+        }
+      } finally {
+        if (finalResponse?.body != null) {
+          // Preserve the original Response (including url/status/headers) while
+          // releasing the pinned agent after its body has actually been read.
+          void finalResponse.clone().arrayBuffer().then(
+            () => agent.close(),
+            () => agent.close(),
+          ).catch(() => undefined)
+        } else {
+          await agent.close().catch(() => undefined)
+        }
+      }
     }
     return guarded as typeof fetch
+  }
+
+  /** Record a DNS/literal-address refusal that happened after the policy check. */
+  private recordNetworkDenial(host: string, error: EgressBlockedError): void {
+    this.log.record({
+      at: new Date().toISOString(),
+      mode: this.policy.mode,
+      purpose: 'model',
+      host,
+      decision: 'deny',
+      reason: error.message,
+    })
   }
 
   /**
@@ -314,7 +942,13 @@ export function egressPolicyOf(input: {
   readonly llmBaseUrl: string
 }): EgressPolicy {
   const hosts: string[] = []
-  const host = hostnameOf(input.llmBaseUrl)
-  if (host !== '') hosts.push(host)
-  return { mode: input.mode, allowedHosts: hosts }
+  const origins: string[] = []
+  try {
+    const parsed = new URL(input.llmBaseUrl)
+    if (parsed.hostname !== '') hosts.push(parsed.hostname)
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') origins.push(parsed.origin)
+  } catch {
+    // Invalid configuration contributes no allowed destination.
+  }
+  return { mode: input.mode, allowedHosts: hosts, allowedOrigins: origins }
 }

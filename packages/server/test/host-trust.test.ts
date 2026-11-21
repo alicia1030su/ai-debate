@@ -126,11 +126,23 @@ test('未声明的 Host 被拒，声明的 Host 放行到会话判定', async ()
     const loopback = await send({ port, path: settingsPath, host: `127.0.0.1:${port}` })
     assert.equal(loopback.status, 401)
 
-    // Sign in over the declared name, then write and read a setting through it.
-    const setup = await send({
+    // A declared Host still is not a local browser: without the one-time token it
+    // must not be able to initialise the administrator account.
+    const remoteSetup = await send({
       port,
       path: '/api/ai-debate/auth/setup',
       host: `debate.example.com:${port}`,
+      method: 'POST',
+      body: { username: 'owner', password: 'host-trust-pass-2026' },
+    })
+    assert.equal(remoteSetup.status, 403)
+
+    // Initialise over loopback, then use that session through the declared name
+    // to prove the Host fence admits it and leaves the decision to authentication.
+    const setup = await send({
+      port,
+      path: '/api/ai-debate/auth/setup',
+      host: `127.0.0.1:${port}`,
       method: 'POST',
       body: { username: 'owner', password: 'host-trust-pass-2026' },
     })

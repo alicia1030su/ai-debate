@@ -33,6 +33,8 @@ import type { PlatformErrorCode } from './types.js'
  * "failed" or, worse, "fine".
  */
 export type FaultKind =
+  /** The deployment's egress policy refused the destination before connecting. */
+  | 'egress_blocked'
   /** The platform host itself did not answer (DNS, TCP, TLS, timeout). */
   | 'unreachable'
   /** The request reached the platform and it refused the credentials. */
@@ -92,8 +94,8 @@ const CHALLENGE_MARKERS = [
   /访问受限/,
   // v0.2.23: Baidu's verification host. The HTTP layer already recognised it; the
   // classifier did not, so a `wappass` body was classified `platform_refused`
-  // while the transport called it `captcha`. `tieba-403-diagnosis.test.ts` fails
-  // if either list drifts from the other again.
+  // while the transport called it `captcha`. `test/tieba-403-diagnosis.test.ts`
+  // fails if either list drifts from the other again.
   /wappass\.baidu\.com/i,
 ]
 
@@ -129,6 +131,19 @@ function matches(patterns: readonly RegExp[], text: string): boolean {
 export function classifyFault(evidence: FaultEvidence): FaultReport {
   const text = evidence.message ?? ''
   const status = evidence.status
+
+  // A policy refusal is a local fact, not a platform connectivity symptom. Keep
+  // it ahead of every status/message heuristic so an operator is not sent to fix
+  // DNS or credentials for a destination this deployment intentionally blocks.
+  if (evidence.code === 'egress_blocked') {
+    return {
+      kind: 'egress_blocked',
+      label: '出网策略拒绝',
+      reason: '请求在建立连接前被本机出网策略拒绝，平台没有收到这次请求。',
+      nextStep: '检查运行模式与允许出网的目标；仅对明确信任的地址调整策略，不要通过换地址绕过限制。',
+      retryable: false,
+    }
+  }
 
   if (evidence.hostReachable === false) {
     return {
@@ -251,6 +266,7 @@ export function blocksPublishing(report: FaultReport): boolean {
     report.kind === 'challenge' ||
     report.kind === 'session_invalid' ||
     report.kind === 'not_logged_in' ||
-    report.kind === 'unreachable'
+    report.kind === 'unreachable' ||
+    report.kind === 'egress_blocked'
   )
 }

@@ -749,7 +749,8 @@ export function apply(ctx: PluginContext, config?: unknown, hooks?: ApplyHooks):
    * 审计落在插件自己的 store 目录旁 —— 不写进会话数据，也不写进宿主日志：
    * 验收脚本要能独立读它，且它不能污染产品状态。
    */
-  const egressLog = new EgressLog(join(resolveStoreDirStrict({ configured: resolveConfig(config).storeDir }).dir, 'egress.jsonl'))
+  const durableDir = hooks?.storeDir ?? resolveStoreDirStrict({ configured: resolveConfig(config).storeDir }).dir
+  const egressLog = new EgressLog(join(durableDir, 'egress.jsonl'))
   /**
    * 守卫按**当前配置**现造，而不是挂载时造一个。
    *
@@ -1023,7 +1024,7 @@ export function apply(ctx: PluginContext, config?: unknown, hooks?: ApplyHooks):
   let sharedStore: DebateStore | undefined
   let sharedStoreDir: string | undefined
   const storeFor = (config: ReturnType<typeof resolveConfig>): DebateStore => {
-    const dir = resolveStoreDir(config)
+    const dir = hooks?.storeDir ?? resolveStoreDir(config)
     if (sharedStore === undefined || sharedStoreDir !== dir) {
       sharedStore = new DebateStore({
         dir,
@@ -1652,7 +1653,7 @@ export function apply(ctx: PluginContext, config?: unknown, hooks?: ApplyHooks):
               return {
                 listen: '',
                 port: 0,
-                dataDir: chooseStoreDir({ configured: effectiveConfig().storeDir }).dir,
+                dataDir: durableDir,
                 version: APP_VERSION,
                 startedAt: '',
                 pid: process.pid,
@@ -2803,23 +2804,20 @@ export function apply(ctx: PluginContext, config?: unknown, hooks?: ApplyHooks):
         }
       },
       session: async (sessionId) => {
-        await runtimeView.store.ready()
-        const session = runtimeView.store.getSession(sessionId)
+        const session = await runtimeView.store.readPersistedSession(sessionId)
         return session === undefined ? undefined : summarise(session)
       },
       sessionForThread: async (url) => {
-        await runtimeView.store.ready()
         let ref: { platform: string; threadId: string }
         try {
           ref = resolveThreadRef(runtimeView, url)
         } catch {
           return undefined
         }
-        const sessions = runtimeView.store
-          .snapshot()
-          .sessions.filter((row) => row.platform === ref.platform && row.threadId === ref.threadId)
-          .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
-        const newest = sessions[0]
+        const sessions = await runtimeView.store.readPersistedSessionsForThread(ref.threadId)
+        const newest = sessions
+          .filter((row) => row.platform === ref.platform)
+          .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0]
         return newest === undefined ? undefined : summarise(newest)
       },
       ownerIdentity: (platform) => ownerIdentity(effectiveConfig(), platform),

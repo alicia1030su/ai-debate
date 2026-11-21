@@ -18,8 +18,9 @@
  */
 
 import { mkdir, link, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { promises as fs } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 
 import type { NumericUidNamespace, TargetSnapshot } from './types.js'
 import type { CapabilityName } from './platforms/contracts.js'
@@ -727,6 +728,104 @@ export interface StoreOptions {
 /** Default wait for the write lock. */
 const DEFAULT_LOCK_TIMEOUT_MS = 5000
 
+/** A release must outlast a transient filesystem read/rename error, but never hang. */
+const LOCK_RELEASE_TIMEOUT_MS = 1000
+
+/**
+ * Tokens for lock acquisitions that this process still owns.
+ *
+ * PID liveness alone cannot distinguish a peer that is legitimately writing from
+ * an earlier acquisition in this same process whose cleanup failed. The token
+ * registry supplies that missing fact: a same-PID lock with an unregistered token
+ * is an orphan and may be reclaimed immediately, while every other live holder
+ * remains protected by the normal liveness-wins rule.
+ */
+const activeLockTokens = new Map<string, Set<string>>()
+
+/** One canonical registry key for lexical aliases of the same lock path. */
+function normalizedLockPath(lockPath: string): string {
+  const absolute = resolve(lockPath)
+  return process.platform === 'win32' ? absolute.toLowerCase() : absolute
+}
+
+/** Register a fully written acquisition before its critical section begins. */
+function registerLockToken(lockPath: string, token: string): void {
+  const key = normalizedLockPath(lockPath)
+  let tokens = activeLockTokens.get(key)
+  if (tokens === undefined) {
+    tokens = new Set<string>()
+    activeLockTokens.set(key, tokens)
+  }
+  tokens.add(token)
+}
+
+/** Forget ownership after release enters its terminal cleanup path. */
+function unregisterLockToken(lockPath: string, token: string): void {
+  const key = normalizedLockPath(lockPath)
+  const tokens = activeLockTokens.get(key)
+  if (tokens === undefined) return
+  tokens.delete(token)
+  if (tokens.size === 0) activeLockTokens.delete(key)
+}
+
+/** Missing means the lock is already gone; every other read error is retried. */
+function isMissingFile(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === 'ENOENT'
+}
+
+/**
+ * Read a lock body with a bounded retry budget.
+ *
+ * `release()` used to treat every read error as "already gone". A single EIO or
+ * Windows sharing violation therefore left a live process's lock behind, and
+ * liveness-wins correctly prevented anyone from ever reclaiming it. ENOENT is
+ * conclusive; any other failure is transient-or-permanent evidence that must be
+ * retried and, if it persists, surfaced rather than silently abandoned.
+ */
+async function readLockWithRetry(lockPath: string, deadline: number): Promise<string | undefined> {
+  let delay = 5
+  for (;;) {
+    try {
+      return await fs.readFile(lockPath, 'utf8')
+    } catch (error) {
+      if (isMissingFile(error)) return undefined
+      if (Date.now() >= deadline) {
+        throw new StoreError(
+          'write_failed',
+          `无法确认状态写入锁的所有权（${lockPath}）：${(error as Error).message}。` +
+            '为避免误删其他写入者的锁，本次释放已停止；残留锁可由本进程下次获取时回收。',
+          { cause: error },
+        )
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay))
+      delay = Math.min(delay * 2, 50)
+    }
+  }
+}
+
+/** Run one lock-path operation until it succeeds, disappears, or exhausts the budget. */
+async function retryLockOperation(operation: () => Promise<void>, lockPath: string, deadline: number): Promise<boolean> {
+  let delay = 5
+  for (;;) {
+    try {
+      await operation()
+      return true
+    } catch (error) {
+      if (isMissingFile(error)) return false
+      if (Date.now() >= deadline) {
+        throw new StoreError(
+          'write_failed',
+          `无法释放状态写入锁（${lockPath}）：${(error as Error).message}。` +
+            '清理结果未确认；所有权登记将被注销，残留锁可由本进程下次获取时回收。',
+          { cause: error },
+        )
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay))
+      delay = Math.min(delay * 2, 50)
+    }
+  }
+}
+
 /**
  * What `acquireLock` hands back: a release function plus an ownership check.
  *
@@ -740,8 +839,16 @@ const DEFAULT_LOCK_TIMEOUT_MS = 5000
 interface LockHandle {
   /** Re-read the lock and confirm it still carries this acquisition's token. */
   verify(): Promise<boolean>
-  /** Delete the lock, but only if it is still ours. */
+  /**
+   * Delete the lock, but only if it is still ours.
+   *
+   * Cleanup diagnostics never reject: a completed persist must not be reported as
+   * failed merely because its lock file could not be removed. Ownership is always
+   * unregistered so a later acquisition can reclaim any same-process residue.
+   */
   release(): Promise<void>
+  /** The last cleanup failure, retained for diagnostics without changing I/O outcome. */
+  releaseError(): StoreError | undefined
 }
 
 /**
@@ -812,10 +919,13 @@ interface LockHandle {
  *
  * 1. **A random token per acquisition**, written into the lock body. The token, not
  *    the pid, is the identity of "this lock is mine".
- * 2. **Liveness wins over age.** If the recorded holder is a live process, the lock
- *    is live no matter how old `at` is — a writer can legitimately run longer than
- *    any fixed threshold (slow disk, large document, a paused process that has not
- *    died). Age is only used when liveness cannot be established.
+ * 2. **Liveness wins over age, except for local orphans.** If the recorded holder
+ *    is another live process, the lock is live no matter how old `at` is — a writer
+ *    can legitimately run longer than any fixed threshold (slow disk, large
+ *    document, a paused process that has not died). A same-process token absent
+ *    from the active registry is different: its owner has already ended the critical
+ *    section, so it is reclaimed immediately. Age is only used when liveness cannot
+ *    be established.
  * 3. **Reclaiming is not a claim.** Breaking a stale lock only *frees the path*; the
  *    breaker must then win a normal `open('wx')` like everyone else. It never reports
  *    success on the strength of the rename alone (v0.2.9 — see the window described
@@ -852,7 +962,10 @@ async function acquireLock(file: string, timeoutMs = DEFAULT_LOCK_TIMEOUT_MS): P
       } finally {
         await handle.close()
       }
+      registerLockToken(lockPath, token)
       let released = false
+      let releasing: Promise<void> | undefined
+      let cleanupError: StoreError | undefined
       return {
         /**
          * Confirm the lock on disk is still the one this call created.
@@ -874,24 +987,30 @@ async function acquireLock(file: string, timeoutMs = DEFAULT_LOCK_TIMEOUT_MS): P
         },
         async release() {
           if (released) return
-          released = true
-          // Only delete the lock if it is still ours. A lock that was broken as stale
-          // and re-acquired by a peer now carries a different token, and unlinking it
-          // here would silently remove that peer's protection.
-          let current: string
-          try {
-            current = await readFile(lockPath, 'utf8')
-          } catch {
-            // Already gone. Releasing a lock that no longer exists is success.
-            return
-          }
-          const currentToken = tokenOf(current)
-          if (currentToken !== token) return
-          try {
-            await unlink(lockPath)
-          } catch {
-            // Raced with another release or a break. Nothing to do.
-          }
+          // Concurrent callers share one attempt. The terminal path always gives
+          // up registry ownership, even when the filesystem could not confirm or
+          // complete cleanup. A later acquire may then reclaim our own residue.
+          releasing ??= releaseOwnedLock(lockPath, token)
+            .then((error) => {
+              cleanupError = error
+              released = true
+            })
+            .catch((error: unknown) => {
+              cleanupError = error instanceof StoreError
+                ? error
+                : new StoreError('write_failed', `无法释放状态写入锁（${lockPath}）：${(error as Error).message}`, {
+                    cause: error,
+                  })
+              released = true
+            })
+            .finally(() => {
+              unregisterLockToken(lockPath, token)
+              releasing = undefined
+            })
+          return releasing
+        },
+        releaseError() {
+          return cleanupError
         },
       }
     } catch (error) {
@@ -923,6 +1042,63 @@ async function acquireLock(file: string, timeoutMs = DEFAULT_LOCK_TIMEOUT_MS): P
   }
 }
 
+/**
+ * Release only the acquisition identified by `token`.
+ *
+ * The final removal is a rename-based compare-and-swap: move the observed lock
+ * to a private path, read the moved bytes, and unlink only when their token is
+ * ours. A plain read-then-unlink has a TOCTOU window in which a peer's new lock
+ * can be deleted after our check. If the moved token is not ours, restore it
+ * only when the live path is free; never overwrite a peer that acquired first.
+ */
+async function releaseOwnedLock(lockPath: string, token: string): Promise<StoreError | undefined> {
+  const deadline = Date.now() + LOCK_RELEASE_TIMEOUT_MS
+  const current = await readLockWithRetry(lockPath, deadline)
+  if (current === undefined || tokenOf(current) !== token) return undefined
+
+  const graveyard = `${lockPath}.${process.pid}.${randomUUID()}.release`
+  const moved = await retryLockOperation(() => fs.rename(lockPath, graveyard), lockPath, deadline)
+  if (!moved) return undefined
+
+  // The live path is free from this point on. Failure to inspect or remove the
+  // private aside is diagnostic only: it must never wedge the main lock path or
+  // turn an already successful persist into a reported failure.
+  let movedBody: string | undefined
+  try {
+    movedBody = await readLockWithRetry(graveyard, deadline)
+  } catch (error) {
+    return error instanceof StoreError
+      ? error
+      : new StoreError('write_failed', `无法检查已移开的状态写入锁（${graveyard}）：${(error as Error).message}`, {
+          cause: error,
+        })
+  }
+  if (movedBody === undefined) return undefined
+  if (tokenOf(movedBody) !== token) {
+    // A peer replaced the observed lock immediately before our rename. Restore
+    // those bytes only when the live path is free; never overwrite a newer lock.
+    // If restoration fails, retain the aside rather than deleting a peer's lock.
+    try {
+      await fs.link(graveyard, lockPath)
+      await fs.unlink(graveyard).catch(() => undefined)
+    } catch {
+      // The live path is occupied or restoration is unavailable. The peer's live
+      // lock (if any) is untouched; the moved bytes remain for diagnosis.
+    }
+    return undefined
+  }
+  try {
+    await retryLockOperation(() => fs.unlink(graveyard), graveyard, deadline)
+  } catch (error) {
+    return error instanceof StoreError
+      ? error
+      : new StoreError('write_failed', `无法删除已移开的状态写入锁（${graveyard}）：${(error as Error).message}`, {
+          cause: error,
+        })
+  }
+  return undefined
+}
+
 /** How long a lock with an *unknowable* holder is allowed to sit before it is broken. */
 const LOCK_STALE_MS = 30_000
 
@@ -943,8 +1119,10 @@ function tokenOf(raw: string): string | undefined {
  *
  * v0.2.7 gated the liveness check behind the age check, which meant an aged lock
  * belonging to a *live* process was collected and the owner never learned. Here the
- * order is inverted: a live holder always wins, and age is only consulted when
- * liveness cannot be established (no pid recorded, or the pid cannot be probed).
+ * order is inverted: another process's live holder always wins. The sole exception
+ * is a same-process token absent from the active registry, which proves the local
+ * critical section already ended. Age is only consulted when liveness cannot be
+ * established (no pid recorded, or the pid cannot be probed).
  *
  * A paused process (`SIGSTOP`, or a debugger break) counts as alive, because
  * `process.kill(pid, 0)` succeeds for it. That is deliberate: breaking a moved-along
@@ -964,10 +1142,11 @@ async function breakStaleLock(lockPath: string): Promise<boolean> {
   let observed: string
   try {
     observed = await readFile(lockPath, 'utf8')
-  } catch {
+  } catch (error) {
     // Released between our failed create and this read. Report "broken" so the
-    // caller retries the create immediately.
-    return true
+    // caller retries the create immediately. Other I/O errors are not evidence
+    // that the path is free; let acquire back off and retry within its timeout.
+    return isMissingFile(error)
   }
 
   let parsed: { pid?: number; at?: number; token?: string } = {}
@@ -979,13 +1158,24 @@ async function breakStaleLock(lockPath: string): Promise<boolean> {
   }
 
   const owner = typeof parsed.pid === 'number' ? parsed.pid : undefined
+  const token = typeof parsed.token === 'string' && parsed.token !== '' ? parsed.token : undefined
 
-  // 1. A live holder always wins, regardless of how old the timestamp is.
-  if (owner !== undefined && isProcessAlive(owner)) return false
+  // 1. Same-process residue is the one case where PID liveness is misleading:
+  // an earlier release may have failed after its owner stopped doing critical-
+  // section work. Only a token still present in the registry is a live local
+  // owner. This check deliberately precedes both liveness and age protection.
+  if (owner === process.pid) {
+    const locallyOwned = token !== undefined && activeLockTokens.get(normalizedLockPath(lockPath))?.has(token) === true
+    if (locallyOwned) return false
+  } else if (owner !== undefined && isProcessAlive(owner)) {
+    // 2. Every other live holder always wins, regardless of age. Its token being
+    // absent from this process's registry says nothing about the owning process.
+    return false
+  }
 
-  // 2. No usable liveness signal: decide by age, using the recorded timestamp when
+  // 3. No usable liveness signal: decide by age, using the recorded timestamp when
   //    there is one and the file's own mtime when there is not.
-  if (owner === undefined || owner === null) {
+  if (owner === undefined) {
     const at = typeof parsed.at === 'number' ? parsed.at : 0
     if (at !== 0) {
       if (Date.now() - at < LOCK_STALE_MS) return false
@@ -998,7 +1188,8 @@ async function breakStaleLock(lockPath: string): Promise<boolean> {
       }
     }
   }
-  // 3. The holder is a dead pid. Break it — but only if it is still the same lock.
+  // 4. The holder is dead or a same-process orphan. Break it — but only if it is
+  //    still the same lock.
 
   const graveyard = `${lockPath}.${process.pid}.${randomUUID()}.stale`
   try {
@@ -1013,7 +1204,11 @@ async function breakStaleLock(lockPath: string): Promise<boolean> {
   let moved: string | undefined
   try {
     moved = await readFile(graveyard, 'utf8')
-  } catch {
+  } catch (error) {
+    // Without the bytes we cannot prove the moved file was ours. Restore it when
+    // possible and retain the aside for diagnosis; never delete an unknown lock.
+    await link(graveyard, lockPath).catch(() => undefined)
+    if (!isMissingFile(error)) return false
     moved = undefined
   }
   if (moved !== observed) {
@@ -1022,11 +1217,11 @@ async function breakStaleLock(lockPath: string): Promise<boolean> {
     // will notice its own token is gone and re-acquire.
     try {
       await link(graveyard, lockPath)
+      await unlink(graveyard).catch(() => undefined)
     } catch {
-      // The path is occupied again; the peer's token check will fail loudly on
-      // release, and no state was written by us. Deleting the moved file is safe.
+      // The path is occupied again or restoration is unavailable. Keep the moved
+      // bytes for diagnosis; never delete a peer lock we could not restore.
     }
-    await unlink(graveyard).catch(() => undefined)
     return false
   }
   await unlink(graveyard).catch(() => undefined)
@@ -1077,6 +1272,8 @@ export class DebateStore {
   private dirty = false
   /** The last write failure, reported until a write succeeds. */
   private lastWriteError: StoreError | undefined
+  /** Last lock-cleanup diagnostic; never changes a persist operation's outcome. */
+  private lastLockReleaseError: StoreError | undefined
   /**
    * Whether this instance has ever seen a document on disk.
    *
@@ -1116,6 +1313,17 @@ export class DebateStore {
   /** The most recent write failure, when the store is dirty. */
   get unsavedReason(): string | undefined {
     return this.lastWriteError?.message
+  }
+
+  /** Last lock-cleanup failure, if any; diagnostic only and never implies dirty data. */
+  get lockReleaseError(): string | undefined {
+    return this.lastLockReleaseError?.message
+  }
+
+  /** Finish a lock hold without allowing cleanup diagnostics to replace its result. */
+  private async releaseLock(lock: LockHandle): Promise<void> {
+    await lock.release()
+    this.lastLockReleaseError = lock.releaseError()
   }
 
   /** Load once; safe to call from every entry point. */
@@ -1273,6 +1481,54 @@ export class DebateStore {
   }
 
   /**
+   * Read the authoritative document currently on disk.
+   *
+   * Unlike {@link snapshot}, this never returns a failed mutation's attempted
+   * document. Background recovery uses it to decide whether a candidate really
+   * exists before advancing an identity or review row. A read/parse failure is
+   * propagated as `StoreError`, so callers can distinguish "absent" from
+   * "unavailable" and fail closed.
+   */
+  async readPersistedSnapshot(): Promise<StoreData> {
+    await this.ready()
+    // A durable read is a filesystem critical section too. Wait for every write
+    // already queued on this instance before taking the same cross-process lock;
+    // otherwise it could observe the file between two same-instance mutations.
+    await this.writeChain
+    let lock: LockHandle
+    try {
+      lock = await acquireLock(this.file, this.options.lockTimeoutMs)
+    } catch (error) {
+      throw error instanceof StoreError
+        ? error
+        : new StoreError('read_failed', `无法读取持久状态（${this.file}）：${(error as Error).message}`, {
+            cause: error,
+          })
+    }
+    try {
+      // Deliberately do not assign to `this.data`: a dirty attempted mutation is
+      // still visible to its caller, but it is not durable candidate evidence.
+      return await this.readCurrentDocument()
+    } finally {
+      await this.releaseLock(lock)
+    }
+  }
+
+  /** Find a session in the durable document, ignoring any dirty in-memory view. */
+  async readPersistedSession(id: string): Promise<StoredSession | undefined> {
+    const document = await this.readPersistedSnapshot()
+    return document.sessions.find((session) => session.id === id)
+  }
+
+  /** Durable sessions for one thread, newest by creation first. */
+  async readPersistedSessionsForThread(threadId: string): Promise<readonly StoredSession[]> {
+    const document = await this.readPersistedSnapshot()
+    return document.sessions
+      .filter((session) => session.threadId === threadId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  }
+
+  /**
    * Apply a change atomically and persist it.
    *
    * ## Why this re-reads under the lock (v0.2.7)
@@ -1376,7 +1632,7 @@ export class DebateStore {
         if (error instanceof StoreError) throw error
         throw new StoreError('write_failed', `状态写入失败：${(error as Error).message}`, { cause: error })
       } finally {
-        await lock.release()
+        await this.releaseLock(lock)
       }
     }
 
@@ -1477,7 +1733,7 @@ export class DebateStore {
         if (error instanceof StoreError) throw error
         throw new StoreError('write_failed', `状态写入失败：${(error as Error).message}`, { cause: error })
       } finally {
-        await lock.release()
+        await this.releaseLock(lock)
       }
     }
 

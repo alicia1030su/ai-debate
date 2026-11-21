@@ -24,7 +24,7 @@ import { DEFAULT_CONFIG, resolveConfig } from '../../packages/core/lib/config.js
 import { buildRuntime } from '../../packages/core/lib/index.js'
 import { fingerprintOf } from '../../packages/core/lib/probe.js'
 import { runAnalysis, runGeneration } from '../../packages/core/lib/runtime.js'
-import { DebateStore } from '../../packages/core/lib/store.js'
+import { DebateStore, type StoredCandidate, type StoredSession, type StoreData } from '../../packages/core/lib/store.js'
 import { PlatformRegistry } from '../../packages/core/lib/platforms/registry.js'
 import type { DebateProductApi, ProbeResult, SessionSummary } from '../../packages/core/lib/product-api.js'
 import { writeJson } from '../../packages/server/src/atomic.ts'
@@ -128,6 +128,7 @@ export interface SoakState {
   convergenceLag: number
   convergenceLagPeak: number
   stuckIdentity: number
+  authBlockedIdentity: number
   coreLockTimeouts: number
   lockTimeoutEvents: LockTimeoutEvent[]
   cursorRegressions: number
@@ -209,6 +210,7 @@ export interface SoakReport {
   readonly convergenceLag: number
   readonly convergenceLagPeak: number
   readonly stuckIdentity: number
+  readonly authBlockedIdentity: number
   readonly coreLockTimeouts: number
   readonly lockTimeoutEvents: readonly LockTimeoutEvent[]
   readonly cursorRegressions: number
@@ -292,6 +294,7 @@ interface InvariantResult {
   readonly lostTasks: number
   readonly convergenceLag: number
   readonly stuckIdentity: number
+  readonly authBlockedIdentity: number
   readonly cursorRegressions: number
   readonly completedTaskReexecutions: number
   readonly failures: readonly string[]
@@ -414,6 +417,7 @@ export function createSoakState(input: {
     convergenceLag: 0,
     convergenceLagPeak: 0,
     stuckIdentity: 0,
+    authBlockedIdentity: 0,
     coreLockTimeouts: 0,
     lockTimeoutEvents: [],
     cursorRegressions: 0,
@@ -490,6 +494,7 @@ export function loadSoakState(file: string): SoakState {
   parsed.convergenceLag ??= 0
   parsed.convergenceLagPeak ??= 0
   parsed.stuckIdentity ??= 0
+  parsed.authBlockedIdentity ??= 0
   parsed.coreLockTimeouts ??= 0
   parsed.lockTimeoutEvents ??= []
   parsed.acknowledgedFailures ??= []
@@ -887,14 +892,12 @@ function makeProductApi(
       }
     },
     session: async (sessionId: string) => {
-      await context.store.ready()
-      const session = context.store.getSession(sessionId)
+      const session = await context.store.readPersistedSession(sessionId)
       return session === undefined ? undefined : summarizeSession(session)
     },
     sessionForThread: async (url: string) => {
-      await context.store.ready()
       const threadId = url.split('/').pop() ?? ''
-      const session = context.store.sessionsForThread(threadId)[0]
+      const session = (await context.store.readPersistedSessionsForThread(threadId))[0]
       return session === undefined ? undefined : summarizeSession(session)
     },
     ownerIdentity: () => ({ handle: 'owner-handle', userName: '楼主' }),
@@ -908,10 +911,19 @@ function addInvariantFailure(state: SoakState, message: string): void {
   }
 }
 
-function inspectInvariants(context: SoakContext, allowTransientLostTasks = false): InvariantResult {
+export async function inspectInvariants(context: SoakContext, allowTransientLostTasks = false): Promise<InvariantResult> {
   const { state, tasks, identities, store, monitors } = context
   const failures: string[] = []
+  // A clean store's snapshot is the document confirmed by its last successful
+  // persist, so it can be sampled synchronously with the ledgers below. Only a
+  // dirty store needs an awaited durable read; after that read, take every
+  // business-ledger snapshot before yielding again. This prevents an old core
+  // snapshot from being paired with candidate/review rows written while the read
+  // was in flight, without ignoring dirty ghost candidates.
+  const persisted = store.hasUnsavedChanges ? await store.readPersistedSnapshot() : store.snapshot()
   const entries = identities.all()
+  const taskEntries = tasks.all()
+  const monitorEntries = monitors.list()
   const identityByKey = new Map<string, (typeof entries)[number]>()
   const identityByReply = new Map<string, (typeof entries)[number]>()
   let identityDuplicates = 0
@@ -922,7 +934,7 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
   }
 
   const candidatesByReply = new Map<string, number>()
-  for (const session of store.snapshot().sessions) {
+  for (const session of persisted.sessions) {
     for (const candidate of session.candidates) {
       const key = `${session.platform}:${session.threadId}:${candidate.targetPostId}`
       candidatesByReply.set(key, (candidatesByReply.get(key) ?? 0) + 1)
@@ -935,10 +947,19 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
 
   const activeKeys = new Set<string>()
   const terminalKeys = new Set<string>()
-  for (const task of tasks.all()) {
+  // Only an auth/policy-blocked task whose monitor is still blocked is an
+  // intentional safe stop. Failed/cancelled/completed/needs_review work must
+  // converge or remain a strict invariant failure.
+  const authBlockedKeys = new Set<string>()
+  const blockedMonitorIds = new Set(
+    monitorEntries.filter((monitor) => monitor.blockedReason !== undefined).map((monitor) => monitor.id),
+  )
+  for (const task of taskEntries) {
     const keys = [task.identityKey, ...(task.identityKeys ?? [])].filter((key): key is string => key !== undefined)
     if (task.state === 'pending' || task.state === 'running' || task.state === 'retry_wait') {
       for (const key of keys) activeKeys.add(key)
+    } else if (task.state === 'blocked' && blockedMonitorIds.has(task.monitorId)) {
+      for (const key of keys) authBlockedKeys.add(key)
     } else {
       for (const key of keys) terminalKeys.add(key)
     }
@@ -953,19 +974,28 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
     if (!terminalKeys.has(entry.key)) continue
     terminalReplyCoordinates.add(`${entry.platform}:${entry.threadId}:${entry.postId}`)
   }
+  const authBlockedReplyCoordinates = new Set<string>()
+  for (const entry of entries) {
+    if (!authBlockedKeys.has(entry.key)) continue
+    authBlockedReplyCoordinates.add(`${entry.platform}:${entry.threadId}:${entry.postId}`)
+  }
   let lostTasks = 0
   let convergenceLag = 0
   let stuckIdentity = 0
+  let authBlockedIdentity = 0
   const classifyUnconverged = (key: string): void => {
     if (activeReplyCoordinates.has(key)) {
       convergenceLag += 1
       return
     }
     if (terminalReplyCoordinates.has(key)) stuckIdentity += 1
+    else if (authBlockedReplyCoordinates.has(key)) authBlockedIdentity += 1
     else lostTasks += 1
   }
-  for (const identity of identities.orphans(activeKeys)) {
-    classifyUnconverged(`${identity.platform}:${identity.threadId}:${identity.postId}`)
+  for (const identity of entries) {
+    if (identity.state === 'claimed' && !activeKeys.has(identity.key)) {
+      classifyUnconverged(`${identity.platform}:${identity.threadId}:${identity.postId}`)
+    }
   }
   for (const identity of entries) {
     if (identity.state !== 'candidate') continue
@@ -975,7 +1005,7 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
   for (const key of candidatesByReply.keys()) {
     if (identityByReply.get(key)?.state !== 'candidate') classifyUnconverged(key)
   }
-  for (const monitor of monitors.list()) {
+  for (const monitor of monitorEntries) {
     for (const postId of monitor.seen) {
       if (postId === BASELINE_POST_ID) continue
       const key = replyIdentityKey({
@@ -985,12 +1015,12 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
         quality: 'stable',
         fingerprint: '',
       })
-      if (!identities.get(key)) classifyUnconverged(`${monitor.platform}:${monitor.threadId}:${postId}`)
+      if (!identityByKey.has(key)) classifyUnconverged(`${monitor.platform}:${monitor.threadId}:${postId}`)
     }
   }
 
   const settledKeys = new Map<string, number>()
-  for (const task of tasks.all()) {
+  for (const task of taskEntries) {
     if (task.kind === 'probe' || task.kind === 'compensate') continue
     if (task.state !== 'completed' && task.state !== 'needs_review') continue
     settledKeys.set(task.dedupeKey, (settledKeys.get(task.dedupeKey) ?? 0) + 1)
@@ -1001,7 +1031,7 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
   }
 
   let cursorRegressions = 0
-  for (const monitor of monitors.list()) {
+  for (const monitor of monitorEntries) {
     const previous = state.cursorWatermarks[monitor.id]
     const current: CursorWatermark = {
       ...(monitor.cursor?.lastScanAt === undefined ? {} : { lastScanAt: monitor.cursor.lastScanAt }),
@@ -1044,10 +1074,11 @@ function inspectInvariants(context: SoakContext, allowTransientLostTasks = false
   state.convergenceLag = convergenceLag
   state.convergenceLagPeak = Math.max(state.convergenceLagPeak, convergenceLag)
   state.stuckIdentity = stuckIdentity
+  state.authBlockedIdentity = authBlockedIdentity
   state.cursorRegressions += cursorRegressions
   state.completedTaskReexecutions = completedTaskReexecutions
   for (const failure of failures) addInvariantFailure(state, failure)
-  return { duplicateCandidates, lostTasks, convergenceLag, stuckIdentity, cursorRegressions, completedTaskReexecutions, failures }
+  return { duplicateCandidates, lostTasks, convergenceLag, stuckIdentity, authBlockedIdentity, cursorRegressions, completedTaskReexecutions, failures }
 }
 
 function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'failed'): SoakReport {
@@ -1117,6 +1148,7 @@ function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'f
     convergenceLag: state.convergenceLag,
     convergenceLagPeak: state.convergenceLagPeak,
     stuckIdentity: state.stuckIdentity,
+    authBlockedIdentity: state.authBlockedIdentity,
     coreLockTimeouts: state.coreLockTimeouts,
     lockTimeoutEvents: state.lockTimeoutEvents.map((event) => ({ ...event })),
     cursorRegressions: state.cursorRegressions,
@@ -1677,7 +1709,7 @@ async function runSoak(options: SoakOptions): Promise<void> {
         lastPruneAt = now
       }
 
-      const invariants = inspectInvariants(context, activeDisk !== undefined || Date.now() < lostTaskGraceUntil)
+      const invariants = await inspectInvariants(context, activeDisk !== undefined || Date.now() < lostTaskGraceUntil)
       if (invariants.failures.length > 0) break
 
       const usage = process.cpuUsage(lastCpu)
@@ -1751,7 +1783,7 @@ async function runSoak(options: SoakOptions): Promise<void> {
     }
     await engine.tick()
     await engine.stop()
-    inspectInvariants(context)
+    await inspectInvariants(context)
     if (fatalError !== undefined) addInvariantFailure(state, fatalError)
     state.completed = state.invariantFailures.length === 0 && fatalError === undefined
     state.lastTickAt = new Date().toISOString()
@@ -1831,6 +1863,7 @@ async function runSoak(options: SoakOptions): Promise<void> {
         convergenceLag: 0,
         convergenceLagPeak: 0,
         stuckIdentity: 0,
+        authBlockedIdentity: 0,
         coreLockTimeouts: 0,
         lockTimeoutEvents: [],
         cursorRegressions: 0,
@@ -1898,12 +1931,14 @@ export async function runSoakSelfTests(): Promise<void> {
       state.iterations = 41
       state.scans = 73
       state.generations = 9
+      state.authBlockedIdentity = 2
       state.completed = false
       saveSoakState(file, state)
       const restored = loadSoakState(file)
       assert.equal(restored.iterations, 41)
       assert.equal(restored.scans, 73)
       assert.equal(restored.generations, 9)
+      assert.equal(restored.authBlockedIdentity, 2)
       assert.equal(restored.completed, false)
       restored.iterations += 1
       saveSoakState(file, restored)
@@ -1911,6 +1946,198 @@ export async function runSoakSelfTests(): Promise<void> {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+
+  test('soak 不变量：仅 blocked 且 monitor 仍 blocked 豁免，failed/cancelled 严格计 stuck', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ai-debate-soak-blocked-identity-'))
+    const monitors = new MonitorStore({ file: join(dir, 'monitors.json'), log: quiet })
+    const tasks = new AutoTaskStore({ file: join(dir, 'auto-tasks.json'), log: quiet })
+    const identities = new ReplyIdentityStore({ file: join(dir, 'reply-identities.json'), log: quiet })
+    const store = new DebateStore({ dir: join(dir, 'core'), sessionTtlMs: 60_000, maxSessions: 10, maxUsageRows: 10 })
+    try {
+      monitors.load()
+      tasks.load()
+      identities.load()
+      await store.ready()
+      const monitor = monitors.create(
+        { name: 'blocked-identity', url: 'https://fake.example/p/blocked', enabled: false },
+        { platform: PLATFORM, threadId: 'blocked' },
+      )
+      const key = replyIdentityKey({ platform: PLATFORM, threadId: 'blocked', postId: 'r1', quality: 'stable', fingerprint: 'fp-r1' })
+      identities.claim({ platform: PLATFORM, threadId: 'blocked', postId: 'r1', quality: 'stable', fingerprint: 'fp-r1', monitorId: monitor.id })
+      const task = tasks.enqueue({ kind: 'generate', monitorId: monitor.id, postId: 'r1', identityKey: key, dedupeKey: `generate:${key}` }).task
+      const state = createSoakState({
+        startedAt: '2026-01-01T00:00:00.000Z',
+        now: Date.parse('2026-01-01T00:00:00.000Z'),
+        seed: 7,
+        dataDir: join(dir, 'data'),
+        monitors: 1,
+        threads: 1,
+        capacity: 1_500,
+        replyEveryMs: 500,
+        scanBatch: 1,
+        scanEveryMs: 250,
+        faults: new FaultInjector({ seed: 7 }).snapshot(),
+      })
+      const context = { state, tasks, identities, store, monitors } as SoakContext
+
+      tasks.finish(task.id, 'failed', { error: 'model timeout', errorKind: 'network' })
+      const failed = await inspectInvariants(context)
+      assert.equal(failed.authBlockedIdentity, 0)
+      assert.equal(failed.stuckIdentity, 1)
+      assert.equal(failed.lostTasks, 0)
+      assert.equal(failed.failures.some((message) => message.includes('仍未收敛')), true)
+
+      assert.equal(tasks.retry(task.id), true)
+      const retried = await inspectInvariants(context)
+      assert.equal(retried.authBlockedIdentity, 0)
+      assert.equal(retried.stuckIdentity, 0)
+      assert.equal(retried.lostTasks, 0)
+      assert.equal(tasks.get(task.id)?.state, 'pending')
+
+      tasks.finish(task.id, 'blocked', { error: 'policy blocked', errorKind: 'auth' })
+      const unbackedBlocked = await inspectInvariants(context)
+      assert.equal(unbackedBlocked.authBlockedIdentity, 0)
+      assert.equal(unbackedBlocked.stuckIdentity, 1)
+
+      monitors.block(monitor.id, 'Soak 注入：平台拒绝访问（403）')
+      const backedBlocked = await inspectInvariants(context)
+      assert.equal(backedBlocked.authBlockedIdentity, 1)
+      assert.equal(backedBlocked.stuckIdentity, 0)
+      assert.equal(backedBlocked.failures.some((message) => message.includes('仍未收敛')), false)
+
+      monitors.clearBlock(monitor.id)
+      const cleared = await inspectInvariants(context)
+      assert.equal(cleared.authBlockedIdentity, 0)
+      assert.equal(cleared.stuckIdentity, 1)
+
+      assert.equal(tasks.retry(task.id), true)
+      tasks.finish(task.id, 'cancelled')
+      const cancelled = await inspectInvariants(context)
+      assert.equal(cancelled.authBlockedIdentity, 0)
+      assert.equal(cancelled.stuckIdentity, 1)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('soak 不变量：dirty 持久读挂起期间双台账推进后按新快照采样，不产生伪 stuck', async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'ai-debate-soak-snapshot-race-'))
+    const monitors = new MonitorStore({ file: join(dir, 'monitors.json'), log: quiet })
+    const tasks = new AutoTaskStore({ file: join(dir, 'auto-tasks.json'), log: quiet })
+    const identities = new ReplyIdentityStore({ file: join(dir, 'reply-identities.json'), log: quiet })
+    const store = new DebateStore({ dir: join(dir, 'core'), sessionTtlMs: 60_000, maxSessions: 10, maxUsageRows: 10 })
+    t.after(() => rmSync(dir, { recursive: true, force: true }))
+    monitors.load()
+    tasks.load()
+    identities.load()
+    await store.ready()
+    const monitor = monitors.create(
+      { name: 'snapshot-race', url: 'https://fake.example/p/snapshot', enabled: false },
+      { platform: PLATFORM, threadId: 'snapshot' },
+    )
+    const key = replyIdentityKey({ platform: PLATFORM, threadId: 'snapshot', postId: 'r1', quality: 'stable', fingerprint: 'fp-r1' })
+    identities.claim({ platform: PLATFORM, threadId: 'snapshot', postId: 'r1', quality: 'stable', fingerprint: 'fp-r1', monitorId: monitor.id })
+    identities.attachSession(key, 'session-1')
+    const task = tasks.enqueue({
+      kind: 'generate',
+      monitorId: monitor.id,
+      postId: 'r1',
+      identityKey: key,
+      sessionId: 'session-1',
+      dedupeKey: `generate:${key}`,
+    }).task
+    tasks.finish(task.id, 'failed', { error: 'old failure', errorKind: 'io' })
+
+    const at = '2026-01-01T00:00:00.000Z'
+    const candidate: StoredCandidate = {
+      replyId: 'candidate-1',
+      text: '已持久候选',
+      strategy: 'direct_rebuttal',
+      targetPostId: 'r1',
+      candidateVersion: 1,
+      textHash: 'hash-1',
+      confidence: 0.8,
+      violations: [],
+      notes: [],
+      approved: false,
+      createdAt: at,
+    }
+    const session: StoredSession = {
+      id: 'session-1',
+      platform: PLATFORM,
+      threadId: 'snapshot',
+      threadTitle: '快照竞态测试帖',
+      threadUrl: 'https://fake.example/p/snapshot',
+      forumName: '测试吧',
+      ownerKey: 'owner',
+      ownerName: '楼主',
+      opponentKey: 'rival',
+      opponentName: '对方',
+      disputeFloorPostId: 'r1',
+      disputeFloorNumber: 1,
+      triggerPostId: 'r1',
+      persona: { style: '直接', intensity: 3, maxLength: 200 },
+      comments: [],
+      readQuality: { floorsRead: 0, nestedRead: 0, truncated: false, reasons: [], observationOverflow: [] },
+      sentTexts: [],
+      candidates: [candidate],
+      state: 'READY',
+      statusText: '候选已就绪',
+      publishedPostIds: [],
+      createdAt: at,
+      updatedAt: at,
+    }
+    await store.mutate((data) => ({ ...data, sessions: [session] }))
+    const durable = await store.readPersistedSnapshot()
+
+    // Force the dirty path without changing the durable candidate document.
+    t.mock.method(
+      store as unknown as { persist(data: StoreData): Promise<void> },
+      'persist',
+      async () => {
+        throw Object.assign(new Error('injected dirty state'), { code: 'EIO' })
+      },
+    )
+    await assert.rejects(() => store.mutate((data) => ({
+      ...data,
+      sessions: data.sessions.map((row) => row.id === session.id ? { ...row, statusText: 'dirty only' } : row),
+    })), /状态写入失败/)
+    assert.equal(store.hasUnsavedChanges, true)
+
+    let releaseRead!: (value: StoreData) => void
+    const pendingRead = new Promise<StoreData>((resolve) => {
+      releaseRead = resolve
+    })
+    t.mock.method(store, 'readPersistedSnapshot', async () => pendingRead)
+    const state = createSoakState({
+      startedAt: at,
+      now: Date.parse(at),
+      seed: 7,
+      dataDir: join(dir, 'data'),
+      monitors: 1,
+      threads: 1,
+      capacity: 1_500,
+      replyEveryMs: 500,
+      scanBatch: 1,
+      scanEveryMs: 250,
+      faults: new FaultInjector({ seed: 7 }).snapshot(),
+    })
+    const context = { state, tasks, identities, store, monitors } as SoakContext
+    const inspection = inspectInvariants(context)
+
+    // The old implementation sampled claimed+failed before awaiting the core
+    // read, then paired it with the now-persisted candidate and reported stuck.
+    identities.markCandidate(key, { sessionId: session.id, candidateId: candidate.replyId })
+    tasks.finish(task.id, 'needs_review', { sessionId: session.id })
+    releaseRead(durable)
+
+    const result = await inspection
+    assert.equal(result.stuckIdentity, 0)
+    assert.equal(result.lostTasks, 0)
+    assert.equal(result.duplicateCandidates, 0)
+    assert.equal(result.convergenceLag, 0)
+    assert.deepEqual(result.failures, [])
   })
 
   test('monitor-dominant 交错：A 分析中，B 发现 r3 时必须补入第二批', async () => {
@@ -1990,6 +2217,7 @@ export async function runSoakSelfTests(): Promise<void> {
       releaseFirst = resolveFirst
     })
     const generatedTargets: string[] = []
+    const persistedSessions = new Map<string, SessionSummary>()
     const api: DebateProductApi = {
       resolveUrl: (url) => ({ platform: PLATFORM, threadId: 't1', url }),
       probe: async (input) => probeFor(input.url, input.url === urlA ? repliesA : repliesB),
@@ -2002,10 +2230,27 @@ export async function runSoakSelfTests(): Promise<void> {
         return { sessionId: `session-${analysisCalls}` }
       },
       generate: async (input) => {
-        generatedTargets.push(input.targetPostId ?? '')
-        return { ok: true, outcome: 'valid_draft', candidateId: `candidate-${input.targetPostId ?? 'unknown'}` }
+        const targetPostId = input.targetPostId ?? 'unknown'
+        const candidateId = `candidate-${targetPostId}`
+        generatedTargets.push(targetPostId)
+        const current = persistedSessions.get(input.sessionId)
+        persistedSessions.set(input.sessionId, {
+          id: input.sessionId,
+          platform: PLATFORM,
+          threadId: 't1',
+          threadTitle: '交错测试帖',
+          threadUrl: urlA,
+          state: 'ready',
+          createdAt: at,
+          updatedAt: at,
+          candidates: [
+            ...(current?.candidates ?? []),
+            { replyId: candidateId, text: '候选', targetPostId, candidateVersion: 1, createdAt: at },
+          ],
+        })
+        return { ok: true, outcome: 'valid_draft', candidateId }
       },
-      session: async () => undefined,
+      session: async (sessionId) => persistedSessions.get(sessionId),
       sessionForThread: async () => undefined,
       ownerIdentity: () => ({ handle: 'owner-handle', userName: '楼主' }),
     }

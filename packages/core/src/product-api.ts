@@ -47,6 +47,8 @@ export interface ProbedReply {
    * monitor blind to changes.
    */
   readonly fingerprint: string
+  /** Whether `postId` is a stable platform identity or only a content fallback. */
+  readonly identityQuality: 'stable' | 'fallback'
 }
 
 /** How much of the thread one read covered, and why it stopped. */
@@ -152,10 +154,16 @@ export interface DebateProductApi {
     signal?: AbortSignal
   }): Promise<GenerateResult>
 
-  /** One stored session, or undefined when the id is unknown. */
+  /**
+   * One durably stored session, or undefined when the id is unknown.
+   *
+   * Implementations must read the persisted core document here, not a dirty
+   * in-memory mutation attempt. Background recovery treats this as candidate
+   * evidence; a failed core write must look absent (or throw), never present.
+   */
   session(sessionId: string): Promise<SessionSummary | undefined>
 
-  /** The most recent session for a thread, used to avoid duplicate analyses. */
+  /** The most recent durably stored session for a thread. */
   sessionForThread(url: string): Promise<SessionSummary | undefined>
 
   /** Bound owner identifiers for a platform, so a monitor can ignore self-posts. */
@@ -164,6 +172,16 @@ export interface DebateProductApi {
 
 /** The hook `apply()` accepts. Omitted by every pre-v0.2.0 caller. */
 export interface ApplyHooks {
+  /**
+   * Authoritative state directory chosen by the standalone host.
+   *
+   * The core still supports its own config/env/default resolver for other callers,
+   * but a standalone server must pin every runtime rebuild to the same directory
+   * as its config, credentials, monitors and backups. Without this override a
+   * `--data-dir` flag could leave `state.json` in a different tree.
+   */
+  readonly storeDir?: string
+
   /**
    * Called once, synchronously, after the engine is mounted.
    *

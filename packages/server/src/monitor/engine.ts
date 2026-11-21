@@ -37,12 +37,14 @@
 import type { DebateProductApi } from '../../../core/src/product-api.ts'
 import type { Logger } from '../logger.ts'
 import { AtomicWriteError } from '../atomic.ts'
-import type { MonitorStore, MonitorTarget } from './store.ts'
-import { type AutoTask, type AutoTaskStore, type QueueStats, type RecoveryRecord } from './tasks.ts'
+import type { MonitorStore, MonitorTarget, PlatformState } from './store.ts'
+import { type ReplyIdentity, ReplyIdentityStore, replyIdentityKey } from './identities.ts'
+import { isTerminal, type AutoTask, type AutoTaskStore, type QueueStats, type RecoveryRecord } from './tasks.ts'
 
 export interface EngineOptions {
   readonly monitors: MonitorStore
   readonly tasks: AutoTaskStore
+  readonly identities: ReplyIdentityStore
   readonly api: () => DebateProductApi | undefined
   readonly log: Logger
   /** Global cap on concurrently running tasks. */
@@ -55,6 +57,8 @@ export interface EngineOptions {
   readonly taskTimeoutMs?: number
   /** Minimum gap between compensating scans of one monitor. */
   readonly compensationEveryMs?: number
+  /** How often to reconcile durable claims with queued tasks (default 30s). */
+  readonly orphanSweepMs?: number
   /** Injected clock, for tests. */
   readonly now?: () => number
 }
@@ -101,12 +105,18 @@ const DEFAULT_COMPENSATION_EVERY_MS = 6 * 60 * 60 * 1000
 /** How long a failed ledger write suspends claiming, before it retries. */
 const DEGRADED_COOLDOWN_MS = 30 * 1000
 
+type CandidateLookup =
+  | { readonly kind: 'found'; readonly candidateId: string }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unavailable' }
+
 /** Classify a thrown error into "retry", "block the monitor" or "give up". */
 export function classifyFailure(error: unknown): {
   kind: string
   retryable: boolean
   blocksMonitor: boolean
   message: string
+  platformState?: PlatformState
   retryAfterMs?: number
 } {
   const message = error instanceof Error ? error.message : String(error)
@@ -115,6 +125,15 @@ export function classifyFailure(error: unknown): {
   const status = (error as { status?: unknown }).status
 
   if (typeof code === 'string') {
+    if (code === 'egress_blocked') {
+      return {
+        kind: 'egress_blocked',
+        retryable: false,
+        blocksMonitor: false,
+        message: '出网策略拒绝：请求未连接到平台。请检查运行模式与允许出网的目标，不要伪装成网络故障。',
+        platformState: 'egress_blocked',
+      }
+    }
     // Platform-level codes (PlatformError) and model-level codes (LlmError) share
     // a few names; both are handled here because the reaction is the same.
     if (code === 'rate_limited') {
@@ -123,20 +142,27 @@ export function classifyFailure(error: unknown): {
         retryable: true,
         blocksMonitor: false,
         message,
+        platformState: 'rate_limited',
         ...(typeof retryAfterMs === 'number' ? { retryAfterMs } : {}),
       }
     }
     if (code === 'auth_required' || code === 'unauthorized' || code === 'forbidden' || code === 'permission_denied' || code === 'captcha') {
-      return { kind: 'auth', retryable: false, blocksMonitor: true, message }
+      return {
+        kind: 'auth',
+        retryable: false,
+        blocksMonitor: true,
+        message,
+        platformState: code === 'forbidden' || code === 'permission_denied' || code === 'captcha' || status === 403 ? 'forbidden' : 'unauthorized',
+      }
     }
     if (code === 'network' || code === 'timeout' || code === 'dns') {
-      return { kind: 'network', retryable: true, blocksMonitor: false, message }
+      return { kind: 'network', retryable: true, blocksMonitor: false, message, platformState: 'network_error' }
     }
     if (code === 'quota') {
       return { kind: 'quota', retryable: false, blocksMonitor: false, message }
     }
     if (code === 'not_found' || code === 'malformed_response' || code === 'bad_response') {
-      return { kind: 'permanent', retryable: false, blocksMonitor: false, message }
+      return { kind: 'permanent', retryable: false, blocksMonitor: false, message, platformState: 'adapter_error' }
     }
     if (code === 'context_too_long') {
       return { kind: 'policy', retryable: false, blocksMonitor: false, message }
@@ -144,9 +170,9 @@ export function classifyFailure(error: unknown): {
   }
 
   if (typeof status === 'number') {
-    if (status === 429) return { kind: 'rate_limited', retryable: true, blocksMonitor: false, message }
-    if (status === 401 || status === 403) return { kind: 'auth', retryable: false, blocksMonitor: true, message }
-    if (status >= 500) return { kind: 'network', retryable: true, blocksMonitor: false, message }
+    if (status === 429) return { kind: 'rate_limited', retryable: true, blocksMonitor: false, message, platformState: 'rate_limited' }
+    if (status === 401 || status === 403) return { kind: 'auth', retryable: false, blocksMonitor: true, message, platformState: status === 403 ? 'forbidden' : 'unauthorized' }
+    if (status >= 500) return { kind: 'network', retryable: true, blocksMonitor: false, message, platformState: 'network_error' }
   }
 
   // The core's owner-binding refusal is an operator action, not a transient fault.
@@ -180,6 +206,7 @@ function platformOf(monitors: MonitorStore, task: AutoTask): string {
 export class AutomationEngine {
   readonly #monitors: MonitorStore
   readonly #tasks: AutoTaskStore
+  readonly #identities: ReplyIdentityStore
   readonly #api: () => DebateProductApi | undefined
   readonly #log: Logger
   readonly #concurrency: number
@@ -187,6 +214,7 @@ export class AutomationEngine {
   readonly #tickMs: number
   readonly #taskTimeoutMs: number
   readonly #compensationEveryMs: number
+  readonly #orphanSweepMs: number
   readonly #now: () => number
   #timer: NodeJS.Timeout | undefined
   #running = false
@@ -201,10 +229,15 @@ export class AutomationEngine {
   #lastSuccessProbeAt: string | undefined
   #degraded: string | undefined
   #degradedUntil = 0
+  #lastOrphanSweep = 0
+  #orphanSweepRunning = false
+  /** Candidate evidence already reconciled in this process; intentionally not persisted. */
+  #verifiedCandidates = new Set<string>()
 
   constructor(options: EngineOptions) {
     this.#monitors = options.monitors
     this.#tasks = options.tasks
+    this.#identities = options.identities
     this.#api = options.api
     this.#log = options.log
     this.#concurrency = Math.max(1, Math.min(4, options.concurrency ?? 1))
@@ -212,6 +245,7 @@ export class AutomationEngine {
     this.#tickMs = Math.max(250, options.tickMs ?? 2000)
     this.#taskTimeoutMs = Math.max(30_000, options.taskTimeoutMs ?? 10 * 60 * 1000)
     this.#compensationEveryMs = Math.max(60_000, options.compensationEveryMs ?? DEFAULT_COMPENSATION_EVERY_MS)
+    this.#orphanSweepMs = Math.max(0, options.orphanSweepMs ?? 30_000)
     this.#now = options.now ?? (() => Date.now())
   }
 
@@ -221,6 +255,13 @@ export class AutomationEngine {
     this.#timer = setInterval(() => void this.#tick(), this.#tickMs)
     this.#timer.unref?.()
     this.#log.info(`后台挂机引擎已启动：并发 ${this.#concurrency}，每平台 ${this.#perPlatform}，心跳 ${this.#tickMs}ms`)
+    this.#lastOrphanSweep = this.#now()
+    void this.#recoverOrphanClaims().catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      this.#lastError = message
+      this.#log.warn(`启动身份对账失败：${message}`)
+      if (error instanceof AtomicWriteError) this.#degrade(error)
+    })
     void this.#tick()
   }
 
@@ -372,11 +413,28 @@ export class AutomationEngine {
     try {
       this.#lastTickAt = new Date(startedAt).toISOString()
       this.#ticks += 1
+      // Renew every in-flight lease before deciding whether any of them expired.
+      // The lease is persisted, so a killed process leaves an expiry that recovery
+      // can reason about; a live process keeps it alive with the scheduler heartbeat.
+      for (const [taskId, platform] of this.#inFlight) {
+        const task = this.#tasks.get(taskId)
+        if (task === undefined) continue
+        if (!this.#tasks.renewLease(taskId, task.leaseToken, startedAt, this.#taskTimeoutMs)) {
+          this.#log.warn(`任务 ${taskId} 的租约已失效（${platform}）`)
+        }
+      }
       // A hung task holds a concurrency slot forever. Reaping is part of the tick,
       // not a separate timer, so it cannot be forgotten when the loop changes.
       const reaped = this.#tasks.reapStuck(startedAt, this.#taskTimeoutMs)
       if (reaped.length > 0) this.#log.warn(`${reaped.length} 个任务超时，已判定为卡死并释放槽位`)
       this.#scheduleDue()
+      // A live write failure can leave a claim without its task just as a crash can.
+      // Sweep occasionally rather than only at startup, so recovery does not require
+      // the operator to restart the service.
+      if (startedAt - this.#lastOrphanSweep >= this.#orphanSweepMs) {
+        this.#lastOrphanSweep = startedAt
+        await this.#recoverOrphanClaims()
+      }
       await this.#drain()
     } catch (error) {
       this.#lastError = error instanceof Error ? error.message : String(error)
@@ -384,8 +442,7 @@ export class AutomationEngine {
       if (error instanceof AtomicWriteError) {
         // The ledger could not be written. Claiming more work would risk repeating
         // it after a restart, so stop claiming until the disk recovers.
-        this.#degraded = `任务台账写入失败：${error.message}`
-        this.#degradedUntil = this.#now() + DEGRADED_COOLDOWN_MS
+        this.#degrade(error)
       }
     } finally {
       this.#lastDurationMs = this.#now() - startedAt
@@ -444,13 +501,22 @@ export class AutomationEngine {
     } catch (error) {
       this.#lastError = error instanceof Error ? error.message : String(error)
       this.#log.warn(`无法排队任务（${input.kind}/${input.monitorId}）：${this.#lastError}`)
+      if (error instanceof AtomicWriteError) this.#degrade(error)
     }
+  }
+
+  /** Stop claiming work until the durable ledger is writable again. */
+  #degrade(error: AtomicWriteError): void {
+    this.#degraded = `持久化写入失败（${error.target}）：${error.message}`
+    this.#degradedUntil = this.#now() + DEGRADED_COOLDOWN_MS
+    this.#lastError = this.#degraded
+    this.#log.error(this.#degraded)
   }
 
   async #drain(): Promise<void> {
     while (this.#running) {
       if (this.#inFlight.size >= this.#concurrency) return
-      const task = this.#tasks.claim(this.#now())
+      const task = this.#tasks.claim(this.#now(), this.#taskTimeoutMs)
       if (task === undefined) return
       const platform = platformOf(this.#monitors, task)
       const samePlatform = [...this.#inFlight.values()].filter((value) => value === platform).length
@@ -462,47 +528,741 @@ export class AutomationEngine {
         return
       }
       this.#inFlight.set(task.id, platform)
-      void this.#execute(task, platform).finally(() => {
-        this.#inFlight.delete(task.id)
-        this.#scheduled.delete(task.monitorId)
-        this.#compensating.delete(task.monitorId)
-      })
+      void this.#execute(task, platform)
+        .catch((error: unknown) => {
+          // Defensive last resort: #execute is not allowed to reject, but a future
+          // edit must not turn a bookkeeping bug into an unhandledRejection that
+          // kills a long-running service.
+          const message = error instanceof Error ? error.message : String(error)
+          this.#lastError = message
+          this.#log.error(`后台任务执行出现未处理异常（${task.id}）：${message}`)
+          if (error instanceof AtomicWriteError) this.#degrade(error)
+        })
+        .finally(() => {
+          this.#inFlight.delete(task.id)
+          this.#scheduled.delete(task.monitorId)
+          this.#compensating.delete(task.monitorId)
+        })
     }
   }
 
   async #execute(task: AutoTask, platform: string): Promise<void> {
-    const api = this.#api()
-    if (api === undefined) {
-      this.#tasks.finish(task.id, 'blocked', {
-        error: '后台接口尚未就绪（辩论引擎未挂载）',
-        errorKind: 'not_ready',
+    try {
+      const api = this.#api()
+      if (api === undefined) {
+        this.#tasks.finish(task.id, 'blocked', {
+          error: '后台接口尚未就绪（辩论引擎未挂载）',
+          errorKind: 'not_ready',
+        })
+        return
+      }
+      try {
+        if (task.kind === 'probe') await this.#runProbe(api, task)
+        else if (task.kind === 'compensate') await this.#runCompensate(api, task)
+        else if (task.kind === 'analyze') await this.#runAnalyze(api, task)
+        else await this.#runGenerate(api, task)
+      } catch (error) {
+        if (error instanceof AtomicWriteError) {
+          // The ledger itself is unavailable. Trying to note/retry/finish would
+          // issue another failing write from inside this catch and escape as an
+          // unhandled rejection. Leave the durable running row for lease recovery,
+          // stop claiming, and let the orphan sweep repair lost task enqueues once
+          // the disk is writable again.
+          this.#degrade(error)
+          return
+        }
+        const failure = classifyFailure(error)
+        const attemptsLeft = task.attempts < task.maxAttempts
+        this.#tasks.note(task.id, 'error', failure.message)
+        if (failure.blocksMonitor) {
+          this.#monitors.block(task.monitorId, failure.message)
+          this.#tasks.finish(task.id, 'blocked', { error: failure.message, errorKind: failure.kind })
+          this.#log.warn(`监控 ${task.monitorId} 因 ${failure.kind} 被暂停：${failure.message}`)
+          return
+        }
+        if (failure.retryable && attemptsLeft) {
+          const delay = failure.retryAfterMs ?? backoffFor(task.attempts, failure.kind)
+          this.#tasks.retryLater(task.id, delay, { error: failure.message, errorKind: failure.kind })
+          return
+        }
+        // Close the identity before publishing the terminal task row. A timeout
+        // can happen after the core persisted a candidate, and the reverse write
+        // order would expose a failed task with a permanently claimed identity to
+        // an invariant check. If the candidate store is unavailable, leave the
+        // claim for the orphan sweep rather than guessing absence.
+        if (task.kind === 'generate' && task.identityKey !== undefined) {
+          const identity = this.#identities.get(task.identityKey)
+          if (identity?.state === 'claimed') {
+            const related = this.#tasks.all().filter((entry) =>
+              entry.identityKey === identity.key || entry.identityKeys?.includes(identity.key) === true,
+            )
+            const candidate = await this.#findExistingCandidate(identity, related)
+            if (candidate.kind === 'found') {
+              this.#recordRecoveredCandidate(identity, task.sessionId, candidate.candidateId)
+              this.#tasks.finish(task.id, 'needs_review', { sessionId: task.sessionId })
+              this.#log.warn(`生成超时但已找到既有候选 ${candidate.candidateId}，任务转为待审核；不重复累计候选数`)
+              return
+            }
+            if (candidate.kind === 'absent') {
+              const uncertain = this.#tasks.get(task.id)?.modelCall?.uncertain === true ? '；模型调用结果不确定' : ''
+              this.#ignoreOrphanIdentity(
+                identity,
+                `生成任务 ${task.id} 失败（${failure.message}，尝试 ${task.attempts}/${task.maxAttempts}），未找到候选${uncertain}；已停止自动重试，可由操作员手动重试`,
+              )
+            } else {
+              this.#log.warn(`回复身份 ${identity.key} 的候选存储暂不可读，保留 claim 等待孤儿对账`)
+            }
+          }
+        }
+        this.#tasks.finish(task.id, 'failed', { error: failure.message, errorKind: failure.kind })
+        this.#monitors.noteOutcome(task.monitorId, 'failure')
+        this.#log.warn(`任务失败（${task.kind}/${platform}）：${failure.message}`)
+      }
+    } catch (error) {
+      // Bookkeeping can fail too (monitor write, auth block, note after a model
+      // error). None of those may reject the fire-and-forget execution promise.
+      if (error instanceof AtomicWriteError) {
+        this.#degrade(error)
+        return
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      this.#lastError = message
+      this.#log.error(`后台任务收尾失败（${task.id}）：${message}`)
+    }
+  }
+
+  #claimReplies(
+    monitor: MonitorTarget,
+    replies: readonly { postId: string; fingerprint: string; identityQuality: 'stable' | 'fallback' }[],
+    freshIds: readonly string[],
+  ): readonly { postId: string; key: string }[] {
+    const wanted = new Set(freshIds)
+    const claimed: { postId: string; key: string }[] = []
+    for (const reply of replies) {
+      if (!wanted.has(reply.postId)) continue
+      const key = replyIdentityKey({
+        platform: monitor.platform,
+        threadId: monitor.threadId,
+        postId: reply.postId,
+        quality: reply.identityQuality,
+        fingerprint: reply.fingerprint,
       })
+      const result = this.#identities.claim({
+        platform: monitor.platform,
+        threadId: monitor.threadId,
+        postId: reply.postId,
+        quality: reply.identityQuality,
+        fingerprint: reply.fingerprint,
+        monitorId: monitor.id,
+      })
+      if (result.fresh || result.identity.state === 'claimed') claimed.push({ postId: reply.postId, key })
+    }
+    return claimed
+  }
+
+  /**
+   * Ensure every claimed reply is covered by an analysis task.
+   *
+   * The first monitor's batch can still be pending when a second monitor discovers
+   * more replies in the same thread. In that case the new identities are appended
+   * to the pending batch. If it is already running, a second batch is queued for
+   * the uncovered replies. Keying only on the first identity would silently drop
+   * the rest of the batch.
+   */
+  #enqueueAnalysis(
+    monitor: MonitorTarget,
+    claimed: readonly { postId: string; key: string }[],
+  ): void {
+    const uncovered: { postId: string; key: string }[] = []
+    for (const entry of claimed) {
+      const identity = this.#identities.get(entry.key)
+      if (identity?.state === 'candidate' || identity?.state === 'ignored') continue
+      const covering = this.#tasks.all().find(
+        (task) =>
+          task.kind === 'analyze' &&
+          (task.identityKey === entry.key || task.identityKeys?.includes(entry.key) === true),
+      )
+      if (covering === undefined) {
+        uncovered.push(entry)
+        continue
+      }
+      if (covering.state === 'completed' || covering.state === 'needs_review') continue
+      if (covering.state === 'pending' || covering.state === 'retry_wait') {
+        try {
+          if (this.#tasks.appendIdentities(covering.id, [{ postId: entry.postId, identityKey: entry.key }])) continue
+        } catch (error) {
+          this.#lastError = error instanceof Error ? error.message : String(error)
+          this.#log.warn(`补充分析批次失败：${this.#lastError}`)
+        }
+      }
+      // Running, failed, blocked or cancelled: this identity is not safely covered.
+      uncovered.push(entry)
+    }
+    if (uncovered.length === 0) return
+    this.#enqueue({
+      kind: 'analyze',
+      monitorId: monitor.id,
+      postId: uncovered[0]!.postId,
+      postIds: uncovered.map((entry) => entry.postId),
+      identityKey: uncovered[0]!.key,
+      identityKeys: uncovered.map((entry) => entry.key),
+      dedupeKey: `analyze:${uncovered[0]!.key}`,
+    })
+  }
+
+  /**
+   * Reconcile durable claims with the tasks that actually still cover them.
+   *
+   * Only pending/running/retry_wait work is active. A blocked task covers its
+   * identity only while its own monitor is still blocked; otherwise an auth pause
+   * would either be silently reopened or re-queued on every sweep. Terminal tasks
+   * never cover work: failed/cancelled generation is closed as ignored after the
+   * candidate check, while a completed analysis can resume at generation.
+   */
+  async #recoverOrphanClaims(): Promise<void> {
+    if (this.#orphanSweepRunning) return
+    this.#orphanSweepRunning = true
+    try {
+      // An ignored identity is a durable fence. If closing its review row failed
+      // after that fence was written, finish the row without another core read or
+      // model call. This is the reverse crash window of candidate-missing
+      // recovery: identity first, task terminal state second.
+      for (const task of this.#tasks.all()) {
+        if (task.state !== 'needs_review' || task.identityKey === undefined) continue
+        const identity = this.#identities.get(task.identityKey)
+        if (identity?.state !== 'ignored') continue
+        this.#tasks.finish(task.id, 'failed', {
+          error: identity.lastError ?? '回复身份已熔断，待审核任务无效',
+          errorKind: 'candidate_missing',
+          ...(task.sessionId === undefined ? {} : { sessionId: task.sessionId }),
+        })
+      }
+
+      // Candidate identities are normally excluded from orphan recovery because
+      // they are terminal bookkeeping. They still need a core-backed audit: an
+      // older bug could persist the identity/review row while the candidate write
+      // failed. Re-read durable core evidence on every process start and close
+      // such ghosts without calling the model again.
+      for (const snapshot of this.#identities.all()) {
+        if (snapshot.state !== 'candidate' || this.#verifiedCandidates.has(this.#candidateEvidenceKey(snapshot))) continue
+        try {
+          await this.#recoverCandidateIdentity(snapshot)
+        } catch (error) {
+          if (error instanceof AtomicWriteError) throw error
+          const message = error instanceof Error ? error.message : String(error)
+          this.#log.warn(`回复身份 ${snapshot.key} 候选核心核验失败：${message}`)
+        }
+      }
+
+      const byIdentity = this.#tasksByIdentity()
+      const active = new Set<string>()
+      for (const [key, tasks] of byIdentity) {
+        if (tasks.some((task) => this.#taskCoversIdentity(task))) active.add(key)
+      }
+      for (const identity of this.#identities.orphans(active)) {
+        try {
+          await this.#recoverOrphanClaim(identity)
+        } catch (error) {
+          // One unreadable session must not prevent unrelated identities from
+          // converging. Ledger write failures are different: stop before doing
+          // more work on a store that is not durable.
+          if (error instanceof AtomicWriteError) throw error
+          const message = error instanceof Error ? error.message : String(error)
+          this.#log.warn(`回复身份 ${identity.key} 对账失败：${message}`)
+        }
+      }
+    } finally {
+      this.#orphanSweepRunning = false
+    }
+  }
+
+  /** Index both single and batched identity keys without changing either ledger. */
+  #tasksByIdentity(): Map<string, AutoTask[]> {
+    const byIdentity = new Map<string, AutoTask[]>()
+    for (const task of this.#tasks.all()) {
+      const keys = new Set<string>()
+      if (task.identityKey !== undefined) keys.add(task.identityKey)
+      for (const key of task.identityKeys ?? []) keys.add(key)
+      for (const key of keys) {
+        const tasks = byIdentity.get(key) ?? []
+        tasks.push(task)
+        byIdentity.set(key, tasks)
+      }
+    }
+    return byIdentity
+  }
+
+  /** Whether a task still owns this identity's pipeline work. */
+  #taskCoversIdentity(task: AutoTask): boolean {
+    if (task.state === 'pending' || task.state === 'running' || task.state === 'retry_wait') return true
+    return task.state === 'blocked' && this.#monitors.get(task.monitorId)?.blockedReason !== undefined
+  }
+
+  /** Re-read coverage after an asynchronous candidate lookup. */
+  #identityHasCoverage(key: string): boolean {
+    return this.#tasks.all().some((task) =>
+      (task.identityKey === key || task.identityKeys?.includes(key) === true)
+      && this.#taskCoversIdentity(task),
+    )
+  }
+
+  /** Whether any task already carries this identity's single review row. */
+  #identityHasReview(key: string): boolean {
+    return this.#tasks.all().some((task) =>
+      (task.identityKey === key || task.identityKeys?.includes(key) === true)
+      && task.state === 'needs_review',
+    )
+  }
+
+  /** Identity fields that change when new durable candidate evidence is recorded. */
+  #candidateEvidenceKey(identity: ReplyIdentity): string {
+    return `${identity.key}\u0000${identity.sessionId ?? ''}\u0000${identity.candidateId ?? ''}`
+  }
+
+  /**
+   * Cache only a fully reconciled candidate review.
+   *
+   * The cache suppresses future core reads, so candidate identity evidence alone
+   * is insufficient: a review row must already be durable. When a model-call
+   * record exists, its candidate id is diagnostic provenance rather than an
+   * approval; correct it to the core-confirmed id before caching. If any write
+   * fails, nothing is cached and the next sweep retries the remaining work.
+   */
+  #cacheVerifiedCandidateReview(identity: ReplyIdentity, candidateId: string): void {
+    const current = this.#identities.get(identity.key)
+    if (current?.state !== 'candidate' || !this.#identityHasReview(current.key)) return
+    for (const task of this.#tasks.all()) {
+      if ((task.identityKey !== current.key && task.identityKeys?.includes(current.key) !== true)
+        || task.state !== 'needs_review'
+        || task.modelCall === undefined
+        || task.modelCall.candidateId === candidateId) continue
+      this.#tasks.finishModelCall(task.id, { candidateId })
+    }
+    this.#verifiedCandidates.add(this.#candidateEvidenceKey(current))
+  }
+
+  /**
+   * Reconcile a candidate identity against the durable core document.
+   *
+   * This is deliberately broader than orphan-claim recovery. `candidate` is a
+   * terminal identity state, so a historical write-ordering bug used to leave it
+   * and its `needs_review` task stuck forever when core candidates were empty.
+   * Absence is actionable only after a successful core read; unavailable storage
+   * remains deferred. No branch calls analyze or generate.
+   */
+  async #recoverCandidateIdentity(snapshot: ReplyIdentity): Promise<void> {
+    let identity = this.#identities.get(snapshot.key)
+    if (identity === undefined || identity.state !== 'candidate') return
+    const identityKey = identity.key
+    const tasks = this.#tasks.all().filter((task) =>
+      task.identityKey === identityKey || task.identityKeys?.includes(identityKey) === true,
+    )
+    const candidate = await this.#findExistingCandidate(identity, tasks)
+    identity = this.#identities.get(snapshot.key)
+    if (identity === undefined || identity.state !== 'candidate') return
+    if (candidate.kind === 'unavailable') {
+      this.#log.warn(`回复身份 ${identity.key} 的候选存储暂不可读，保留候选身份等待下次核验`)
       return
     }
-    try {
-      if (task.kind === 'probe') await this.#runProbe(api, task)
-      else if (task.kind === 'compensate') await this.#runCompensate(api, task)
-      else if (task.kind === 'analyze') await this.#runAnalyze(api, task)
-      else await this.#runGenerate(api, task)
-    } catch (error) {
-      const failure = classifyFailure(error)
-      const attemptsLeft = task.attempts < task.maxAttempts
-      this.#tasks.note(task.id, 'error', failure.message)
-      if (failure.blocksMonitor) {
-        this.#monitors.block(task.monitorId, failure.message)
-        this.#tasks.finish(task.id, 'blocked', { error: failure.message, errorKind: failure.kind })
-        this.#log.warn(`监控 ${task.monitorId} 因 ${failure.kind} 被暂停：${failure.message}`)
-        return
+    // A live task may be in the middle of writing the candidate or retrying an
+    // unavailable read. It remains the owner and will perform its own check.
+    if (this.#identityHasCoverage(identity.key)) return
+
+    if (candidate.kind === 'absent') {
+      const reason =
+        `数据不一致：回复身份 ${identity.key} 记录候选 ${identity.candidateId ?? '(缺失)'}，` +
+        `但核心持久会话未确认目标 ${identity.postId} 的候选；已停止自动处理，未调用模型`
+      // Close the identity first. If this durable write fails, the task remains
+      // needs_review and the next sweep retries the same core-backed decision;
+      // no candidate+failed window is exposed. If the subsequent task write fails,
+      // the ignored identity is a durable fence and the sweep's ignored-review
+      // pass closes only that task, without another core read or model call.
+      this.#identities.markIgnored(identity.key, reason)
+      for (const task of tasks) {
+        if (task.state === 'needs_review') {
+          this.#tasks.finish(task.id, 'failed', {
+            error: reason,
+            errorKind: 'candidate_missing',
+            ...(task.sessionId === undefined ? {} : { sessionId: task.sessionId }),
+          })
+        }
       }
-      if (failure.retryable && attemptsLeft) {
-        const delay = failure.retryAfterMs ?? backoffFor(task.attempts, failure.kind)
-        this.#tasks.retryLater(task.id, delay, { error: failure.message, errorKind: failure.kind })
-        return
-      }
-      this.#tasks.finish(task.id, 'failed', { error: failure.message, errorKind: failure.kind })
-      this.#monitors.noteOutcome(task.monitorId, 'failure')
-      this.#log.warn(`任务失败（${task.kind}/${platform}）：${failure.message}`)
+      this.#log.warn(`回复身份 ${identity.key} 已熔断：${reason}`)
+      return
     }
+
+    const confirmedSessionId = identity.sessionId ?? tasks.find((task) => task.sessionId !== undefined)?.sessionId
+    if (identity.candidateId !== candidate.candidateId || confirmedSessionId === undefined) {
+      this.#identities.markCandidate(identity.key, {
+        ...(confirmedSessionId === undefined ? {} : { sessionId: confirmedSessionId }),
+        candidateId: candidate.candidateId,
+      })
+      identity = this.#identities.get(identity.key)
+      if (identity === undefined || identity.state !== 'candidate') return
+    }
+    if (this.#identityHasReview(identity.key)) {
+      this.#cacheVerifiedCandidateReview(identity, candidate.candidateId)
+      return
+    }
+
+    const completedAnalysis = tasks.find((task) => task.kind === 'analyze' && task.state === 'completed')
+    if (completedAnalysis !== undefined) {
+      await this.#recoverCandidateAnalysisReview(identity, completedAnalysis, candidate)
+    } else {
+      const generation = tasks.find((task) => task.kind === 'generate')
+      const sessionId = identity.sessionId ?? generation?.sessionId
+      // A terminal generation is historical evidence. Preserve its failed or
+      // completed state (the existing recovery contract) while retaining the
+      // now-verified candidate identity; only manufacture review provenance when
+      // no generation row exists at all.
+      if (generation === undefined) {
+        const monitor = this.#monitors.get(identity.monitorId)
+        if (monitor !== undefined && sessionId !== undefined) {
+          this.#enqueueRecoveredCandidateReview(identity, monitor.id, sessionId, candidate.candidateId)
+        }
+      }
+    }
+    const current = this.#identities.get(identity.key)
+    if (current?.state === 'candidate') this.#cacheVerifiedCandidateReview(current, candidate.candidateId)
+  }
+
+  /**
+   * Retry the review transition after candidate persistence succeeded but the
+   * analyze task write did not. Candidate identities are intentionally excluded
+   * from `orphans()`, so this reverse ledger gap must be reconciled explicitly.
+   */
+  async #recoverCandidateAnalysisReview(
+    snapshot: ReplyIdentity,
+    completedAnalysis: AutoTask,
+    confirmed?: Extract<CandidateLookup, { kind: 'found' }>,
+  ): Promise<void> {
+    const identity = this.#identities.get(snapshot.key)
+    if (identity === undefined || identity.state !== 'candidate') return
+    const analysis = this.#tasks.get(completedAnalysis.id)
+    if (analysis?.kind !== 'analyze' || analysis.state !== 'completed') return
+
+    const tasks = this.#tasks.all().filter((task) =>
+      task.identityKey === identity.key || task.identityKeys?.includes(identity.key) === true,
+    )
+    // The normal pipeline already has a generate review row. Reconciling the
+    // earlier completed analyze as well would create a duplicate review entry
+    // and count the same candidate twice.
+    if (this.#identityHasReview(identity.key)) return
+    const candidate = confirmed ?? await this.#findExistingCandidate(identity, tasks)
+    // A concurrent task may have created the review row while the core read was
+    // in flight. Re-check immediately after the await before doing any write.
+    if (this.#identityHasReview(identity.key)) return
+    if (candidate.kind === 'unavailable') {
+      this.#log.warn(`回复身份 ${identity.key} 的候选存储暂不可读，保留已完成分析等待下次对账`)
+      return
+    }
+    if (candidate.kind === 'absent') {
+      // The durable candidate state is evidence that a candidate once existed,
+      // but the readable core no longer confirms one for this target. Preserve
+      // both ledgers rather than inventing review provenance.
+      this.#log.warn(`回复身份 ${identity.key} 标记为候选但核心未确认候选证据，保留已完成分析等待下次对账`)
+      return
+    }
+    if (this.#identityHasCoverage(identity.key)) return
+
+    // Candidate lookup is asynchronous. Re-read the identity immediately before
+    // writing; the final review check and finish have no await between them.
+    const currentIdentity = this.#identities.get(identity.key)
+    const currentAnalysis = this.#tasks.get(analysis.id)
+    if (currentIdentity?.state !== 'candidate' || currentAnalysis?.state !== 'completed') return
+    if (this.#identityHasReview(identity.key)) return
+    const sessionId = currentAnalysis.sessionId ?? currentIdentity.sessionId
+    this.#tasks.finish(currentAnalysis.id, 'needs_review', sessionId === undefined ? {} : { sessionId })
+    this.#log.warn(`回复身份 ${identity.key} 已确认既有候选 ${candidate.candidateId}，补写原分析任务待审核状态，未创建生成任务，不重复累计候选数`)
+  }
+
+  /** Apply the smallest safe transition to one uncovered claim. */
+  async #recoverOrphanClaim(snapshot: ReplyIdentity): Promise<void> {
+    const identity = this.#identities.get(snapshot.key)
+    if (identity === undefined || identity.state !== 'claimed') return
+    const tasks = this.#tasks.all().filter((task) =>
+      task.identityKey === identity.key || task.identityKeys?.includes(identity.key) === true,
+    )
+    // An asynchronous candidate lookup can race a newly enqueued task. Re-check
+    // coverage before mutating the identity so recovery never steals live work.
+    if (tasks.some((task) => this.#taskCoversIdentity(task))) return
+
+    const terminal = tasks.filter((task) => isTerminal(task.state))
+    const terminalGenerate = terminal.find((task) => task.kind === 'generate')
+    if (terminalGenerate !== undefined) {
+      const candidate = await this.#findExistingCandidate(identity, tasks)
+      // A manual retry or another monitor may have enqueued work while the
+      // session read was in flight. Never close over that new coverage.
+      if (this.#identityHasCoverage(identity.key)) return
+      if (candidate.kind === 'unavailable') {
+        this.#log.warn(`回复身份 ${identity.key} 的候选存储暂不可读，保留 claim 等待下次对账`)
+        return
+      }
+      if (candidate.kind === 'found') {
+        this.#recordRecoveredCandidate(identity, terminalGenerate.sessionId ?? identity.sessionId, candidate.candidateId)
+        return
+      }
+      const uncertainty = terminalGenerate.modelCall?.uncertain === true ? '；模型调用结果不确定' : ''
+      const diagnosis = terminalGenerate.state === 'needs_review' ? '数据不一致：' : ''
+      const stateLabel = terminalGenerate.state === 'needs_review' ? '已待审核' : `已 ${terminalGenerate.state}`
+      this.#ignoreOrphanIdentity(
+        identity,
+        `${diagnosis}生成任务 ${terminalGenerate.id} ${stateLabel}，未找到候选${uncertainty}；已停止自动重试，可由操作员手动重试`,
+      )
+      return
+    }
+
+    // A failed/cancelled analysis can still carry a session from a partially
+    // completed pipeline. Candidate evidence must win before we circuit-break it.
+    const candidateBearingTerminal = terminal.some((task) =>
+      (task.kind !== 'analyze' || task.state !== 'completed')
+      && (identity.sessionId !== undefined || identity.candidateId !== undefined || task.sessionId !== undefined),
+    )
+    if (candidateBearingTerminal) {
+      const candidate = await this.#findExistingCandidate(identity, tasks)
+      if (candidate.kind === 'unavailable') {
+        this.#log.warn(`回复身份 ${identity.key} 的候选存储暂不可读，保留 claim 等待下次对账`)
+        return
+      }
+      if (this.#identityHasCoverage(identity.key)) return
+      if (candidate.kind === 'found') {
+        const sessionId = identity.sessionId ?? terminal.find((task) => task.sessionId !== undefined)?.sessionId
+        this.#recordRecoveredCandidate(identity, sessionId, candidate.candidateId)
+        const owner = terminal[0]
+        if (owner !== undefined && sessionId !== undefined && this.#monitors.get(owner.monitorId) !== undefined) {
+          this.#enqueueRecoveredCandidateReview(identity, owner.monitorId, sessionId, candidate.candidateId)
+        }
+        return
+      }
+    }
+
+    const failedOrCancelled = terminal.find((task) => task.state === 'failed' || task.state === 'cancelled')
+    if (failedOrCancelled !== undefined) {
+      this.#ignoreOrphanIdentity(
+        identity,
+        `${failedOrCancelled.kind} 任务 ${failedOrCancelled.id} 已 ${failedOrCancelled.state}：${failedOrCancelled.lastError ?? '未记录原因'}；已停止自动重试`,
+      )
+      return
+    }
+    const inconsistentReview = terminal.find((task) => task.state === 'needs_review')
+    if (inconsistentReview !== undefined) {
+      this.#ignoreOrphanIdentity(
+        identity,
+        `数据不一致：${inconsistentReview.kind} 任务 ${inconsistentReview.id} 已待审核但身份未记录候选，已熔断；请检查候选存储`,
+      )
+      return
+    }
+
+    const completedAnalysis = terminal.find((task) => task.kind === 'analyze' && task.state === 'completed')
+    if (completedAnalysis !== undefined) {
+      const sessionId = completedAnalysis.sessionId ?? identity.sessionId
+      if (sessionId === undefined) {
+        this.#ignoreOrphanIdentity(identity, `分析任务 ${completedAnalysis.id} 已完成但未记录会话，已熔断`)
+        return
+      }
+      const candidate = await this.#findExistingCandidate(identity, tasks)
+      if (candidate.kind === 'unavailable') {
+        this.#log.warn(`回复身份 ${identity.key} 的候选存储暂不可读，保留 claim 等待下次对账`)
+        return
+      }
+      if (this.#identityHasCoverage(identity.key)) return
+      if (candidate.kind === 'found') {
+        // The candidate already exists, so the original analysis is the review
+        // row. Do not manufacture a generate task: mark the identity first, and
+        // only then promote the analyze row. If the identity write fails, the
+        // completed/claimed pair remains for the next sweep to retry.
+        this.#identities.markCandidate(identity.key, { sessionId, candidateId: candidate.candidateId })
+        this.#tasks.finish(completedAnalysis.id, 'needs_review', { sessionId })
+        this.#log.warn(`回复身份 ${identity.key} 已找到既有候选 ${candidate.candidateId}，原分析任务转为待审核，未创建生成任务，不重复累计候选数`)
+        return
+      }
+      if (this.#monitors.get(completedAnalysis.monitorId) === undefined) {
+        this.#ignoreOrphanIdentity(identity, `分析任务 ${completedAnalysis.id} 已完成但监控已删除且无候选，已熔断`)
+        return
+      }
+      // Generation uses the already-created core session, not platform reads, so
+      // it can safely finish even if a later auth failure paused the monitor.
+      this.#enqueueOrphanGeneration(identity, completedAnalysis.monitorId, sessionId, '分析已完成但生成任务缺失')
+      return
+    }
+
+    const monitor = this.#monitors.get(identity.monitorId)
+    // The original crash window can also leave an attached session with no task.
+    // Resolve its candidate before a deleted monitor or auth pause closes/defers
+    // the claim; candidate evidence always wins over those bookkeeping states.
+    if (identity.sessionId !== undefined || identity.candidateId !== undefined) {
+      const candidate = await this.#findExistingCandidate(identity, tasks)
+      if (candidate.kind === 'unavailable') {
+        this.#log.warn(`回复身份 ${identity.key} 的候选存储暂不可读，保留 claim 等待下次对账`)
+        return
+      }
+      if (this.#identityHasCoverage(identity.key)) return
+      if (candidate.kind === 'found') {
+        this.#recordRecoveredCandidate(identity, identity.sessionId, candidate.candidateId)
+        if (monitor !== undefined && identity.sessionId !== undefined) {
+          this.#enqueueRecoveredCandidateReview(identity, monitor.id, identity.sessionId, candidate.candidateId)
+        }
+        return
+      }
+    }
+    if (monitor === undefined) {
+      this.#ignoreOrphanIdentity(identity, '回复身份所属监控已删除且无候选证据，已停止自动处理')
+      return
+    }
+    if (monitor.blockedReason !== undefined) {
+      // Authentication is an operator pause, not a terminal answer. Keep the
+      // claim and resume will make its blocked task cover the identity again.
+      return
+    }
+    if (terminal.length > 0) {
+      this.#ignoreOrphanIdentity(identity, '身份存在终态任务但没有可恢复的分析或生成阶段，已熔断')
+      return
+    }
+
+    // Analysis already attached a session and candidate lookup proved absence;
+    // resume at generation rather than analyse twice.
+    if (identity.sessionId !== undefined) {
+      this.#enqueueOrphanGeneration(identity, monitor.id, identity.sessionId, '身份已有会话但生成任务缺失')
+      return
+    }
+    this.#enqueue({
+      kind: 'analyze',
+      monitorId: monitor.id,
+      postId: identity.postId,
+      identityKey: identity.key,
+      identityKeys: [identity.key],
+      dedupeKey: `analyze:${identity.key}`,
+    })
+    this.#log.warn(`回复身份 ${identity.key} 已持久化但任务缺失，已重新排队`)
+  }
+
+  /** Resume a missing generation once; the normal candidate check still runs first. */
+  #enqueueOrphanGeneration(identity: ReplyIdentity, monitorId: string, sessionId: string, reason: string): void {
+    const current = this.#identities.get(identity.key)
+    if (current === undefined || current.state !== 'claimed') return
+    if (this.#tasks.all().some((task) =>
+      (task.identityKey === identity.key || task.identityKeys?.includes(identity.key) === true)
+      && this.#taskCoversIdentity(task),
+    )) return
+    this.#enqueue({
+      kind: 'generate',
+      monitorId,
+      postId: identity.postId,
+      identityKey: identity.key,
+      sessionId,
+      dedupeKey: `generate:${identity.key}`,
+      maxAttempts: 1,
+    })
+    this.#log.warn(`回复身份 ${identity.key}：${reason}，已排入一次有界生成恢复`)
+  }
+
+  /**
+   * Materialize review provenance for a candidate found before generation.
+   *
+   * The task is enqueued before the identity write and finished immediately. If
+   * either write fails, the surviving pending task re-runs the candidate check
+   * and settles without calling the model.
+   */
+  #enqueueRecoveredCandidateReview(identity: ReplyIdentity, monitorId: string, sessionId: string, candidateId: string): void {
+    if (this.#identityHasCoverage(identity.key)) return
+    const current = this.#identities.get(identity.key)
+    if (current === undefined || (current.state !== 'claimed' && current.state !== 'candidate')) return
+    const enqueued = this.#tasks.enqueue({
+      kind: 'generate',
+      monitorId,
+      postId: identity.postId,
+      identityKey: identity.key,
+      sessionId,
+      dedupeKey: `generate:${identity.key}`,
+      maxAttempts: 1,
+    })
+    if (enqueued.deduplicated) return
+    this.#identities.markCandidate(identity.key, { sessionId, candidateId })
+    this.#tasks.finish(enqueued.task.id, 'needs_review', { sessionId })
+    const confirmed = this.#identities.get(identity.key)
+    if (confirmed !== undefined) this.#cacheVerifiedCandidateReview(confirmed, candidateId)
+    this.#log.warn(`回复身份 ${identity.key} 已找到既有候选 ${candidateId}，直接建立待审核任务，未调用模型，不重复累计候选数`)
+  }
+
+  /**
+   * Look for a candidate before closing an uncertain terminal generation.
+   *
+   * A timeout can happen after the core persisted the candidate. Treating the
+   * task's failure as proof of absence would hide that candidate forever; treating
+   * an unavailable store as absence would be equally wrong, so that case defers.
+   */
+  async #findExistingCandidate(identity: ReplyIdentity, tasks: readonly AutoTask[]): Promise<CandidateLookup> {
+    const sessionIds = new Set<string>()
+    const preferredIds = new Set<string>()
+    for (const task of tasks) {
+      if (task.sessionId !== undefined) sessionIds.add(task.sessionId)
+      const candidateId = task.modelCall?.candidateId
+      if (typeof candidateId === 'string' && candidateId.trim() !== '') preferredIds.add(candidateId)
+    }
+    if (identity.sessionId !== undefined) sessionIds.add(identity.sessionId)
+    if (typeof identity.candidateId === 'string' && identity.candidateId.trim() !== '') preferredIds.add(identity.candidateId)
+    // Ledger ids are only hints. Without a session there is no core evidence to
+    // verify them against, so fail closed rather than treating the hint as proof.
+    if (sessionIds.size === 0) return preferredIds.size === 0 ? { kind: 'absent' } : { kind: 'unavailable' }
+    const api = this.#api()
+    if (api === undefined) return { kind: 'unavailable' }
+    let fallbackCandidateId: string | undefined
+    let unavailable = false
+    for (const sessionId of sessionIds) {
+      try {
+        const session = await api.session(sessionId)
+        if (session === undefined) continue
+        const candidates = session.candidates.filter((entry) =>
+          entry.targetPostId === identity.postId && typeof entry.replyId === 'string' && entry.replyId.trim() !== '',
+        )
+        // A recorded id confirmed by any readable session is conclusive. Keep
+        // checking the remaining sessions only when no preferred id has matched.
+        for (const preferredId of preferredIds) {
+          if (candidates.some((entry) => entry.replyId === preferredId)) {
+            return { kind: 'found', candidateId: preferredId }
+          }
+        }
+        fallbackCandidateId ??= candidates[0]?.replyId
+      } catch {
+        // A readable session with an unreadable candidate collection is just as
+        // inconclusive as a failed session read. Remember the failure so a
+        // fallback candidate or absence from another session is not overstated.
+        unavailable = true
+      }
+    }
+    if (unavailable) return { kind: 'unavailable' }
+    if (fallbackCandidateId !== undefined) return { kind: 'found', candidateId: fallbackCandidateId }
+    return { kind: 'absent' }
+  }
+
+  /** Repair the identity half of a candidate write that was interrupted. */
+  #recordRecoveredCandidate(identity: ReplyIdentity, sessionId: string | undefined, candidateId: string): void {
+    const current = this.#identities.get(identity.key)
+    if (current === undefined) return
+    // A concurrent task may have advanced this identity while the core lookup was
+    // in flight. Refresh an existing candidate from authoritative core evidence,
+    // but never reopen an explicitly ignored identity or any unknown state.
+    if (current.state !== 'claimed' && current.state !== 'candidate') return
+    const confirmedSessionId = sessionId ?? current.sessionId
+    if (current.state !== 'candidate'
+      || current.candidateId !== candidateId
+      || current.sessionId !== confirmedSessionId) {
+      this.#identities.markCandidate(identity.key, {
+        ...(confirmedSessionId === undefined ? {} : { sessionId: confirmedSessionId }),
+        candidateId,
+      })
+    }
+    const confirmed = this.#identities.get(identity.key)
+    if (confirmed?.state === 'candidate') this.#cacheVerifiedCandidateReview(confirmed, candidateId)
+    this.#log.warn(`回复身份 ${identity.key} 已找到既有候选 ${candidateId}，未重复调用模型`)
+  }
+
+  /** Close a terminal orphan without deleting its task evidence. */
+  #ignoreOrphanIdentity(identity: ReplyIdentity, reason: string): void {
+    const current = this.#identities.get(identity.key)
+    if (current === undefined || current.state !== 'claimed') return
+    this.#identities.markIgnored(identity.key, reason)
+    this.#log.warn(`回复身份 ${identity.key} 已熔断：${reason}`)
   }
 
   async #runProbe(api: DebateProductApi, task: AutoTask): Promise<void> {
@@ -517,7 +1277,7 @@ export class AutomationEngine {
       result = await api.probe({ url: monitor.url })
     } catch (error) {
       const failure = classifyFailure(error)
-      this.#monitors.noteCheck(monitor.id, { at: startedAt, ok: false, error: failure.message })
+      this.#monitors.noteCheck(monitor.id, { at: startedAt, ok: false, error: failure.message, platformState: failure.platformState })
       throw error
     }
     this.#monitors.noteCheck(monitor.id, { at: startedAt, ok: true })
@@ -552,6 +1312,13 @@ export class AutomationEngine {
       return
     }
 
+    // Claim globally *before* advancing this monitor's cursor. If the identity
+    // write fails, the cursor stays put and the next scan sees the reply again. If
+    // the cursor write fails after the claim, startup's orphan recovery enqueues the
+    // claimed reply. Either crash order is safe; the reverse order would lose it.
+    const known = new Set(monitor.seen)
+    const freshIds = fresh.filter((reply) => !known.has(reply.postId)).map((reply) => reply.postId)
+    const claimed = this.#claimReplies(monitor, fresh, freshIds)
     const outcome = this.#monitors.applyScan(monitor.id, {
       at: startedAt,
       coverage: 'tail',
@@ -571,16 +1338,9 @@ export class AutomationEngine {
       this.#tasks.finish(task.id, 'completed')
       return
     }
-    // One analysis covers the whole batch: the read that found these replies also
-    // contains them, so asking the engine to re-read per reply would multiply
-    // platform requests by the number of new comments.
-    this.#enqueue({
-      kind: 'analyze',
-      monitorId: monitor.id,
-      postId: outcome.fresh[0] as string,
-      postIds: outcome.fresh,
-      dedupeKey: `analyze:${monitor.id}:${outcome.fresh[0] as string}`,
-    })
+    // Two monitors can see the same floor; the identity fence makes the second
+    // one a no-op even though its own cursor was advanced independently.
+    this.#enqueueAnalysis(monitor, claimed)
     this.#tasks.note(task.id, 'info', `发现 ${outcome.fresh.length} 条新发言，已排入分析队列`)
     this.#tasks.finish(task.id, 'completed')
   }
@@ -602,11 +1362,14 @@ export class AutomationEngine {
       })
     } catch (error) {
       const failure = classifyFailure(error)
-      this.#monitors.noteCheck(monitor.id, { at: startedAt, ok: false, error: failure.message })
+      this.#monitors.noteCheck(monitor.id, { at: startedAt, ok: false, error: failure.message, platformState: failure.platformState })
       throw error
     }
     const owner = api.ownerIdentity(monitor.platform)
     const replies = result.replies.filter((reply) => !isOwnerPost(reply, owner))
+    const known = new Set(monitor.seen)
+    const freshIds = replies.filter((reply) => !known.has(reply.postId)).map((reply) => reply.postId)
+    const claimed = this.#claimReplies(monitor, replies, freshIds)
     const outcome = this.#monitors.applyScan(monitor.id, {
       at: startedAt,
       coverage: full ? 'full' : 'tail',
@@ -635,13 +1398,7 @@ export class AutomationEngine {
       // through analysis like any other discovery, or a slow probe cadence would
       // silently drop it. Rewrites are the opposite case — they are recorded only,
       // because a candidate built on a since-edited reply answers a dead question.
-      this.#enqueue({
-        kind: 'analyze',
-        monitorId: monitor.id,
-        postId: outcome.fresh[0] as string,
-        postIds: outcome.fresh,
-        dedupeKey: `analyze:${monitor.id}:${outcome.fresh[0] as string}`,
-      })
+      this.#enqueueAnalysis(monitor, claimed)
       this.#tasks.note(task.id, 'info', `补偿扫描发现 ${outcome.fresh.length} 条新发言，已排入分析队列`)
     }
     if (!result.scan.complete) {
@@ -670,38 +1427,82 @@ export class AutomationEngine {
     this.#monitors.noteOutcome(monitor.id, 'analyzed')
 
     const targets = task.postIds ?? (task.postId === undefined ? [] : [task.postId])
-    for (const postId of targets) {
-      // Keyed by monitor and reply, not by session: a second analysis of the same
-      // thread produces a new session id, and a session-scoped key would then let
-      // the same reply collect a second candidate.
-      const key = `generate:${monitor.id}:${postId}`
-      if (this.#tasks.settledByKey(key) !== undefined) continue
+    for (const [index, postId] of targets.entries()) {
+      const key = task.identityKeys?.[index] ?? task.identityKey ?? `legacy:${monitor.platform}:${monitor.threadId}:${postId}`
+      if (key !== undefined) this.#identities.attachSession(key, sessionId)
+      const identity = this.#identities.get(key)
+      if (identity?.state === 'candidate' || identity?.state === 'ignored') continue
+      const dedupeKey = `generate:${key}`
+      if (this.#tasks.settledByKey(dedupeKey) !== undefined) continue
       this.#enqueue({
         kind: 'generate',
         monitorId: monitor.id,
         postId,
+        identityKey: key,
         sessionId,
-        dedupeKey: key,
+        dedupeKey,
       })
     }
     this.#tasks.finish(task.id, 'completed', { sessionId })
   }
 
   async #runGenerate(api: DebateProductApi, task: AutoTask): Promise<void> {
-    const monitor = this.#monitors.get(task.monitorId)
-    if (monitor === undefined || task.sessionId === undefined) {
+    if (task.sessionId === undefined) {
       this.#tasks.finish(task.id, 'cancelled', { error: '监控目标或会话已不存在' })
+      return
+    }
+    const monitor = this.#monitors.get(task.monitorId)
+    const identity = task.identityKey === undefined ? undefined : this.#identities.get(task.identityKey)
+    if (identity?.state === 'candidate') {
+      const related = this.#tasks.all().filter((entry) =>
+        entry.identityKey === identity.key || entry.identityKeys?.includes(identity.key) === true,
+      )
+      const candidate = await this.#findExistingCandidate(identity, related)
+      if (candidate.kind === 'found') {
+        this.#tasks.note(task.id, 'info', `核心已确认既有候选 ${candidate.candidateId}，不再调用模型，不重复累计候选数`)
+        this.#tasks.finish(task.id, 'needs_review', { sessionId: identity.sessionId ?? task.sessionId })
+        return
+      }
+      if (candidate.kind === 'unavailable') {
+        const error = '身份已记录候选，但核心候选存储暂不可读；等待核验后转入待审核，不调用模型'
+        // Unavailable is not absence. Keep the identity and an active retry row
+        // even after the normal attempt budget; terminally failing here would
+        // create candidate+failed with no safe way to decide ignored vs review.
+        this.#tasks.retryLater(task.id, 30_000, { error, errorKind: 'candidate_unavailable' })
+        return
+      }
+      const error = '身份记录为候选，但核心不存在匹配目标的有效候选；已停止自动处理'
+      // Close the identity first. If this durable write fails, the task stays
+      // running for lease recovery instead of exposing terminal failed+candidate
+      // for one sweep interval (the strict soak invariant rejects that window).
+      if (task.identityKey !== undefined) this.#identities.markIgnored(task.identityKey, error)
+      this.#tasks.finish(task.id, 'failed', { error, errorKind: 'candidate_missing', sessionId: task.sessionId })
+      if (monitor !== undefined) this.#monitors.noteOutcome(monitor.id, 'failure')
       return
     }
     // A candidate for this exact target may already exist — from an earlier
     // attempt that was interrupted after the model call. Reusing it is both
     // cheaper and the only way "one reply, one candidate" holds across a crash.
     const session = await api.session(task.sessionId)
-    const existing = session?.candidates.find((candidate) => candidate.targetPostId === task.postId)
+    const existing = session?.candidates.find((candidate) =>
+      candidate.targetPostId === task.postId && typeof candidate.replyId === 'string' && candidate.replyId.trim() !== '',
+    )
     if (existing !== undefined) {
-      this.#tasks.note(task.id, 'info', `该目标已有候选 ${existing.replyId}，不再重复生成`)
+      this.#tasks.note(task.id, 'info', `该目标已有候选 ${existing.replyId}，不再重复生成，不重复累计候选数`)
+      if (task.identityKey !== undefined) this.#identities.markCandidate(task.identityKey, { sessionId: task.sessionId, candidateId: existing.replyId })
       this.#tasks.finish(task.id, 'needs_review', { sessionId: task.sessionId })
-      this.#monitors.noteOutcome(monitor.id, 'candidate')
+      return
+    }
+    if (monitor === undefined) {
+      this.#tasks.finish(task.id, 'cancelled', { error: '监控目标已删除' })
+      return
+    }
+    // Automatic recovery closes exhausted identities as ignored. Only the
+    // durable marker written by AutoTaskStore.retry may reopen one; a stale
+    // duplicate task must not turn an ignored decision into another model call.
+    const manuallyRetried = task.logs.some((entry) => entry.message === '操作员手动重试')
+    if (identity?.state === 'ignored' && !manuallyRetried) {
+      this.#tasks.finish(task.id, 'completed', { error: identity.lastError ?? '该回复已被标记为不生成', errorKind: 'generator_declined', sessionId: task.sessionId })
       return
     }
 
@@ -720,22 +1521,64 @@ export class AutomationEngine {
       this.#tasks.finishModelCall(task.id, { uncertain: true })
       throw error
     }
-    this.#tasks.finishModelCall(task.id, {
-      ...(result.candidateId === undefined ? {} : { candidateId: result.candidateId }),
-      ...(result.ok ? {} : { uncertain: true }),
-    })
-    if (result.ok) {
-      this.#tasks.note(task.id, 'info', `候选已生成：${result.candidateId ?? '(未返回 id)'}`)
+    const candidateId = typeof result.candidateId === 'string' ? result.candidateId.trim() : ''
+    const validCandidate = result.ok && candidateId !== ''
+    if (result.ok && candidateId === '') {
+      // A successful response without a durable candidate id is not reviewable.
+      // Reuse the normal uncertain-result reconciliation: the core may still own
+      // a candidate, but an absent or unreadable core must never create one in the
+      // identity ledger by assumption.
+      this.#tasks.finishModelCall(task.id, { uncertain: true })
+      throw Object.assign(new Error('生成返回成功但缺少非空 candidateId，模型调用结果不确定'), { code: 'bad_response' })
+    }
+    if (validCandidate) {
+      // The API contract promises a persisted candidate, but the server verifies
+      // that promise before advancing either ledger. This is the final boundary
+      // that prevents a dirty in-memory candidate from becoming needs_review.
+      let confirmed = false
+      try {
+        const persisted = await api.session(task.sessionId)
+        confirmed = persisted?.candidates.some((candidate) =>
+          candidate.replyId === candidateId
+          && (task.postId === undefined || candidate.targetPostId === task.postId),
+        ) === true
+      } catch (error) {
+        this.#tasks.finishModelCall(task.id, { candidateId, uncertain: true })
+        throw error
+      }
+      this.#tasks.finishModelCall(task.id, {
+        candidateId,
+        ...(confirmed ? {} : { uncertain: true }),
+      })
+      if (!confirmed) {
+        throw Object.assign(
+          new Error(`生成返回的 candidateId ${candidateId} 未在核心持久候选中确认，模型调用结果不确定`),
+          { code: 'bad_response' },
+        )
+      }
+      if (task.identityKey !== undefined) {
+        this.#identities.markCandidate(task.identityKey, { sessionId: task.sessionId, candidateId })
+      }
+      this.#tasks.note(task.id, 'info', `候选已生成：${candidateId}`)
       this.#tasks.finish(task.id, 'needs_review', { sessionId: task.sessionId })
+      if (task.identityKey !== undefined) {
+        const confirmedIdentity = this.#identities.get(task.identityKey)
+        if (confirmedIdentity !== undefined) this.#cacheVerifiedCandidateReview(confirmedIdentity, candidateId)
+      }
       this.#monitors.noteOutcome(monitor.id, 'candidate')
       return
     }
+    this.#tasks.finishModelCall(task.id, {
+      ...(candidateId === '' ? {} : { candidateId }),
+      uncertain: true,
+    })
     // A refusal from the generator is a decision with a reason. It is recorded in
     // full and never retried — asking the model again hoping for a different
     // judgement is how a rejected reply eventually gets through.
     const reason = result.message ?? `生成未产出候选（${result.outcome}）`
     const violations = result.violations?.join('；')
     this.#tasks.note(task.id, 'warn', violations === undefined ? reason : `${reason}：${violations}`)
+    if (task.identityKey !== undefined) this.#identities.markIgnored(task.identityKey, violations === undefined ? reason : `${reason}：${violations}`)
     this.#tasks.finish(task.id, 'completed', {
       error: violations === undefined ? reason : `${reason}：${violations}`,
       errorKind: 'generator_declined',
@@ -779,6 +1622,14 @@ export function monitorViews(
       compensationHours: monitor.compensationHours,
       createdAt: monitor.createdAt,
       updatedAt: monitor.updatedAt,
+      platformState: monitor.platformState,
+      nextScanAt: monitor.enabled && monitor.lastCheckAt !== undefined
+        ? new Date(Date.parse(monitor.lastCheckAt) + monitor.intervalSec * 1000).toISOString()
+        : undefined,
+      scanning: own.some((task) => task.kind === 'probe' && task.state === 'running'),
+      retryWaitSec: own
+        .filter((task) => task.state === 'retry_wait' && task.retryAfterMs !== undefined)
+        .reduce<number>((acc, task) => Math.max(acc, task.retryAfterMs as number), 0) / 1000,
       ...(monitor.lastCheckAt === undefined ? {} : { lastCheckAt: monitor.lastCheckAt }),
       ...(monitor.lastSuccessAt === undefined ? {} : { lastSuccessAt: monitor.lastSuccessAt }),
       ...(monitor.lastError === undefined ? {} : { lastError: monitor.lastError }),

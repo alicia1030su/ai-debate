@@ -1,6 +1,6 @@
 {
   "name": "@ai-debate/web",
-  "version": "0.1.0",
+  "version": "0.2.2",
   "private": true,
   "description": "AI Debate web console: the inherited product page plus the standalone auth shell, bundled into one static artefact.",
   "license": "AGPL-3.0-only",

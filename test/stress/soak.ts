@@ -37,6 +37,7 @@ import { probeThread } from '../../packages/core/lib/probe.js'
 import { runAnalysis, runGeneration } from '../../packages/core/lib/runtime.js'
 import { MonitorStore } from '../../packages/server/src/monitor/store.ts'
 import { AutoTaskStore } from '../../packages/server/src/monitor/tasks.ts'
+import { ReplyIdentityStore } from '../../packages/server/src/monitor/identities.ts'
 import { AutomationEngine } from '../../packages/server/src/monitor/engine.ts'
 import { FakeAdapter, type FakeReplySeed } from '../support/fake-adapter.ts'
 import type { DebateProductApi } from '../../packages/core/lib/product-api.js'
@@ -189,7 +190,9 @@ async function main(): Promise<void> {
   const tasks = new AutoTaskStore({ file: join(dir, 'auto-tasks.json'), log: quiet, capacity: 400 })
   tasks.load()
   tasks.recoverInterrupted()
-  const engine = new AutomationEngine({ monitors, tasks, api: () => api, log: quiet as never, tickMs: intervalMs, taskTimeoutMs: 120_000 })
+  const identities = new ReplyIdentityStore({ file: join(dir, 'reply-identities.json'), log: quiet })
+  identities.load()
+  const engine = new AutomationEngine({ monitors, tasks, identities, api: () => api, log: quiet as never, tickMs: intervalMs, taskTimeoutMs: 120_000 })
   engine.start()
 
   const monitor = monitors.create({ name: '压力', url: THREAD_URL, intervalSec: 120 }, { platform: PLATFORM, threadId: '9200' })

@@ -35,7 +35,8 @@ import {
   type ThreadRef,
   type UserProfile,
 } from '../../types.js'
-import { HttpClient, MOBILE_UA, type HttpResult } from '../http.js'
+import { HttpClient, MOBILE_UA, type HttpClientOptions, type HttpResult } from '../http.js'
+import { classifyFault, type FaultReport } from '../../fault-classify.js'
 import {
   parseCommentPage,
   parseTbs,
@@ -81,6 +82,28 @@ function identityOfNested(reply: NestedReply): AuthorIdentity {
 const FLOORS_PER_PAGE = 30
 
 /** Options for the adapter; every one has a working default. */
+export type TiebaPlatformState =
+  | 'healthy'
+  | 'unauthorized'
+  | 'forbidden'
+  | 'rate_limited'
+  | 'network_error'
+  | 'egress_blocked'
+  | 'adapter_error'
+  | 'unknown'
+
+export interface TiebaDiagnostics {
+  readonly platform: 'tieba'
+  readonly state: TiebaPlatformState
+  readonly authenticated?: boolean
+  readonly authKnown: boolean
+  readonly cookieNames: readonly string[]
+  readonly nestedChannel: { readonly open: boolean; readonly reason?: string }
+  readonly lastRead?: { readonly ok: boolean; readonly at: string; readonly stage: string; readonly message: string }
+  readonly lastError?: { readonly at: string; readonly code: string; readonly status?: number; readonly message: string; readonly fault: FaultReport }
+  readonly lines: readonly { readonly state: string; readonly message: string; readonly steps: readonly string[] }[]
+}
+
 export interface TiebaAdapterOptions {
   /** Cookie header value copied from a logged-in browser, if the user has one. */
   readonly cookie?: string
@@ -88,6 +111,8 @@ export interface TiebaAdapterOptions {
   readonly timeoutMs?: number
   /** Extra attempts for transport failures. */
   readonly retries?: number
+  /** DNS resolver injection; production uses the system resolver. */
+  readonly resolver?: HttpClientOptions['resolver']
   /** Milliseconds to pace pagination, to stay polite. */
   readonly pageDelayMs?: number
   /** Hard cap on pages walked for one thread; guards runaway loops. */
@@ -172,6 +197,10 @@ export class TiebaAdapter implements PlatformAdapter {
   private nestedChannelBlockedUntil = 0
   /** Why the nested channel was closed, for the health report. */
   private nestedChannelReason: string | undefined
+  private lastAuth: { state: AuthState; at: string } | undefined
+  private lastRead: TiebaDiagnostics['lastRead']
+  private lastError: TiebaDiagnostics['lastError']
+  private lastThreadId: string | undefined
 
   constructor(options: TiebaAdapterOptions = {}) {
     this.options = options
@@ -180,6 +209,7 @@ export class TiebaAdapter implements PlatformAdapter {
     this.http = new HttpClient({
       timeoutMs: options.timeoutMs ?? 20_000,
       retries: options.retries ?? 2,
+      ...(options.resolver === undefined ? {} : { resolver: options.resolver }),
     })
     if (options.cookie) this.seedCookie(options.cookie)
   }
@@ -253,12 +283,18 @@ export class TiebaAdapter implements PlatformAdapter {
   ): Promise<HttpResult> {
     await this.bootstrap(signal)
     const offset = (page - 1) * FLOORS_PER_PAGE
-    return this.http.request(`https://tieba.baidu.com/mo/q/m?kz=${threadId}&pn=${offset}`, {
-      headers: { 'user-agent': MOBILE_UA, referer: threadUrl(threadId) },
-      signal,
-      timeoutMs: this.options.timeoutMs,
-      retries: this.options.retries,
-    })
+    this.lastThreadId = threadId
+    try {
+      return await this.http.request(`https://tieba.baidu.com/mo/q/m?kz=${threadId}&pn=${offset}`, {
+        headers: { 'user-agent': MOBILE_UA, referer: threadUrl(threadId) },
+        signal,
+        timeoutMs: this.options.timeoutMs,
+        retries: this.options.retries,
+      })
+    } catch (error) {
+      this.rememberError(error)
+      throw error
+    }
   }
 
   /** Check the login state from the page's own editor config. */
@@ -297,6 +333,12 @@ export class TiebaAdapter implements PlatformAdapter {
       (id): id is string => typeof id === 'string' && id.length > 0,
     )
 
+    if (candidates.length === 0) {
+      const state: AuthState = { authenticated: false, reason: '尚未配置登录探测帖，无法确认登录状态' }
+      this.lastAuth = { state, at: new Date().toISOString() }
+      return state
+    }
+
     let lastFailure: PlatformError | undefined
     for (const threadId of candidates) {
       let html: string
@@ -305,6 +347,9 @@ export class TiebaAdapter implements PlatformAdapter {
         html = page.text
       } catch (error) {
         const failure = error as PlatformError
+        // A local egress refusal says nothing about login state and must not be
+        // converted into an unauthenticated AuthState by the probe loop.
+        if (isEgressBlocked(error)) throw error
         lastFailure = failure
         // A deleted or inaccessible probe says nothing about the login. Try the next
         // one; only a challenge/block is worth reporting verbatim, and even then a
@@ -319,20 +364,26 @@ export class TiebaAdapter implements PlatformAdapter {
         lastFailure = undefined
         continue
       }
+      this.lastAuth = { state, at: new Date().toISOString() }
       return state
     }
 
     if (lastFailure) {
-      return {
+      const state: AuthState = {
         authenticated: false,
         reason: `无法读取贴吧页面来确认登录状态：${lastFailure.message}`,
         blocked: lastFailure.code === 'captcha' || lastFailure.code === 'forbidden',
       }
+      this.lastAuth = { state, at: new Date().toISOString() }
+      return state
     }
-    return {
+    const state: AuthState = {
       authenticated: false,
       reason: '每个可用的贴吧页面都没有暴露登录状态标记，按未登录处理',
-    }  }
+    }
+    this.lastAuth = { state, at: new Date().toISOString() }
+    return state
+  }
 
   /** Read the thread body and its metadata. */
   async getThread(ref: ThreadRef, signal?: AbortSignal): Promise<Thread> {
@@ -345,8 +396,11 @@ export class TiebaAdapter implements PlatformAdapter {
 
     const first = floors[0]
     if (!first) {
-      throw new PlatformError(`帖子 ${parsedRef.threadId} 没有可读取的楼层，可能已被删除`, 'not_found')
+      const error = new PlatformError(`帖子 ${parsedRef.threadId} 没有可读取的楼层，可能已被删除`, 'not_found')
+      this.rememberError(error)
+      throw error
     }
+    this.rememberRead(true, 'thread', `读取帖子 ${parsedRef.threadId}`)
     this.threadCache.set(parsedRef.threadId, {
       forumId: wapMeta.forumId,
       forumName: wapMeta.forumName,
@@ -385,13 +439,33 @@ export class TiebaAdapter implements PlatformAdapter {
     const meta = parseWapPageMeta(response.text)
     const floors = parseWapFloors(response.text)
     const declaredTotalPages = meta.totalPages
+    const hasMore =
+      declaredTotalPages !== undefined
+        ? page < declaredTotalPages
+        : floors.length === FLOORS_PER_PAGE
+    // A page number that disagrees with the page the platform says it served is
+    // evidence of a redirect, a cache hit, or a changed URL contract. Treating it
+    // as the requested page would silently skip or duplicate floors.
+    const wrongPage = meta.currentPage !== undefined && meta.currentPage !== page
+    const emptyDeclaredPage = floors.length === 0 && (declaredTotalPages === undefined || page <= declaredTotalPages)
+    // `pageSize` is the nominal capacity, not a promise: deleted floors leave real
+    // gaps, and the captured fixture's first page has 29 readable floors out of a
+    // nominal 30. A short page is therefore not, by itself, a pagination fault.
+    const incomplete = wrongPage || emptyDeclaredPage
+    if (incomplete) {
+      this.rememberError(new PlatformError(
+        wrongPage ? `请求第 ${page} 页，但平台返回第 ${meta.currentPage} 页` : `平台声明有第 ${page} 页，却没有返回楼层`,
+        'malformed_response',
+      ))
+    } else {
+      this.rememberRead(true, 'replies', `读取第 ${page} 页，共 ${floors.length} 楼`)
+    }
     return {
       floors: floors.map((entry) => entry.floor),
       page,
-      hasMore:
-        declaredTotalPages !== undefined
-          ? page < declaredTotalPages
-          : floors.length === FLOORS_PER_PAGE,
+      hasMore,
+      pagingState: incomplete ? 'partial' : hasMore ? 'more' : declaredTotalPages === undefined ? 'unknown' : 'done',
+      incomplete,
       declaredTotalPages,
       declaredTotal: meta.totalCount,
     }
@@ -426,12 +500,15 @@ export class TiebaAdapter implements PlatformAdapter {
     let declaredTotal: number | undefined
     let page = 1
     let failed: string | undefined
+    let reachedDeclaredEnd = false
+    let duplicatePage = false
 
     while (page <= maxPages) {
       let response: HttpResult
       try {
         response = await this.fetchWapPage(parsedRef.threadId, page, options.signal)
       } catch (error) {
+        if (isEgressBlocked(error)) throw error
         failed = (error as Error).message
         break
       }
@@ -449,8 +526,19 @@ export class TiebaAdapter implements PlatformAdapter {
       }
       options.onProgress?.({ page, totalPages, collected: seen.size })
 
-      if (floors.length === 0 || added === 0) break
-      if (totalPages !== undefined && page >= totalPages) break
+      if (floors.length === 0 || added === 0) {
+        // An empty page before the declared end, or a page containing only ids we
+        // already saw, is not a clean end of thread. It is a pagination fault.
+        if (totalPages === undefined || page < totalPages) {
+          failed = failed ?? `第 ${page} 页没有带来新楼层，但平台仍声明还有后续页`
+          duplicatePage = added === 0 && floors.length > 0
+        }
+        break
+      }
+      if (totalPages !== undefined && page >= totalPages) {
+        reachedDeclaredEnd = true
+        break
+      }
       page += 1
       if (this.options.pageDelayMs) {
         await new Promise((resolve) => setTimeout(resolve, this.options.pageDelayMs))
@@ -469,8 +557,12 @@ export class TiebaAdapter implements PlatformAdapter {
       totalPages,
       // Completion means every declared floor is present. Deleted floors leave
       // permanent gaps, so a short result is reported as incomplete, not hidden.
-      complete: failed === undefined && missingCount === undefined,
+      complete:
+        failed === undefined &&
+        missingCount === undefined &&
+        (totalPages === undefined || reachedDeclaredEnd),
       missingCount,
+      ...(duplicatePage ? { error: failed } : {}),
       error: failed,
     }
   }
@@ -489,6 +581,7 @@ export class TiebaAdapter implements PlatformAdapter {
         if (fallback) return fallback
         return await this.readNestedFromCommentPage(parsedRef, floor, page, signal)
       } catch (failure) {
+        if (isEgressBlocked(failure)) throw failure
         if (!this.tripNestedChannel(failure)) throw failure
       }
     }
@@ -503,13 +596,13 @@ export class TiebaAdapter implements PlatformAdapter {
   /**
    * Close the nested channel after a block, and report whether that happened.
    *
-   * Only a `forbidden`/`rate_limited` answer closes it: those are the platform
-   * refusing this reader, and retrying makes it worse. A timeout or a 5xx is
+   * Only a `forbidden`/`rate_limited`/`captcha` answer closes it: those are the
+   * platform refusing this reader, and retrying makes it worse. A timeout or a 5xx is
    * transient and is left to the HTTP layer's retry budget.
    */
   private tripNestedChannel(failure: unknown): boolean {
     if (!(failure instanceof PlatformError)) return false
-    if (failure.code !== 'forbidden' && failure.code !== 'rate_limited') return false
+    if (failure.code !== 'forbidden' && failure.code !== 'rate_limited' && failure.code !== 'captcha') return false
     const cooldown = this.options.nestedCooldownMs ?? 10 * 60_000
     this.nestedChannelBlockedUntil = Date.now() + cooldown
     this.nestedChannelReason =
@@ -531,7 +624,7 @@ export class TiebaAdapter implements PlatformAdapter {
     const replies = floor.inlineNested ?? []
     const declared = floor.nestedCount
     const hasMore = declared !== undefined && declared > replies.length
-    return { replies, page, hasMore: false, declaredTotal: declared, incomplete: hasMore }
+    return { replies, page, hasMore, pagingState: hasMore ? 'partial' : 'done', declaredTotal: declared, incomplete: hasMore }
   }
 
   /** Explain the current nested-channel state, for the health report. */
@@ -654,6 +747,7 @@ export class TiebaAdapter implements PlatformAdapter {
       try {
         result = await this.getNestedReplies(ref, floor, page, options.signal)
       } catch (failure) {
+        if (isEgressBlocked(failure)) throw failure
         error = (failure as Error).message
         break
       }
@@ -926,7 +1020,7 @@ export class TiebaAdapter implements PlatformAdapter {
     const text = content.trim()
     if (!text) return { status: 'failed', error: '回复内容为空', errorCode: 'malformed_response' }
 
-    const auth = await this.checkAuthentication(signal)
+    const auth = await this.checkAuthentication(signal, parsedRef.threadId)
     if (!auth.authenticated) {
       return {
         status: 'failed',
@@ -978,6 +1072,7 @@ export class TiebaAdapter implements PlatformAdapter {
         retries: 0,
       })
     } catch (error) {
+      if (isEgressBlocked(error)) throw error
       const failure = error as PlatformError
       // Timeout or transport failure after sending = unknown outcome.
       if (failure.code === 'timeout' || failure.code === 'network') {
@@ -990,8 +1085,86 @@ export class TiebaAdapter implements PlatformAdapter {
       return { status: 'failed', error: failure.message, errorCode: failure.code }
     }
 
-    return interpretPublishResponse(response.text)
+    const outcome = interpretPublishResponse(response.text)
+    this.rememberRead(outcome.status === 'confirmed', 'publish', outcome.error ?? '发表接口已返回确定结果')
+    return outcome
   }
+
+  /** Live, secret-free diagnostics for the settings page and monitor health check. */
+  async describeDiagnostics(options: { readonly refresh?: boolean; readonly signal?: AbortSignal } = {}): Promise<TiebaDiagnostics> {
+    if (options.refresh === true || this.lastAuth === undefined) {
+      await this.checkAuthentication(options.signal, this.authProbeThreadId ?? this.lastThreadId)
+    }
+    const auth = this.lastAuth
+    const nested = this.describeNestedChannel()
+    const error = this.lastError
+    const state: TiebaPlatformState = error === undefined
+      ? auth?.state.authenticated === true ? 'healthy' : auth === undefined ? 'unknown' : 'unauthorized'
+      : error.code === 'rate_limited' ? 'rate_limited'
+        : error.code === 'forbidden' || error.code === 'captcha' ? 'forbidden'
+          : error.code === 'auth_required' ? 'unauthorized'
+            : error.code === 'network' || error.code === 'timeout' || error.code === 'dns' ? 'network_error'
+              : error.code === 'egress_blocked' ? 'egress_blocked'
+                : error.code === 'malformed_response' || error.code === 'not_found' ? 'adapter_error'
+                : 'unknown'
+    const authLine = {
+      state: auth?.state.authenticated === true ? 'read_ok' : auth === undefined ? 'not_implemented' : 'not_authorised',
+      message: auth?.state.reason ?? '尚未探测登录状态',
+      steps: auth?.state.authenticated === true ? [] : ['在「贴吧账号」保存有效 Cookie', '配置一个可公开读取的探测帖', '点击「刷新实时诊断」'],
+    }
+    const nestedLine = {
+      state: nested.open ? 'read_ok' : 'failed',
+      message: nested.reason ?? '楼中楼分页通道可用',
+      steps: nested.open ? [] : ['等待冷却时间结束', '不要连续重试楼中楼接口'],
+    }
+    const errorLine = error === undefined ? undefined : {
+      state: 'failed',
+      message: `${error.code}${error.status === undefined ? '' : ` / HTTP ${error.status}`}：${error.message}`,
+      steps: [error.fault.nextStep],
+    }
+    return {
+      platform: 'tieba',
+      state,
+      ...(auth === undefined ? {} : { authenticated: auth.state.authenticated }),
+      authKnown: auth !== undefined,
+      cookieNames: this.describeCookieNames(),
+      nestedChannel: nested,
+      ...(this.lastRead === undefined ? {} : { lastRead: this.lastRead }),
+      ...(error === undefined ? {} : { lastError: error }),
+      lines: [authLine, nestedLine, ...(errorLine === undefined ? [] : [errorLine])],
+    }
+  }
+
+  private rememberRead(ok: boolean, stage: string, message: string): void {
+    this.lastRead = { ok, at: new Date().toISOString(), stage, message }
+  }
+
+  private rememberError(error: unknown): void {
+    const typed = error as { code?: unknown; status?: unknown; message?: unknown }
+    const code = typeof typed.code === 'string' ? typed.code : 'unknown'
+    const message = error instanceof Error ? error.message : String(error)
+    this.lastError = {
+      at: new Date().toISOString(),
+      code,
+      ...(typeof typed.status === 'number' ? { status: typed.status } : {}),
+      message,
+      fault: classifyFault({
+        code: code as never,
+        ...(typeof typed.status === 'number' ? { status: typed.status } : {}),
+        message,
+        hasCredential: this.http.jar.has('BDUSS'),
+        hostReachable: true,
+      }),
+    }
+  }
+}
+
+/** Recognize a policy refusal without wrapping or degrading it into an outcome. */
+function isEgressBlocked(error: unknown): boolean {
+  if (error === null || typeof error !== 'object') return false
+  const candidate = error as { name?: unknown; code?: unknown }
+  return candidate.code === 'egress_blocked'
+    && (candidate.name === 'EgressBlockedError' || candidate.name === 'PlatformError')
 }
 
 /** Normalize an incoming ref, accepting a raw URL or bare thread id. */

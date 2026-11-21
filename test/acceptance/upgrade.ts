@@ -88,7 +88,7 @@ interface ScenarioSummary {
   readonly dataDir: string
   readonly stateSha256: string
   readonly beforeFiles: readonly FileDigest[]
-  readonly identityMigration: 'migrated' | 'strategy-only' | 'not-applicable'
+  readonly identityMigration: 'migrated' | 'failed' | 'not-applicable'
   readonly modelCalls: number
 }
 
@@ -714,25 +714,34 @@ async function verifyDecryptedCredentials(dataDir: string, prefix: string): Prom
   check(`${prefix} credentials.json 不含明文测试值`, Object.values(SECRET_VALUES).every((value) => !ciphertext.includes(value)))
 }
 
-function inspectIdentities(dataDir: string, prefix: string): 'migrated' | 'strategy-only' | 'not-applicable' {
+function inspectIdentities(dataDir: string, prefix: string): 'migrated' | 'failed' {
   const file = join(dataDir, 'reply-identities.json')
   if (!existsSync(file)) {
-    note(`${prefix} reply-identities.json 未生成；当前产品没有旧 seen/cursor/task/state -> 全局身份的自动迁移路径。`)
-    note(`${prefix} 已记录策略：稳定 ID 建 candidate；仅 seen 的行建 ignored(legacy-seen)；v0.2.0 无稳定指纹时不伪造 fallback。`)
-    return 'strategy-only'
+    check(`${prefix} 启动自动生成 reply-identities.json`, false, '迁移模块未接线或启动迁移失败')
+    return 'failed'
   }
   const document = readJson(file)
+  check(`${prefix} 身份迁移完成标记已落盘`, document.migration?.state === 'complete' && typeof document.migration?.completedAt === 'string')
   const entries = Array.isArray(document.entries) ? document.entries as JsonObject[] : []
   const byPost = new Map(entries.map((entry) => [String(entry.postId), entry]))
   const candidate222 = byPost.get('222')
   const candidate333 = byPost.get('333')
+  const candidatesMigrated = candidate222?.state === 'candidate' && candidate333?.state === 'candidate'
   check(
     `${prefix} 旧候选回复已迁移为全局 candidate 身份`,
-    candidate222?.state === 'candidate' && candidate333?.state === 'candidate',
+    candidatesMigrated,
     `222=${String(candidate222?.state)} 333=${String(candidate333?.state)}`,
   )
-  check(`${prefix} 旧 seen 回复没有遗留为可重放的 claimed`, entries.every((entry) => entry.state !== 'claimed'))
-  return 'migrated'
+  const seenIgnored = byPost.get('111')?.state === 'ignored'
+  check(`${prefix} 仅 seen 的旧回复迁移为 ignored`, seenIgnored)
+  const noReplayableClaims = entries.every((entry) => entry.state !== 'claimed')
+  check(`${prefix} 旧 seen 回复没有遗留为可重放的 claimed`, noReplayableClaims)
+  const migratedTasks = (readJson(join(dataDir, 'auto-tasks.json')).tasks ?? []) as JsonObject[]
+  const tasksBackfilled = migratedTasks.find((task) => task.id === 'upgrade-task-review')?.identityKey === `stable:tieba:${THREAD_ID}:333`
+    && migratedTasks.find((task) => task.id === 'upgrade-task-recover')?.identityKey === `stable:tieba:${THREAD_ID}:222`
+  check(`${prefix} 旧任务已回填全局身份键`, tasksBackfilled)
+  const migrationComplete = document.migration?.state === 'complete' && typeof document.migration?.completedAt === 'string'
+  return candidatesMigrated && seenIgnored && noReplayableClaims && tasksBackfilled && migrationComplete ? 'migrated' : 'failed'
 }
 
 async function runScenario(source: LegacySource, model: { port: number; calls(): number }): Promise<void> {
@@ -753,7 +762,7 @@ async function runScenario(source: LegacySource, model: { port: number; calls():
     ? sha256(readFileSync(join(dataDir, 'credentials.json')))
     : undefined
   let service: RunningService | undefined
-  let identityMigration: ScenarioSummary['identityMigration'] = source.version === '0.2.1' ? 'strategy-only' : 'not-applicable'
+  let identityMigration: ScenarioSummary['identityMigration'] = source.version === '0.2.1' ? 'failed' : 'not-applicable'
   const modelCallsBefore = model.calls()
   try {
     service = startCurrent(dataDir)
@@ -786,7 +795,7 @@ async function runScenario(source: LegacySource, model: { port: number; calls():
       : (readJson(join(dataDir, 'monitors.json')).monitors as JsonObject[]).find((monitor) => monitor.id === legacy.id)
     check(`${prefix} 旧监控目标保留`, legacy !== undefined, `count=${monitors.length}`)
     check(`${prefix} 监控 ID/间隔/启用状态保留`, legacy?.id !== undefined && legacy.intervalSec === 300 && legacy.enabled === false)
-    check(`${prefix} 监控计数保留`, legacy?.counters?.discovered === 3 && legacy?.counters?.candidates === 2)
+    check(`${prefix} 监控计数保留`, legacy?.counters?.discovered === 3 && legacy?.counters?.candidates === 2, JSON.stringify(legacy?.counters))
     check(`${prefix} 旧 seen 列表保留`, Array.isArray(diskMonitor?.seen) && diskMonitor.seen.join(',') === '111,222,333')
     if (source.version === '0.2.1') {
       check(`${prefix} v0.2.1 cursor 完整保留`, diskMonitor?.cursor?.lastCompleteScanAt !== undefined && diskMonitor?.cursor?.lastSeenPostId === '333' && diskMonitor?.cursor?.fingerprints?.['222'] === 'fp-222' && legacy?.lastCompleteScanAt === diskMonitor?.cursor?.lastCompleteScanAt)

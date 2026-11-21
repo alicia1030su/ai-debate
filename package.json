@@ -1,6 +1,6 @@
 {
   "name": "ai-debate",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "AI Debate — standalone discussion analysis, persona-driven reply drafting and human-approved publishing workbench.",
   "license": "AGPL-3.0-only",
@@ -21,8 +21,9 @@
     "bundle": "node scripts/bundle-server.mjs",
     "package:windows": "node packaging/windows/build.mjs",
     "package:linux": "node packaging/linux/build.mjs",
-    "test": "npm run test:core && npm run test:server && npm run test:web && npm run acceptance && npm run test:automation && npm run test:recovery && npm run test:paging && npm run test:upgrade",
+    "test": "npm run test:core && npm run test:server && npm run test:web && npm run test:secrets && npm run acceptance && npm run test:automation && npm run test:recovery && npm run test:paging && npm run test:upgrade",
     "test:core": "node --experimental-transform-types --test --test-concurrency=4 \"packages/core/test/**/*.test.ts\"",
+    "test:secrets": "node --test test/scan-secrets.test.mjs",
     "start": "node --experimental-transform-types packages/server/src/cli.ts serve",
     "smoke": "node --experimental-transform-types test/acceptance/standalone.ts",
     "acceptance": "node --experimental-transform-types test/acceptance/standalone.ts",

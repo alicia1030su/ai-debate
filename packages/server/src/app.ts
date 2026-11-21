@@ -7,11 +7,13 @@
  *   2. The logger, so a failure in any later step is readable.
  *   3. Configuration, credentials and the administrator account — the three
  *      stores the engine reads through the adapter.
- *   4. The job queue, because its handlers close over the stores above.
- *   5. `apply()` last: it builds the runtime, registers the seven route families
+ *   4. The job queue and monitor ledgers, because their handlers and migration
+ *      close over the stores above.
+ *   5. Legacy reply-identity migration, before automation can observe a monitor.
+ *   6. `apply()` last: it builds the runtime, registers the seven route families
  *      and starts reading the config object. Anything it needs must already exist.
  *
- * A failure in step 5 is not fatal to the process: the server still answers
+ * A failure in step 5 or 6 is not fatal to the process: the server still answers
  * `/healthz` (so the launcher and systemd see "alive") and every API route returns
  * 503 with the reason. A product that refuses to start because one subsystem threw
  * is worse than one that starts and says what is broken.
@@ -19,7 +21,8 @@
 import { apply } from '@ai-debate/core'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { copyFileSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { AssetStore } from './assets.ts'
 import { AuthService, isLoopback } from './auth.ts'
@@ -36,7 +39,10 @@ import { createStandaloneHost } from './standalone-host.ts'
 import { freeBytes, writeJson } from './atomic.ts'
 import { MonitorStore } from './monitor/store.ts'
 import { AutoTaskStore } from './monitor/tasks.ts'
-import { AutomationEngine, monitorViews } from './monitor/engine.ts'
+import { AutomationEngine, classifyFailure, monitorViews, type EngineStatus } from './monitor/engine.ts'
+import { ReplyIdentityStore } from './monitor/identities.ts'
+import { migrateLegacyReplyIdentities } from './monitor/migrate.ts'
+import { BackupService, type BackupListEntry, type BackupKind } from './backup.ts'
 import type { DebateProductApi } from '../../core/src/product-api.ts'
 
 export interface StartOptions {
@@ -62,6 +68,12 @@ export interface StartOptions {
    * — passes it here instead of mutating the process environment.
    */
   readonly trustedHosts?: readonly string[]
+  /** Send Secure session cookies. Enable only when the browser uses HTTPS. */
+  readonly secureCookies?: boolean
+  /** Test seam: receive shutdown exit codes instead of terminating the process. */
+  readonly exitProcess?: ((code: number) => void) | undefined
+  /** Test seam: delay before a controlled shutdown/restart. */
+  readonly restartDelayMs?: number
 }
 
 export interface RunningServer {
@@ -75,11 +87,33 @@ export interface RunningServer {
   readonly routePaths: readonly string[]
   readonly mounted: boolean
   readonly mountError?: string
+  /** Automation is circuit-broken when legacy identity migration cannot finish. */
+  readonly automationDisabled?: string
   close(): Promise<void>
 }
 
 const AUTO_BACKUP_INTERVAL_MS = 6 * 60 * 60 * 1000
-const KEEP_AUTO_BACKUPS = 7
+
+interface BackupSummary {
+  readonly total: number
+  readonly daily: number
+  readonly weekly: number
+  readonly manual: number
+  readonly latest: { readonly name: string; readonly createdAt: string; readonly kind: string; readonly bytes: number } | null
+  readonly invalid: number
+}
+
+function summarizeBackups(entries: readonly BackupListEntry[]): BackupSummary {
+  const latest = entries.find((entry) => entry.valid)
+  return {
+    total: entries.length,
+    daily: entries.filter((entry) => entry.kind === 'daily').length,
+    weekly: entries.filter((entry) => entry.kind === 'weekly').length,
+    manual: entries.filter((entry) => entry.kind === 'manual').length,
+    latest: latest === undefined ? null : { name: latest.name, createdAt: latest.createdAt, kind: latest.kind, bytes: latest.bytes },
+    invalid: entries.filter((entry) => !entry.valid).length,
+  }
+}
 
 /** Size of one file, or zero when it does not exist (or is not readable). */
 function fileSize(file: string): number {
@@ -129,18 +163,6 @@ function dirSize(dir: string): number {
   return total
 }
 
-function sha256OfFile(file: string): string | undefined {
-  try {
-    return createHash('sha256').update(readFileSync(file)).digest('hex')
-  } catch {
-    return undefined
-  }
-}
-
-function stamp(): string {
-  return new Date().toISOString().replace(/[:.]/g, '-')
-}
-
 export async function startServer(options: StartOptions): Promise<RunningServer> {
   const layout = layoutOf(options.dataDir)
   ensureLayout(layout)
@@ -159,18 +181,61 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
   const credentials = new CredentialStore({ file: layout.credentialsFile, keyFile: layout.credentialsKey, log })
   credentials.load()
 
+  const configuredTrustedHosts = options.trustedHosts ?? trustedHostsFor(options.host)
+  const loopbackNames = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
+  // A loopback *bind* does not prove the browser is local: a reverse proxy accepts
+  // remote users and connects to us from 127.0.0.1. If the operator named any
+  // non-loopback Host, first-run setup must require the one-time token just like a
+  // directly exposed listener.
+  const loopbackOnlySetup =
+    (isLoopback(options.host) || options.host === 'localhost') &&
+    configuredTrustedHosts.every((entry) => loopbackNames.has(entry))
   const auth = new AuthService({
     adminFile: layout.adminFile,
     sessionsFile: layout.sessionsFile,
     log,
     audit,
-    loopbackOnlySetup: isLoopback(options.host) || options.host === 'localhost',
+    loopbackOnlySetup,
   })
   const authLoad = auth.load()
   log.info(authLoad.initialized ? `管理员账号：${auth.username}` : '尚未初始化管理员账号，首次打开将进入初始化页面')
 
-  const queue = new JobQueue({ file: layout.jobsFile, log })
-  registerJobHandlers({ queue, layout, config, credentials, log, version: options.version, audit })
+  const queue = new JobQueue({ file: layout.jobsFile, receiptFile: join(layout.runDir, 'job-receipts.json'), log })
+  let engine: AutomationEngine | undefined
+  let restoreCompleted = false
+  const backupService = new BackupService({
+    layout,
+    version: options.version,
+    log,
+    audit,
+    onRestored: (): void => {
+      restoreCompleted = true
+    },
+  })
+  registerJobHandlers({
+    queue,
+    layout,
+    credentials,
+    log,
+    backups: backupService,
+    stopEngine: async (): Promise<boolean> => {
+      if (engine === undefined) return false
+      try {
+        await engine.stop()
+        if (engine.status().runningTasks > 0) throw new Error('后台任务未能在停机期限内结束，拒绝恢复。')
+        return true
+      } catch (error) {
+        engine.start()
+        throw error
+      }
+    },
+    restartEngine: (): boolean => {
+      if (engine === undefined) return false
+      engine.start()
+      return engine.status().running
+    },
+    restartAfterRestore: (): void => restart('备份恢复完成，需要重新加载台账与监控内存态'),
+  })
   const recovered = queue.start()
   if (recovered.recovered > 0) log.warn(`恢复 ${recovered.recovered} 个中断的任务`)
 
@@ -223,6 +288,18 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     }
   }
 
+  const identities = new ReplyIdentityStore({
+    file: layout.identitiesFile,
+    log,
+    onEvent: (event, detail) => {
+      if (event === 'write_failed') log.error(`全局回复身份写入失败：${String(detail.reason ?? '')}`)
+      else if (event === 'corrupt') audit.write('store.corrupt', { file: String(detail.file ?? '') })
+      else if (event === 'restored') audit.write('store.restored', { file: String(detail.file ?? '') })
+    },
+  })
+  identities.load()
+  if (identities.loadError !== undefined) log.error(identities.loadError)
+
   const autoTasks = new AutoTaskStore({
     file: layout.autoTasksFile,
     log,
@@ -243,8 +320,79 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     audit.write('queue.recovered', { recovered: recovery.recovered, uncertain: recovery.uncertain })
   }
 
+  // Rebuild the global reply fence only when the durable ledger is absent or an
+  // old analyze/generate task still lacks its identity key. A completed upgrade
+  // must not re-read an unrelated, later-corrupted core ledger on every boot.
+  const needsIdentityMigration = !existsSync(layout.identitiesFile)
+    || autoTasks.all().some((task) => (task.kind === 'analyze' || task.kind === 'generate')
+      && !((typeof task.identityKey === 'string' && task.identityKey.trim() !== '')
+        || (task.identityKeys?.some((key) => key.trim() !== '') ?? false)))
+  let identityMigrationError: string | undefined
+  try {
+    if (monitors.loadError !== undefined) throw new Error(monitors.loadError)
+    if (autoTasks.loadError !== undefined) throw new Error(autoTasks.loadError)
+    if (identities.loadError !== undefined) throw new Error(identities.loadError)
+    if (identities.restoredFromBackup) {
+      throw new Error('全局回复身份台账从备份恢复后尚未落盘，拒绝在不稳定的身份边界上启动。')
+    }
+    if (needsIdentityMigration) {
+      const migration = migrateLegacyReplyIdentities({
+        monitorsFile: layout.monitorsFile,
+        tasksFile: layout.autoTasksFile,
+        stateFile: join(layout.dataDir, 'state.json'),
+        identities,
+        tasks: autoTasks,
+        log,
+      })
+      log.info(
+        `回复身份迁移完成：${migration.identities} 条身份（新增 ${migration.identitiesAdded}、候选 ${migration.candidates}、占用 ${migration.claimed}、忽略 ${migration.ignored}），回填 ${migration.tasksBackfilled} 个任务`,
+      )
+      audit.write('store.migrated', {
+        file: 'reply-identities.json',
+        identityWritten: migration.identityWritten,
+        alreadyComplete: migration.alreadyComplete,
+        identities: migration.identities,
+        identitiesAdded: migration.identitiesAdded,
+        candidates: migration.candidates,
+        claimed: migration.claimed,
+        ignored: migration.ignored,
+        tasksBackfilled: migration.tasksBackfilled,
+        errors: migration.errors,
+        warnings: migration.warnings,
+      })
+    }
+  } catch (error) {
+    const detail = (error instanceof Error ? error.message : String(error)).replace(/[。.]$/, '')
+    identityMigrationError = `回复身份迁移失败：${detail}`
+    log.error(`${identityMigrationError}。后台挂机已熔断，修复数据后重启即可恢复。`)
+    audit.write('store.migrate_failed', { file: 'reply-identities.json', reason: identityMigrationError })
+  }
+
   let productApi: DebateProductApi | undefined
-  let engine: AutomationEngine | undefined
+
+  if (identityMigrationError !== undefined) {
+    // Keep the management/settings surface mounted, but make every core write
+    // path fail explicitly instead of silently bypassing the unfinished fence.
+    const connection = (host.ctx as {
+      get?: (name: string) => unknown
+    }).get?.('connection') as { requestRejection(request: { headers: unknown }): 401 | 403 | undefined } | undefined
+    const blocked = (request: IncomingMessage, response: ServerResponse): void => {
+      const rejection = connection?.requestRejection(request)
+      const status = rejection ?? 503
+      response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+      response.end(JSON.stringify({
+        error: rejection === 401
+          ? 'unauthorized: 需要已登录的会话。'
+          : rejection === 403
+            ? 'forbidden: 会话校验未通过。'
+            : `身份迁移未完成，核心操作已禁用：${identityMigrationError}`,
+      }))
+    }
+    for (const path of ['/api/ai-debate/workbench', '/api/ai-debate/action', '/api/ai-debate/approve']) {
+      registry.register({ kind: 'exact', path, handler: blocked })
+    }
+    log.error(`身份迁移未完成，自动化与核心写操作已熔断：${identityMigrationError}`)
+  }
 
   let mounted = true
   let mountError: string | undefined
@@ -253,6 +401,9 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     // narrower than the object it actually reads, so the cast is at the boundary
     // and nowhere else.
     apply(host.ctx as never, config.raw, {
+      // One authoritative tree for every durable artefact. A config `storeDir`
+      // must not be able to fork the core ledger away from the server's backups.
+      storeDir: layout.dataDir,
       onReady: (api) => {
         productApi = api
       },
@@ -326,43 +477,138 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     },
   }
 
-  /**
-   * What is on disk under `backups/`, newest first.
-   *
-   * Read on demand rather than cached: the jobs page's restore control must name a
-   * directory that exists *now*, and a cached list would offer one that was pruned
-   * by the auto-backup rotation an hour ago. A directory without a manifest is
-   * listed with `files: 0` instead of being hidden — it is a fact on disk, and
-   * hiding it would make "restore says the backup does not exist" inexplicable.
-   */
+  /** Read backups on demand so a just-pruned directory is never offered. */
   const backups = {
-    list(): readonly { name: string; createdAt: string; files: number; bytes: number }[] {
-      const out: { name: string; createdAt: string; files: number; bytes: number }[] = []
-      let names: string[]
-      try {
-        names = readdirSync(layout.backupsDir)
-      } catch {
-        return out
-      }
-      for (const name of names) {
-        const dir = join(layout.backupsDir, name)
-        let files = 0
-        let bytes = 0
-        try {
-          if (!statSync(dir).isDirectory()) continue
-          for (const file of readdirSync(dir)) {
-            const info = statSync(join(dir, file))
-            if (!info.isFile()) continue
-            files += 1
-            bytes += info.size
-          }
-        } catch {
-          // A directory being written or removed right now: report it as it stands.
-        }
-        out.push({ name, createdAt: name.startsWith('pre-restore-') ? name.slice(11) : name, files, bytes })
-      }
-      return out.sort((a, b) => b.name.localeCompare(a.name))
+    list: (): readonly BackupListEntry[] => backupService.list(),
+    verify: (name: string) => backupService.verify(name),
+  }
+
+  const loadErrors = (): readonly string[] => [
+    ...(monitors.loadError === undefined ? [] : [monitors.loadError]),
+    ...(autoTasks.loadError === undefined ? [] : [autoTasks.loadError]),
+    ...(monitors.saveError === undefined ? [] : [monitors.saveError]),
+    ...(autoTasks.saveError === undefined ? [] : [autoTasks.saveError]),
+    ...(identities.loadError === undefined ? [] : [identities.loadError]),
+    ...(identities.saveError === undefined ? [] : [identities.saveError]),
+    ...(identityMigrationError === undefined ? [] : [identityMigrationError]),
+  ]
+
+  const fallbackEngineStatus: EngineStatus = {
+    paused: true,
+    running: false,
+    concurrency: 1,
+    perPlatform: 1,
+    monitors: { total: 0, enabled: 0, blocked: 0 },
+    tasks: {},
+    today: { discovered: 0, candidates: 0, failures: 0 },
+    queued: 0,
+    runningTasks: 0,
+    heartbeat: { ticks: 0, intervalMs: 0, healthy: false },
+    queue: {
+      capacity: 0,
+      used: 0,
+      byState: {
+        pending: 0,
+        running: 0,
+        completed: 0,
+        retry_wait: 0,
+        needs_review: 0,
+        blocked: 0,
+        failed: 0,
+        cancelled: 0,
+      },
+      oldestPendingAgeSec: 0,
+      longestRunningSec: 0,
+      stuck: 0,
+      backlog: { level: 'ok' },
     },
+    alerts: [],
+  }
+
+  const automationStatus = (): Record<string, unknown> => {
+    const raw = engine?.status() ?? fallbackEngineStatus
+    const status: EngineStatus = {
+      ...raw,
+      ...(raw.lastError === undefined ? {} : { lastError: redact(raw.lastError) }),
+      ...(raw.degraded === undefined ? {} : { degraded: redact(raw.degraded) }),
+      queue: {
+        ...raw.queue,
+        backlog: {
+          ...raw.queue.backlog,
+          ...(raw.queue.backlog.reason === undefined ? {} : { reason: redact(raw.queue.backlog.reason) }),
+        },
+      },
+      alerts: raw.alerts.map((alert) => ({ ...alert, reason: redact(alert.reason) })),
+    }
+    const recovery = status.recovery ?? { at: startedAt, recovered: 0, uncertain: 0 }
+    return {
+      ...status,
+      ...(identityMigrationError === undefined ? {} : { degraded: identityMigrationError, identityMigrationError }),
+      backups: summarizeBackups(backupService.list()),
+      recovery,
+      recovered: recovery.recovered,
+      uncertain: recovery.uncertain,
+    }
+  }
+
+  /** A secret-free support bundle computed on demand. */
+  const diagnostics = (): Record<string, unknown> => {
+    const queueSnapshot = queue.snapshot()
+    return {
+      version: options.version,
+      startedAt,
+      server: {
+        running: closing === undefined,
+        mounted,
+        restorePendingRestart: restoreCompleted,
+        ...(mountError === undefined ? {} : { mountError: redact(mountError) }),
+        ...(identityMigrationError === undefined ? {} : { automationDisabled: redact(identityMigrationError) }),
+      },
+      queue: {
+        paused: queueSnapshot.paused,
+        persistenceSuspended: queueSnapshot.persistenceSuspended,
+        concurrency: queueSnapshot.concurrency,
+        counts: queueSnapshot.counts,
+        jobs: queueSnapshot.jobs.map((job) => ({
+          id: job.id,
+          type: job.type,
+          state: job.state,
+          attempts: job.attempts,
+          createdAt: job.createdAt,
+          updatedAt: job.updatedAt,
+          ...(job.lastError === undefined ? {} : { lastError: redact(job.lastError) }),
+        })),
+      },
+      storage: {
+        errors: loadErrors().map((message) => redact(message)),
+        stateBytes: fileSize(join(layout.dataDir, 'state.json')),
+        configBytes: config.sizeBytes(),
+        credentialsBytes: credentials.sizeBytes(),
+        queueBytes: queue.sizeBytes(),
+      },
+      automation: automationStatus(),
+      monitors: monitors.list().map((monitor) => ({
+        id: monitor.id,
+        name: monitor.name,
+        platform: monitor.platform,
+        enabled: monitor.enabled,
+        platformState: monitor.platformState,
+        lastSuccessAt: monitor.lastSuccessAt,
+        ...(monitor.lastError === undefined ? {} : { lastError: redact(monitor.lastError) }),
+      })),
+      tasks: autoTasks.list(200).map((task) => ({
+        id: task.id,
+        kind: task.kind,
+        monitorId: task.monitorId,
+        state: task.state,
+        attempts: task.attempts,
+        updatedAt: task.updatedAt,
+        recoveredAt: task.recoveredAt,
+        uncertain: task.modelCall?.uncertain === true,
+        ...(task.lastErrorKind === undefined ? {} : { lastErrorKind: task.lastErrorKind }),
+      })),
+      backups: summarizeBackups(backupService.list()),
+    }
   }
 
   const info = (): Record<string, unknown> => ({
@@ -432,19 +678,19 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     }
   }
 
-  const shutdown = (reason: string): void => {
+  function shutdown(reason: string): void {
     log.info(`收到停止请求：${reason}`)
     audit.write('service.shutdown', { reason })
     setTimeout(() => {
-      void close().finally(() => process.exit(0))
-    }, 250)
+      void close().finally(() => (options.exitProcess ?? process.exit)(0))
+    }, Math.max(0, options.restartDelayMs ?? 250))
   }
-  const restart = (reason: string): void => {
+  function restart(reason: string): void {
     log.info(`收到重启请求：${reason}`)
     audit.write('service.restart', { reason })
     setTimeout(() => {
-      void close().finally(() => process.exit(75))
-    }, 250)
+      void close().finally(() => (options.exitProcess ?? process.exit)(75))
+    }, Math.max(0, options.restartDelayMs ?? 250))
   }
 
   const server = createHttpServer({
@@ -456,30 +702,20 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     version: options.version,
     dataDir: layout.dataDir,
     startedAt,
-    secureCookies: false,
+    secureCookies: options.secureCookies ?? process.env.AI_DEBATE_SECURE_COOKIES === '1',
     host: options.host,
+    trustedHosts: options.trustedHosts ?? trustedHostsFor(options.host),
     port: () => actualPort,
     info,
+    diagnostics,
     controlToken: readControlToken(layout) ?? writeControlToken(layout),
     legacy,
     backups,
     audit,
     automation: {
-      status: (): Record<string, unknown> => (engine?.status() ?? {
-        paused: true,
-        running: false,
-        concurrency: 1,
-        perPlatform: 1,
-        monitors: { total: 0, enabled: 0, blocked: 0 },
-        tasks: {},
-        today: { discovered: 0, candidates: 0, failures: 0 },
-        queued: 0,
-        runningTasks: 0,
-        heartbeat: { ticks: 0, intervalMs: 0, healthy: false },
-        queue: { capacity: 0, used: 0, byState: {}, oldestPendingAgeSec: 0, longestRunningSec: 0, stuck: 0, backlog: { level: 'ok' } },
-        alerts: [],
-      }) as unknown as Record<string, unknown>,
+      status: automationStatus,
       health,
+      identities: () => identities.stats(),
       monitors: () => monitorViews(monitors.list(), autoTasks.all()),
       tasks: (limit: number) => autoTasks.list(limit),
       reviews: () => autoTasks
@@ -515,6 +751,31 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
         return monitors.update(id, patch)
       },
       removeMonitor: (id: string) => monitors.remove(id),
+      platformCheck: async (id: string): Promise<Record<string, unknown>> => {
+        const monitor = monitors.get(id)
+        if (monitor === undefined) return { ok: false, notFound: true, error: '监控目标不存在。' }
+        if (productApi === undefined) return { ok: false, error: '辩论引擎未挂载，无法执行只读平台探测。' }
+        try {
+          const result = await productApi.probe({ url: monitor.url, mode: 'tail' })
+          return {
+            ok: true,
+            platform: result.platform,
+            threadId: result.threadId,
+            title: result.title,
+            complete: result.complete,
+            pagesRead: result.pagesRead,
+            repliesSeen: result.replies.length,
+            scan: result.scan,
+          }
+        } catch (error) {
+          const failure = classifyFailure(error)
+          return {
+            ok: false,
+            platformState: failure.platformState ?? 'adapter_error',
+            error: redact(failure.message),
+          }
+        }
+      },
       checkNow: (id: string) => engine?.checkNow(id) ?? { ok: false, message: '后台引擎未启动。' },
       scanNow: (id: string, mode: 'compensate' | 'full') =>
         engine?.scanNow(id, mode) ?? { ok: false, message: '后台引擎未启动。' },
@@ -533,12 +794,7 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
         if (reaped.length > 0) audit.write('queue.reaped', { count: reaped.length })
         return { ok: true, reaped: reaped.length }
       },
-      loadErrors: () => [
-        ...(monitors.loadError === undefined ? [] : [monitors.loadError]),
-        ...(autoTasks.loadError === undefined ? [] : [autoTasks.loadError]),
-        ...(monitors.saveError === undefined ? [] : [monitors.saveError]),
-        ...(autoTasks.saveError === undefined ? [] : [autoTasks.saveError]),
-      ],
+      loadErrors,
     },
     actions: {
       shutdown,
@@ -579,23 +835,24 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
 
   log.info(`监听 http://${options.host}:${actualPort}/`)
 
-  engine = new AutomationEngine({
-    monitors,
-    tasks: autoTasks,
-    api: () => productApi,
-    log,
-    ...(options.monitorConcurrency === undefined ? {} : { concurrency: options.monitorConcurrency }),
-    ...(options.monitorTickMs === undefined ? {} : { tickMs: options.monitorTickMs }),
-    ...(process.env.AI_DEBATE_TASK_TIMEOUT_MS === undefined
-      ? {}
-      : { taskTimeoutMs: Number(process.env.AI_DEBATE_TASK_TIMEOUT_MS) }),
-    ...(process.env.AI_DEBATE_COMPENSATION_MS === undefined
-      ? {}
-      : { compensationEveryMs: Number(process.env.AI_DEBATE_COMPENSATION_MS) }),
-  })
-  if (mounted) {
+  if (mounted && identityMigrationError === undefined) {
+    engine = new AutomationEngine({
+      monitors,
+      tasks: autoTasks,
+      identities,
+      api: () => productApi,
+      log,
+      ...(options.monitorConcurrency === undefined ? {} : { concurrency: options.monitorConcurrency }),
+      ...(options.monitorTickMs === undefined ? {} : { tickMs: options.monitorTickMs }),
+      ...(process.env.AI_DEBATE_TASK_TIMEOUT_MS === undefined
+        ? {}
+        : { taskTimeoutMs: Number(process.env.AI_DEBATE_TASK_TIMEOUT_MS) }),
+      ...(process.env.AI_DEBATE_COMPENSATION_MS === undefined
+        ? {}
+        : { compensationEveryMs: Number(process.env.AI_DEBATE_COMPENSATION_MS) }),
+    })
     engine.start()
-  } else {
+  } else if (!mounted) {
     log.warn('辩论引擎未挂载，后台挂机不启动（监控配置保留，修复后重启即可继续）')
   }
 
@@ -659,6 +916,7 @@ export async function startServer(options: StartOptions): Promise<RunningServer>
     routePaths: registry.paths(),
     mounted,
     ...(mountError === undefined ? {} : { mountError }),
+    ...(identityMigrationError === undefined ? {} : { automationDisabled: identityMigrationError }),
     close,
   }
 
@@ -754,106 +1012,62 @@ export function setAutostart(enable: boolean): { ok: boolean; message: string } 
 interface JobDeps {
   readonly queue: JobQueue
   readonly layout: Layout
-  readonly config: ConfigStore
   readonly credentials: CredentialStore
   readonly log: Logger
-  readonly version: string
-  readonly audit: ReturnType<typeof createAuditor>
+  readonly backups: BackupService
+  readonly stopEngine: () => Promise<boolean>
+  readonly restartEngine: () => boolean
+  readonly restartAfterRestore: () => void
 }
 
 function registerJobHandlers(deps: JobDeps): void {
-  const { queue, layout, config, credentials, log, version, audit } = deps
+  const { queue, layout, credentials, log, backups, stopEngine, restartEngine, restartAfterRestore } = deps
 
-  queue.register('backup.create', async ({ payload, note }) => {
-    // A scheduled backup and an owner-requested one are the same file, but only the
-    // scheduled ones are subject to rotation. Without this distinction the auto
-    // backup taken at 03:00 would delete the copy the owner took before restoring a
-    // bad config — the one backup in the set they actually need.
-    const auto = payload.auto === true
-    const dir = join(layout.backupsDir, stamp())
-    mkdirSync(dir, { recursive: true })
-    const files = ['config.json', 'state.json', 'jobs.json']
-    const entries: Record<string, { sha256: string; bytes: number }> = {}
-    for (const name of files) {
-      const source = join(layout.dataDir, name)
-      if (!existsSync(source)) continue
-      const target = join(dir, name)
-      copyFileSync(source, target)
-      entries[name] = { sha256: sha256OfFile(target) ?? '', bytes: statSync(target).size }
-    }
-    writeFileSync(
-      join(dir, 'manifest.json'),
-      `${JSON.stringify(
-        { version, createdAt: new Date().toISOString(), auto, files: entries, note: '不含凭据、口令与会话' },
-        null,
-        2,
-      )}\n`,
-      'utf8',
-    )
-    note('info', `备份完成：${dir}（${Object.keys(entries).length} 个文件${auto ? '，自动备份' : ''}）`)
-    audit.write('backup.created', { dir, files: Object.keys(entries).length, auto })
-    if (auto) pruneAutoBackups()
+  queue.register('backup.create', async ({ payload, note, signal }) => {
+    const requested = payload.kind
+    const kind: BackupKind = payload.auto === true
+      ? 'daily'
+      : requested === 'manual' || requested === 'daily' || requested === 'weekly'
+        ? requested
+        : 'manual'
+    const name = backups.create(kind, { signal })
+    note('info', `备份完成：${name}（${kind}）`)
+    if (kind !== 'manual') backups.prune()
   })
 
-  /** Keep the newest N *scheduled* backups; manual ones are never deleted. */
-  function pruneAutoBackups(): void {
+  queue.register('backup.restore', async ({ jobId, payload, note, signal }) => {
+    const name = typeof payload.name === 'string' ? payload.name : ''
+    let persistenceSuspended = false
+    let engineStopped = false
+    let queuePaused = false
     try {
-      const auto: string[] = []
-      for (const name of readdirSync(layout.backupsDir)) {
-        if (!/^\d{4}-\d{2}-\d{2}T/.test(name)) continue
-        try {
-          const manifest = JSON.parse(readFileSync(join(layout.backupsDir, name, 'manifest.json'), 'utf8')) as {
-            auto?: unknown
-          }
-          if (manifest.auto === true) auto.push(name)
-        } catch {
-          // A directory without a readable manifest cannot be proven automatic, so
-          // it is left alone: deleting the wrong backup is unrecoverable.
-        }
+      engineStopped = await stopEngine()
+      queue.pauseQueue({ persist: false })
+      queuePaused = true
+      queue.suspendPersistence()
+      persistenceSuspended = true
+      const result = backups.restore(name, { confirmed: payload.confirmed === true, signal })
+      if (result.skipped.includes('credentials.json')) {
+        note('warn', '凭据密文未恢复，请重新填写。')
       }
-      auto.sort()
-      for (const name of auto.slice(0, Math.max(0, auto.length - KEEP_AUTO_BACKUPS))) {
-        rmSync(join(layout.backupsDir, name), { recursive: true, force: true })
-        log.info(`自动备份超过 ${KEEP_AUTO_BACKUPS} 份，已删除最旧的一份：${name}`)
+      note('info', `已从 ${result.name} 恢复；恢复前数据保存在 ${result.preRestore}。服务将重启。`)
+      if (!queue.recordSucceededReceipt(jobId, '备份恢复成功，服务将重启')) {
+        log.error('备份恢复成功，但任务凭证写入失败；仍将重启以保证恢复结果生效。')
       }
-    } catch {
-      // Pruning is housekeeping; failing it only means the disk keeps more copies.
+      restartAfterRestore()
+    } catch (error) {
+      if (persistenceSuspended) queue.resumePersistence()
+      if (queuePaused) queue.resumeQueue({ persist: false })
+      const engineRunning = engineStopped ? restartEngine() : true
+      const engineState = engineStopped
+        ? engineRunning ? '后台引擎已重新启动' : '后台引擎重启失败'
+        : '后台引擎仍在运行'
+      const detail = `恢复失败：${error instanceof Error ? error.message : String(error)}。${engineState}，队列已恢复运行；请检查后重试。`
+      note('error', detail)
+      queue.recordFailedReceipt(jobId, detail)
+      log.error(`备份恢复失败，${engineState}：${detail}`)
+      throw new Error(detail, { cause: error })
     }
-  }
-
-  queue.register('backup.restore', async ({ payload, note }) => {
-    const name = typeof payload.dir === 'string' ? payload.dir : ''
-    if (!/^\d{4}-\d{2}-\d{2}T[\w-]+$/.test(name)) throw new Error('备份目录名不合法。')
-    const dir = join(layout.backupsDir, name)
-    const manifestPath = join(dir, 'manifest.json')
-    if (!existsSync(manifestPath)) throw new Error('这个备份缺少 manifest.json，拒绝恢复。')
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { files?: Record<string, { sha256?: string }> }
-    for (const [file, expected] of Object.entries(manifest.files ?? {})) {
-      const actual = sha256OfFile(join(dir, file))
-      if (actual === undefined) throw new Error(`备份缺少文件 ${file}。`)
-      if (typeof expected.sha256 === 'string' && expected.sha256 !== '' && actual !== expected.sha256) {
-        throw new Error(`备份文件 ${file} 校验失败（可能已损坏）。`)
-      }
-    }
-    // Keep the current state aside before overwriting it. A restore that cannot be
-    // undone is how a bad backup destroys the good data.
-    const pre = join(layout.backupsDir, `pre-restore-${stamp()}`)
-    mkdirSync(pre, { recursive: true })
-    for (const name of ['config.json', 'state.json', 'jobs.json']) {
-      const source = join(layout.dataDir, name)
-      if (existsSync(source)) copyFileSync(source, join(pre, name))
-    }
-    for (const name of ['config.json', 'state.json', 'jobs.json']) {
-      const source = join(dir, name)
-      if (existsSync(source)) copyFileSync(source, join(layout.dataDir, name))
-    }
-    if (existsSync(join(dir, 'config.json'))) {
-      const restored = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')) as Record<string, unknown>
-      config.replaceAll(restored)
-    }
-    note('info', `已从 ${name} 恢复；恢复前的数据保存在 ${pre}`)
-    audit.write('backup.restored', { dir: name, preRestore: pre })
-    log.warn('备份已恢复，请重启服务以重新加载台账。')
   })
 
   queue.register('logs.rotate', async ({ note }) => {

@@ -377,6 +377,8 @@ export interface NestedPage {
    * reports the floor as partially read rather than silently complete.
    */
   readonly incomplete?: boolean
+  /** Navigation state, when the platform exposes a reliable next-page signal. */
+  readonly pagingState?: 'done' | 'more' | 'unknown' | 'partial' | 'failed'
 }
 
 /** Login/auth state of the bound account. */
@@ -460,6 +462,8 @@ export type PlatformErrorCode =
   | 'network'
   | 'timeout'
   | 'dns'
+  /** The deployment's egress policy refused the destination before connecting. */
+  | 'egress_blocked'
   | 'rate_limited'
   | 'forbidden'
   | 'captcha'

@@ -1,13 +1,14 @@
 # v0.2.2 覆盖升级说明与验收记录
 
-本文记录 **正式 v0.2.1 Windows Release 附件 → 当前 v0.2.2 构建** 的覆盖升级验收方法、预期迁移、回滚步骤和实际证据。它不替代发布签字；真实附件、当前构建和未覆盖项必须分别阅读。
+本文记录 **正式 v0.2.1 Windows Release 附件 → v0.2.2 构建** 的覆盖升级验收方法、预期迁移、回滚步骤和实际证据。它不替代发布签字；真实附件、当前构建和未覆盖项必须分别阅读。最终候选已冻结并通过架构复审，连续 24h Soak 正在运行；最终 EXE 改由 CI 打包并复验，当前为 **NO-GO**。计数器修复后的最终源码 bundle 已通过真实 v0.2.1 + v0.2.0 fixture 的 **97/97** 升级验收。
 
 ## 1. 当前状态
 
 - 验收脚本：`test/acceptance/upgrade.ts`
 - 主场景：v0.2.1 真实 EXE 通过 HTTP 写出的数据目录，由当前 v0.2.2 构建原地打开。
 - 兼容场景：v0.2.0 旧结构回归仍保留；本次未提供 v0.2.0 EXE，因此该场景是 fixture，不宣称真实旧版二进制验证。
-- 全局身份自动迁移：**当前产品尚未实现**。脚本明确输出 `identityMigration: "strategy-only"`，不把“旧监控游标和候选仍在”冒充成“全局身份台账已迁移”。详见 §5。
+- 全局身份自动迁移：`packages/server/src/monitor/migrate.ts` 已在 `app.ts` 接到后台引擎启动前；迁移测试 20/20、身份测试 13/13、启动集成 5/5，合计 **38/38**；真实 v0.2.1 升级 **97/97 通过，`identityMigration: "migrated"`，`modelCalls=0`**。详见 §5.3。
+- 既有 Windows EXE 均完成于最终修复之前或本地重建被安全守卫阻断，已解除最终资产资格。最终 EXE 由 CI Windows job 打包，再用真实 v0.2.1 附件复验；CI `upgrade-real` 尚未运行，Linux TGZ 尚未构建。
 
 ## 2. 前置条件
 
@@ -98,7 +99,7 @@ v0.2.0 fixture 使用 `monitors.json version=1`，不包含 v0.2.1 新增的 cur
 - 恢复前自动生成 `pre-restore-*` 快照；脚本检查该快照覆盖当时全部现有白名单文件，且自身校验通过
 - 同机管理员与凭据密钥不进入备份，也不被恢复操作删除
 
-### 5.3 全局回复身份迁移策略与当前缺口
+### 5.3 全局回复身份迁移实现与接线状态
 
 v0.2.1 没有 `reply-identities.json`。v0.2.2 引入全局身份栅栏，键形如：
 
@@ -106,17 +107,16 @@ v0.2.1 没有 `reply-identities.json`。v0.2.2 引入全局身份栅栏，键形
 stable:<platform>:<threadId>:<postId>
 ```
 
-正确的迁移策略应是：
+`monitor/migrate.ts` 按以下规则重建：
 
-1. 从 `monitors.json` 的 `seen` 与 `cursor.fingerprints` 收集平台、帖子、回复 ID 和指纹。
-2. 对 `state.json` 中已有候选的回复建立 `state: "candidate"`，带上 `sessionId/candidateId`。
-3. 对已结束但没有候选的生成任务建立明确的终态身份；只有 seen、没有候选或任务证据的行标记 `ignored`，原因写 `legacy-seen`，不能留成会被 orphan 恢复重放的 `claimed`。
-4. 同一稳定键合并而不是重复插入；迁移必须幂等，二次启动不得再改。
-5. v0.2.0 没有稳定指纹时，不把内容哈希伪装成稳定 fallback 身份；继续保留 monitor 级 seen 作为局部栅栏。
+1. 从 `monitors.json` 的 `seen` 与 `cursor.fingerprints` 收集平台、帖子、回复 ID 和指纹；同一 platform+thread 的重复监控合并为同一稳定键。
+2. `state.json` 中已有候选的回复建立 `state: "candidate"`，带上 `sessionId/candidateId`，优先级最高。
+3. `pending/running/retry_wait/blocked` 任务对应 `claimed`，并回填 `identityKey/identityKeys`；已终态但无候选的任务标 `ignored`。
+4. 只有 seen、没有候选或任务证据的回复标 `ignored(legacy-seen)`，不会留成会被 orphan 恢复重放的 `claimed`。
+5. 指纹优先用 cursor；缺失时使用 `legacy-<sha256>` 确定性非空值。找不到监控的核心会话使用 `legacy:<platform>:<threadId>` 作为来源标记。
+6. 身份台账先原子写入，再一次性回填任务；任务写失败抛错。二次启动只补任务、不覆盖身份台账。`state.json` 损坏、监控/会话上下文冲突、非法候选、未知任务 kind 或多个已批准候选冲突时必须熔断，不得写出不完整身份或回填任务，也不得写迁移完成标记。持久完成标记让同源重启无写入；源变化只做安全增量；完成标记写失败时下一次只补标记。
 
-**当前实现状态：上述自动迁移尚不存在。** `app.ts` 只调用 `ReplyIdentityStore.load()`，文件不存在时不会从旧监控/任务/核心台账生成身份。本次真实升级因此没有生成 `reply-identities.json`。
-
-现状仍能避免本次验收中的重复生成，因为旧 monitor 的 seen 保留、任务终态保留、核心生成器也会复用会话内已有候选；但删除后重建监控、或未来跨监控复用同一帖子时，缺少全局 candidate 身份仍有重复风险。发布前应由产品负责人决定：补齐自动迁移，或明确接受该限制并记录为已知问题。
+**接线状态：已完成。** `app.ts` 在监控引擎启动前调用迁移函数；身份文件不存在时原子创建，已存在时不覆盖，旧任务缺 key 时幂等回填。`state.json` 损坏、上下文/候选冲突、未知任务 kind 时迁移熔断，不写半成品或完成标记；身份或监控源台账不可读时，服务与 `/healthz` 保持可用，但自动化与核心/手工分析接口熔断并报告 `identityMigrationError`。身份台账严格校验 `candidateId`，engine 回到核心会话核验。真实 v0.2.1 升级验收为 **97/97，`migrated`，`modelCalls=0`**；startup-migration 另验证二次启动身份与任务文件哈希不变。
 
 ## 6. 回滚
 
@@ -140,27 +140,31 @@ Copy-Item -Recurse -Force "$env:LOCALAPPDATA\ai-debate" "$env:LOCALAPPDATA\ai-de
 
 ## 7. 本次实际执行证据
 
-执行时间：2026-11-20 22:45（UTC+8，Windows 构建机）。
+历史首次执行：2026-11-20 22:45（UTC+8，Windows 构建机），接线前 92/92；严格迁移完成后于 UTC 2026-11-21 复跑，B1–B4 修复候选回归为 **97/97 通过，`identityMigration: "migrated"`，`modelCalls=0`**。
 
 | 项目 | 实际结果 |
 |---|---|
 | `npm run typecheck` | 通过，0 错误 |
-| `npm run test:upgrade` | **92/92 通过** |
+| `npm run test:upgrade` | **97/97 通过** |
 | 旧附件 | 正式 v0.2.1 Windows EXE |
 | 旧附件 SHA256 | `cb3b14f0dc52ff5d579e64df5e0e21eff051c62291dcde162d48cda9a16cedcf` |
 | 旧附件版本输出 | `AI Debate 0.2.1 (win32-x64)` |
+| 官方 v0.2.1 Linux TGZ SHA256 | `2b658c70dbcacca3ccb74a5e794b4603132017d8d3d96655815f4f204a5d5f61`（CI 配置校验，尚未本机运行） |
 | 当前源码包版本 | `0.2.2` |
-| 当前 `dist/ai-debate.cjs` SHA256 | `dcc25bf9e5b1777638617611ff55abeeb37d4578655c72f148beaa0bbef1b607` |
+| 最终源码 bundle | 已重建；真实 v0.2.1 + v0.2.0 fixture 升级 97/97 通过 |
+| 历史 Windows EXE（非最终） | `AI Debate 0.2.2 (win32-x64)`；89,966,592 字节；SHA256 `adfb51128437b159ab05fd3be7377b09438887bbbfc9eaf268d21ded98f8fea2` |
+| 最终 Windows EXE | 由 CI 打包并回填 SHA256/大小/版本；本地重建被批量删除安全守卫阻断，未绕过 |
 | 真实旧版 HTTP 写入 | setup=200、settings=200、两条 secrets=200、monitor=200 |
 | 模型陷阱调用数 | 0（恢复旧任务复用已有候选） |
 | v0.2.1 场景核心台账哈希 | `0c7952b50c76dd0870c8142edf1165abf7ace5dd3a94a97032783c1da67c0382` |
 | v0.2.1 凭据密文哈希 | `8ea2abe162aaeca946bacbd1add94e98807fce709c7c798506e2857230d8ea86` |
-| 全局身份迁移 | `strategy-only`，未生成 `reply-identities.json` |
+| 全局身份迁移 | **`migrated`**；迁移 20/20、身份 13/13、启动集成 5/5，合计 38/38；真实升级 97/97 |
 | v0.2.0 兼容场景 | fixture 通过；未提供真实 v0.2.0 EXE |
+| CI `upgrade-real` | 已配置下载并校验真实 v0.2.1/v0.2.0 Linux TGZ；尚未运行 |
 
 证据边界：
 
 - 真实 v0.2.1 附件、管理员、配置、监控和加密凭据由旧 EXE 写出；核心台账、任务行、确定性游标和旧备份 manifest 是离线植入，不能算作旧版自然运行产生。
-- 当前侧验证的是源码构建的 `dist/ai-debate.cjs`，不是尚未产出的 v0.2.2 正式 EXE。
+- 97/97 升级验收使用计数器修复后的最终源码 bundle；旧 EXE 的 standalone 27/27 不能替代最终 EXE 验收。最终 EXE 与升级复验由 CI 完成后回填；CI `upgrade-real` 尚未运行。
 - 没有访问真实贴吧，也没有调用真实模型；验证的是升级读写与去重，不是平台连通性或模型质量。
 - 备份 `list/verify` 通过 HTTP 验证；`restore` 在脚本中直接调用真实 `BackupService`，并检查预备快照与恢复结果。

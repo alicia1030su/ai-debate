@@ -463,6 +463,14 @@ export function platformSettingsOf(
       ...(typeof config.authProbeThreadId === 'string' && config.authProbeThreadId.trim() !== ''
         ? { authProbeThreadId: config.authProbeThreadId.trim() }
         : {}),
+      ...(typeof config.authProbeFallbacks === 'string' && config.authProbeFallbacks.trim() !== ''
+        ? {
+            authProbeFallbacks: config.authProbeFallbacks
+              .split(',')
+              .map((entry) => entry.trim())
+              .filter((entry) => /^\d+$/.test(entry)),
+          }
+        : {}),
     }
   }
 
@@ -1117,6 +1125,12 @@ export async function runGeneration(
   const config = runtime.config()
   const progress = input.progress ?? (() => undefined)
   await runtime.store.ready()
+  if (runtime.store.hasUnsavedChanges) {
+    throw new Error(
+      `状态存在尚未确认落盘的改动，本次生成未开始：${runtime.store.unsavedReason ?? '内存与磁盘不一致'}。` +
+        '为避免把未保存的会话或候选当成持久事实，请先恢复状态存储。',
+    )
+  }
   const session = runtime.store.getSession(input.sessionId)
   if (!session) throw new Error(`找不到会话 ${input.sessionId}`)
 
@@ -1652,7 +1666,10 @@ export async function runGeneration(
             }
           : entry,
       ),
-    }))
+    })).catch((error: unknown) => {
+      guard.finish(session.id, claim)
+      throw error
+    })
     throw new Error(`模型输出不符合约定，没有生成候选：${reasons}`)
   }
 
@@ -1948,11 +1965,38 @@ export async function runGeneration(
         },
       ],
     }
+  }).catch((error: unknown) => {
+    // A rejected persist must release the in-memory generation claim as well as
+    // the store lock. Otherwise a later successful write could inherit a stale
+    // claim and refuse every result for this session.
+    guard.finish(session.id, claim)
+    throw error
   })
 
-  // A candidate is always written on this path — the only early exits above throw — so
-  // `stored` is populated. Reading it back is what makes the returned id and version
-  // describe the document rather than this function's intention.
+  // `mutate` resolving is the persistence boundary, but read the candidate back
+  // from disk before reporting its id. This keeps the return contract explicit:
+  // callers may advance identity/review ledgers only for a candidate that a fresh
+  // reader can confirm, never for the attempted document retained in memory after
+  // a failed write.
+  if (stored !== undefined) {
+    try {
+      const persisted = await runtime.store.readPersistedSession(session.id)
+      const durable = persisted?.candidates.find((candidate) => candidate.replyId === stored?.replyId)
+      if (durable === undefined) {
+        throw new Error(
+          `候选 ${stored.replyId} 写入后未能从磁盘确认，本次生成结果不确定；` +
+            '服务器不得据此推进候选身份或待审核状态。',
+        )
+      }
+      stored = durable
+    } finally {
+      guard.finish(session.id, claim)
+    }
+  }
+
+  // A candidate is written on the valid/invalid-draft paths. Reading it back is
+  // what makes the returned id and version describe the durable document rather
+  // than this function's intention.
   //
   // v0.2.35: the one case where it can be empty is a stale write, which is a *refusal*
   // rather than an internal error — the two need different messages, so they are separate
@@ -1992,7 +2036,6 @@ export async function runGeneration(
     }
     throw new Error('内部错误：候选回复未写入会话，无法确认候选 id 与版本号。')
   }
-  guard.finish(session.id, claim)
 
   return {
     sessionId: session.id,

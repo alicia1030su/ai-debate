@@ -54,6 +54,9 @@ jobs:
       - name: Web tests
         shell: bash
         run: node --test packages/web/test/*.test.mjs
+      - name: Secret scanner regression tests
+        shell: bash
+        run: npm run test:secrets
       - name: End-to-end acceptance
         shell: bash
         run: node --experimental-transform-types test/acceptance/standalone.ts
@@ -66,18 +69,18 @@ jobs:
       - name: Paging and cursor acceptance
         shell: bash
         run: node --experimental-transform-types test/acceptance/paging.ts
-      - name: Upgrade from a v0.2.0 data directory
+      - name: Upgrade fixtures (v0.2.1 shape and v0.2.0 compatibility)
         shell: bash
         run: node --experimental-transform-types test/acceptance/upgrade.ts
       - name: No DSH dependency
         shell: bash
         run: node scripts/assert-no-dsh.mjs
 
-  # Downloading the previous release is the only way to prove the upgrade path with
-  # bytes yesterday's build actually wrote. The `test` job's upgrade run uses a
-  # byte-faithful fixture; this one uses the real binary.
+  # The fixture job proves deterministic edge cases; this job proves the actual
+  # bytes shipped in both releases. v0.2.1 is the primary upgrade target and
+  # v0.2.0 remains a real-binary compatibility regression in the same script.
   upgrade-real:
-    name: Upgrade from the real v0.2.0 binary
+    name: Upgrade from real v0.2.1 (v0.2.0 compatibility)
     runs-on: ubuntu-22.04
     needs: test
     steps:
@@ -88,21 +91,47 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build && npm run bundle
-      - name: Download v0.2.0
+      - name: Download and verify v0.2.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download v0.2.1 --repo "${{ github.repository }}" \
+            --pattern 'ai-debate-linux-x64.tgz' --pattern 'SHA256SUMS.txt' \
+            --dir /tmp/v021 --clobber
+          (cd /tmp/v021 && grep -E '  ai-debate-linux-x64\.tgz$' SHA256SUMS.txt | sha256sum -c -)
+          mkdir -p /tmp/v021/pkg
+          tar -xzf /tmp/v021/ai-debate-linux-x64.tgz -C /tmp/v021/pkg
+          V021_BIN=$(find /tmp/v021/pkg -path '*/bin/ai-debate' -type f -print -quit)
+          test -n "$V021_BIN"
+          chmod +x "$V021_BIN"
+          "$V021_BIN" --version
+          sha256sum /tmp/v021/ai-debate-linux-x64.tgz "$V021_BIN"
+          echo "V021_BIN=$V021_BIN" >> "$GITHUB_ENV"
+      - name: Download and verify v0.2.0 compatibility binary
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh release download v0.2.0 --repo "${{ github.repository }}" \
-            --pattern 'ai-debate-linux-x64.tgz' --dir /tmp/v020 --clobber
+            --pattern 'ai-debate-linux-x64.tgz' --pattern 'SHA256SUMS.txt' \
+            --dir /tmp/v020 --clobber
+          (cd /tmp/v020 && grep -E '  ai-debate-linux-x64\.tgz$' SHA256SUMS.txt | sha256sum -c -)
           mkdir -p /tmp/v020/pkg
           tar -xzf /tmp/v020/ai-debate-linux-x64.tgz -C /tmp/v020/pkg
-          find /tmp/v020/pkg -name ai-debate -type f -exec chmod +x {} \;
-          echo "V020_BIN=$(find /tmp/v020/pkg -name ai-debate -type f | head -1)" >> "$GITHUB_ENV"
-      - name: Run the upgrade against the 0.2.0 binary
+          V020_BIN=$(find /tmp/v020/pkg -path '*/bin/ai-debate' -type f -print -quit)
+          test -n "$V020_BIN"
+          chmod +x "$V020_BIN"
+          "$V020_BIN" --version
+          sha256sum /tmp/v020/ai-debate-linux-x64.tgz "$V020_BIN"
+          echo "V020_BIN=$V020_BIN" >> "$GITHUB_ENV"
+      - name: Run the upgrade against both real binaries
         run: |
           set -euo pipefail
-          AI_DEBATE_V020_BIN="$V020_BIN" node --experimental-transform-types test/acceptance/upgrade.ts
+          echo "Primary upgrade source: real v0.2.1 binary $V021_BIN"
+          echo "Compatibility source: real v0.2.0 binary $V020_BIN"
+          AI_DEBATE_V021_BIN="$V021_BIN" AI_DEBATE_V020_BIN="$V020_BIN" \
+            node --experimental-transform-types test/acceptance/upgrade.ts
       - name: Upload the upgrade report on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -137,6 +166,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run package:windows
+      - name: Capture the Node runtime used by the SEA build
+        run: node -e "require('node:fs').copyFileSync(process.execPath, 'dist/node-baseline.bin')"
+      - name: Verify the release artefact and documents
+        run: node scripts/verify-release.mjs
+      - name: Scan the executable for embedded credentials
+        run: node scripts/scan-secrets.mjs --baseline dist/node-baseline.bin dist/AI-Debate-windows-x64.exe
       - name: Launch the packaged executable
         shell: pwsh
         run: |
@@ -180,6 +215,27 @@ jobs:
       - name: Check Linux deployment path policy without root
         run: bash test/acceptance/linux-path-policy.sh
       - run: npm run package:linux
+      - name: Capture the Node runtime used by the SEA build
+        run: node -e "require('node:fs').copyFileSync(process.execPath, 'dist/node-baseline.bin')"
+      - name: Verify the release artefact and documents
+        run: node scripts/verify-release.mjs
+      - name: Verify and scan the packaged Linux archive
+        run: |
+          set -euo pipefail
+          unpack=$(mktemp -d)
+          trap 'rm -rf "$unpack"' EXIT
+          tar -xzf dist/ai-debate-linux-x64.tgz -C "$unpack"
+          binary="$unpack/ai-debate-linux-x64/bin/ai-debate"
+          test -x "$binary"
+          expected_version=$(node -p "require('./package.json').version")
+          version_output=$(env -u AI_DEBATE_VERSION "$binary" --version 2>&1)
+          printf 'packaged --version: %s\n' "$version_output"
+          if ! grep -Eq "(^|[^0-9])${expected_version//./\\.}([^0-9]|$)" <<< "$version_output"; then
+            echo "::error::Linux TGZ 的 bin/ai-debate 未报告 $expected_version"
+            exit 1
+          fi
+          node scripts/scan-secrets.mjs "$unpack"
+          node scripts/scan-secrets.mjs --baseline dist/node-baseline.bin "$binary"
       - name: Check the systemd unit rendering and restart policy
         run: |
           set -euo pipefail

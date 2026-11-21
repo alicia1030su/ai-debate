@@ -15,7 +15,7 @@
  * except `backup.restore`, which is not safe to repeat blindly and is instead
  * marked `failed` with a reason the operator can act on.
  */
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { writeJson } from './atomic.ts'
 import { randomUUID } from 'node:crypto'
 
@@ -59,11 +59,62 @@ interface JobDocument {
   jobs: Job[]
 }
 
+interface ReceiptDocument {
+  version: 1
+  receipts: Job[]
+}
+
+const JOB_TYPES: ReadonlySet<string> = new Set<JobType>([
+  'backup.create',
+  'backup.restore',
+  'logs.rotate',
+  'credentials.audit',
+  'storage.check',
+])
+const TERMINAL_RECEIPT_STATES: ReadonlySet<string> = new Set(['succeeded', 'failed', 'cancelled'])
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && value !== '' && Number.isFinite(Date.parse(value))
+}
+
+function isBoundedString(value: unknown, maxChars: number): value is string {
+  return typeof value === 'string' && value.length <= maxChars
+}
+
+function isJobLogLine(value: unknown): value is JobLogLine {
+  return isRecord(value) &&
+    isTimestamp(value.at) &&
+    (value.level === 'info' || value.level === 'warn' || value.level === 'error') &&
+    isBoundedString(value.message, 64 * 1024)
+}
+
+/** Receipts are display-only terminal records and must never be schedulable. */
+function isJobReceipt(value: unknown): value is Job {
+  return isRecord(value) &&
+    isBoundedString(value.id, 200) && value.id !== '' &&
+    typeof value.type === 'string' && JOB_TYPES.has(value.type) &&
+    typeof value.state === 'string' && TERMINAL_RECEIPT_STATES.has(value.state) &&
+    typeof value.attempts === 'number' && Number.isInteger(value.attempts) && value.attempts >= 0 &&
+    typeof value.maxAttempts === 'number' && Number.isInteger(value.maxAttempts) && value.maxAttempts >= 1 &&
+    isRecord(value.payload) &&
+    isTimestamp(value.createdAt) && isTimestamp(value.updatedAt) && isTimestamp(value.nextRunAt) &&
+    (value.key === undefined || isBoundedString(value.key, 500)) &&
+    (value.startedAt === undefined || isTimestamp(value.startedAt)) &&
+    (value.finishedAt === undefined || isTimestamp(value.finishedAt)) &&
+    (value.lastError === undefined || isBoundedString(value.lastError, 256 * 1024)) &&
+    Array.isArray(value.logs) && value.logs.length <= MAX_JOB_LOGS && value.logs.every(isJobLogLine)
+}
+
 export interface JobHandlerContext {
   /** Append a line to this job's own log. */
   note(level: 'info' | 'warn' | 'error', message: string): void
   /** Set when the queue is shutting down or the job was cancelled. */
   readonly signal: AbortSignal
+  readonly jobId: string
   readonly payload: Record<string, unknown>
 }
 
@@ -74,31 +125,40 @@ export interface QueueSnapshot {
   readonly counts: Record<JobState, number>
   readonly jobs: readonly Job[]
   readonly concurrency: number
+  readonly persistenceSuspended: boolean
 }
 
 const MAX_JOBS = 200
 const MAX_JOB_LOGS = 40
+const MAX_RECEIPTS = 50
+/** Bound the whole sidecar before JSON.parse; 5 MiB of junk is not a receipt. */
+const MAX_RECEIPT_BYTES = 2 * 1024 * 1024
 const BASE_BACKOFF_MS = 5_000
 const MAX_BACKOFF_MS = 5 * 60_000
 const JOB_TIMEOUT_MS = 5 * 60_000
 
 export class JobQueue {
   readonly #file: string
+  readonly #receiptFile: string | undefined
   readonly #log: { info(message: string): void; warn(message: string): void; error(message: string): void }
   readonly #handlers = new Map<JobType, JobHandler>()
   readonly #concurrency: number
   #jobs: Job[] = []
+  #receipts: Job[] = []
   #paused = false
   #timer: NodeJS.Timeout | undefined
   #running = new Map<string, AbortController>()
   #stopped = false
+  #persistenceSuspended = false
 
   constructor(options: {
     file: string
+    receiptFile?: string | undefined
     log: { info(message: string): void; warn(message: string): void; error(message: string): void }
     concurrency?: number
   }) {
     this.#file = options.file
+    this.#receiptFile = options.receiptFile
     this.#log = options.log
     // One at a time by default, and never more than four: the engine's own limits
     // (`maxAutoPerSession`, `cooldownSeconds`, one adapter per platform) assume a
@@ -117,6 +177,8 @@ export class JobQueue {
   /** Load, recover interrupted jobs, and start the tick. */
   start(): { recovered: number } {
     this.#load()
+    this.#loadReceipts()
+    this.#mergeReceipts()
     const recovered = this.#recover()
     this.#tick()
     this.#timer = setInterval(() => void this.#tick(), 1000)
@@ -135,6 +197,25 @@ export class JobQueue {
       await new Promise((resolve) => setTimeout(resolve, 50))
     }
     this.#persist()
+  }
+
+  /**
+   * Stop writing this in-memory queue to disk.
+   *
+   * Restore replaces `jobs.json` with the backup's ledger. Letting the finally
+   * block persist the old array afterwards would silently undo that restore.
+   */
+  suspendPersistence(): void { this.#persistenceSuspended = true }
+  resumePersistence(): void { this.#persistenceSuspended = false }
+
+  /** Persist a terminal display record without touching the restored jobs ledger. */
+  recordSucceededReceipt(jobId: string, message: string): boolean {
+    return this.#recordReceipt(jobId, 'succeeded', message)
+  }
+
+  /** Persist a failed restore outcome for post-restart operator visibility. */
+  recordFailedReceipt(jobId: string, message: string): boolean {
+    return this.#recordReceipt(jobId, 'failed', message)
   }
 
   /** Enqueue a job, de-duplicating on `key` while queued or running. */
@@ -182,17 +263,23 @@ export class JobQueue {
   snapshot(): QueueSnapshot {
     const counts: Record<JobState, number> = { queued: 0, running: 0, succeeded: 0, failed: 0, paused: 0, cancelled: 0 }
     for (const job of this.#jobs) counts[job.state] += 1
-    return { paused: this.#paused, counts, jobs: this.#jobs, concurrency: this.#concurrency }
+    return {
+      paused: this.#paused,
+      counts,
+      jobs: this.#jobs,
+      concurrency: this.#concurrency,
+      persistenceSuspended: this.#persistenceSuspended,
+    }
   }
 
-  pauseQueue(): void {
+  pauseQueue(options: { readonly persist?: boolean } = {}): void {
     this.#paused = true
-    this.#persist()
+    if (options.persist !== false) this.#persist()
   }
 
-  resumeQueue(): void {
+  resumeQueue(options: { readonly persist?: boolean } = {}): void {
     this.#paused = false
-    this.#persist()
+    if (options.persist !== false) this.#persist()
   }
 
   pauseJob(id: string): boolean {
@@ -224,6 +311,81 @@ export class JobQueue {
     job.updatedAt = new Date().toISOString()
     this.#persist()
     return true
+  }
+
+  #loadReceipts(): void {
+    const file = this.#receiptFile
+    if (file === undefined || !existsSync(file)) return
+    try {
+      const size = statSync(file).size
+      if (size > MAX_RECEIPT_BYTES) throw new Error(`receipt 文件超过 ${MAX_RECEIPT_BYTES} 字节上限`)
+      const bytes = readFileSync(file)
+      // Re-check after reading to cover a file that grew between stat and read.
+      if (bytes.length > MAX_RECEIPT_BYTES) throw new Error(`receipt 文件超过 ${MAX_RECEIPT_BYTES} 字节上限`)
+      const parsed = JSON.parse(bytes.toString('utf8')) as ReceiptDocument
+      if (parsed.version !== 1 || !Array.isArray(parsed.receipts) || parsed.receipts.some((receipt) => !isJobReceipt(receipt))) {
+        throw new Error('receipt 文档结构不正确')
+      }
+      this.#receipts = parsed.receipts.slice(0, MAX_RECEIPTS)
+    } catch (error) {
+      this.#receipts = []
+      // JSON.parse errors can quote a slice of the corrupt document. Receipts may
+      // contain operator-visible failure text, so never echo that slice to logs.
+      const reason = error instanceof SyntaxError ? 'JSON 语法错误' : (error as Error).message
+      this.#log.error(`任务凭证文件无法解析，已保留现场：${reason}`)
+      try {
+        const preserved = `${file}.corrupt-${Date.now()}`
+        copyFileSync(file, preserved)
+        chmodSync(preserved, 0o600)
+      } catch {
+        // Best effort: the original file remains untouched for manual inspection.
+      }
+    }
+  }
+
+  /** Terminal receipts override same-id jobs and are never eligible for #tick. */
+  #mergeReceipts(): void {
+    for (const receipt of this.#receipts) {
+      const index = this.#jobs.findIndex((job) => job.id === receipt.id)
+      if (index >= 0) this.#jobs[index] = receipt
+      else this.#jobs.unshift(receipt)
+    }
+    this.#trim()
+  }
+
+  #recordReceipt(jobId: string, state: 'succeeded' | 'failed', message: string): boolean {
+    if (this.#receiptFile === undefined) return false
+    const job = this.#jobs.find((item) => item.id === jobId)
+    if (job === undefined) {
+      this.#log.warn(`无法记录任务凭证：找不到 ${jobId}`)
+      return false
+    }
+    const now = new Date().toISOString()
+    const receipt: Job = {
+      ...job,
+      state,
+      finishedAt: now,
+      updatedAt: now,
+      lastError: state === 'failed' ? message : undefined,
+      logs: [...job.logs, { at: now, level: (state === 'failed' ? 'error' : 'info') as JobLogLine['level'], message }].slice(-MAX_JOB_LOGS),
+    }
+    const receipts = [receipt, ...this.#receipts.filter((item) => item.id !== jobId)].slice(0, MAX_RECEIPTS)
+    const document: ReceiptDocument = { version: 1, receipts }
+    const serialized = `${JSON.stringify(document, null, 2)}\n`
+    if (!isJobReceipt(receipt) || Buffer.byteLength(serialized, 'utf8') > MAX_RECEIPT_BYTES) {
+      this.#log.error('任务凭证内容超过安全上限，拒绝写入；已恢复的 jobs.json 不受影响。')
+      return false
+    }
+    try {
+      writeJson(this.#receiptFile, document, { mode: 0o600 })
+      this.#receipts = receipts
+      const index = this.#jobs.findIndex((item) => item.id === jobId)
+      if (index >= 0) this.#jobs[index] = receipt
+      return true
+    } catch (error) {
+      this.#log.error(`任务凭证写入失败（不影响已恢复的 jobs.json）：${(error as Error).message}`)
+      return false
+    }
   }
 
   #load(): void {
@@ -302,6 +464,7 @@ export class JobQueue {
     const timeout = setTimeout(() => controller.abort(), JOB_TIMEOUT_MS)
     try {
       await handler({
+        jobId: job.id,
         payload: job.payload,
         signal: controller.signal,
         note: (level, message) => {
@@ -355,6 +518,7 @@ export class JobQueue {
   }
 
   #persist(): void {
+    if (this.#persistenceSuspended) return
     const document: JobDocument = { version: 1, paused: this.#paused, jobs: this.#jobs }
     try {
       writeJson(this.#file, document, { mode: 0o600 })

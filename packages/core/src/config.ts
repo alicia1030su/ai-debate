@@ -120,6 +120,8 @@ export const Config = z.object({
    * "not configured" case the only case. Blank means "not configured".
    */
   authProbeThreadId: z.string().default('').volatile(),
+  /** Comma-separated fallback thread ids used only to read the login banner. */
+  authProbeFallbacks: z.string().default('').volatile(),
 
   // ---- persona -------------------------------------------------------------
   /** Default persona style. */
@@ -304,6 +306,7 @@ export const DEFAULT_CONFIG = {
   llmTemperature: 0.4,
   llmMaxOutputTokens: 0,
   authProbeThreadId: '',
+  authProbeFallbacks: '',
   contextPreset: 'small' as const,
   contextTokens: 0,
   interactionMode: 'manual' as const,
@@ -383,6 +386,7 @@ export function resolveConfig(input: unknown): ResolvedConfig {
     securityEventLimit: readNumber(raw.securityEventLimit, DEFAULT_CONFIG.securityEventLimit),
     tiebaCookie: readString(raw.tiebaCookie, '').trim(),
     authProbeThreadId: readString(raw.authProbeThreadId, '').trim(),
+    authProbeFallbacks: readString(raw.authProbeFallbacks, '').trim(),
     personaStyle: (['tieba_veteran', 'soft_defensive', 'tsundere', 'aloof'] as const).includes(
       style as never,
     )

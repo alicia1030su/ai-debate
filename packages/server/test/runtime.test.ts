@@ -81,6 +81,32 @@ test('凭据加密落盘：文件里没有明文，describe 不透露长度或�
   }
 })
 
+test('缺密钥时 describe/resolve 不创建新 key，也不会解密旧密文', async () => {
+  const dir = tempDir()
+  try {
+    const file = join(dir, 'credentials.json')
+    const keyFile = join(dir, 'credentials.key')
+    const writer = new CredentialStore({ file, keyFile, log: quiet })
+    writer.load()
+    await writer.set('AI_DEBATE_LLM_API_KEY', 'secret-before-key-loss')
+    const ciphertext = readFileSync(file)
+    rmSync(keyFile)
+
+    const warnings: string[] = []
+    const reader = new CredentialStore({ file, keyFile, log: { warn: (message) => warnings.push(message) } })
+    assert.deepEqual(reader.load(), { loaded: false, corrupt: true })
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      assert.equal((await reader.describe('AI_DEBATE_LLM_API_KEY')).configured, false)
+      assert.equal(await reader.resolve('AI_DEBATE_LLM_API_KEY'), undefined)
+      assert.equal(existsSync(keyFile), false, '读取路径不得创建密钥')
+    }
+    assert.deepEqual(readFileSync(file), ciphertext, '读取失败不得改写凭据文件')
+    assert.equal(warnings.some((message) => message.includes('请重新填写')), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('凭据命名空间之外的引用被拒绝', async () => {
   const dir = tempDir()
   try {

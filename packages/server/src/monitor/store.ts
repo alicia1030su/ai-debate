@@ -52,6 +52,17 @@ export interface MonitorCounters {
   readonly todayFailures: number
 }
 
+/** Platform-facing health, deliberately separate from task failure. */
+export type PlatformState =
+  | 'healthy'
+  | 'unauthorized'
+  | 'forbidden'
+  | 'rate_limited'
+  | 'network_error'
+  | 'egress_blocked'
+  | 'adapter_error'
+  | 'paused'
+
 /** How much of the thread the last scan actually looked at. */
 export type ScanCoverage = 'tail' | 'full'
 
@@ -111,6 +122,8 @@ export interface MonitorTarget {
   lastSuccessAt?: string
   lastError?: string
   lastErrorAt?: string
+  /** Current platform read state. Model failures do not change this. */
+  platformState: PlatformState
   /** Set when the platform told us the credentials are gone; clears on resume. */
   blockedReason?: string
   /** Post ids already accepted into the pipeline, newest last. */
@@ -215,6 +228,7 @@ function upgradeMonitor(raw: MonitorTarget & { compensationHours?: number; chang
         : DEFAULT_COMPENSATION_HOURS,
     changes: Array.isArray(raw.changes) ? raw.changes : [],
     seen: Array.isArray(raw.seen) ? raw.seen : [],
+    platformState: raw.platformState ?? (raw.blockedReason ? 'paused' : 'healthy'),
   }
 }
 
@@ -323,6 +337,7 @@ export class MonitorStore {
           ? DEFAULT_COMPENSATION_HOURS
           : Math.max(0, Math.min(MAX_COMPENSATION_HOURS, Math.round(input.compensationHours))),
       changes: [],
+      platformState: 'healthy',
       counters: freshCounters(),
     }
     this.#commit([...this.#monitors, monitor])
@@ -360,13 +375,14 @@ export class MonitorStore {
   }
 
   /** Record the outcome of one scheduled check. */
-  noteCheck(id: string, outcome: { at: string; ok: boolean; error?: string }): void {
+  noteCheck(id: string, outcome: { at: string; ok: boolean; error?: string; platformState?: PlatformState }): void {
     const index = this.#indexOf(id)
     if (index < 0) return
     const current = this.#monitors[index] as MonitorTarget
     const next: MonitorTarget = {
       ...current,
       lastCheckAt: outcome.at,
+      platformState: outcome.ok ? 'healthy' : (outcome.platformState ?? 'adapter_error'),
       ...(outcome.ok ? { lastSuccessAt: outcome.at, lastError: undefined, lastErrorAt: undefined } : {}),
       ...(outcome.ok || outcome.error === undefined ? {} : { lastError: outcome.error, lastErrorAt: outcome.at }),
       updatedAt: outcome.at,
@@ -517,6 +533,7 @@ export class MonitorStore {
         ...current,
         enabled: false,
         blockedReason: reason,
+        platformState: 'paused',
         lastError: reason,
         lastErrorAt: at,
         updatedAt: at,
@@ -529,7 +546,7 @@ export class MonitorStore {
     const index = this.#indexOf(id)
     if (index < 0) return
     const current = this.#monitors[index] as MonitorTarget
-    this.#commit(this.#replace(index, { ...current, blockedReason: undefined, updatedAt: new Date().toISOString() }))
+    this.#commit(this.#replace(index, { ...current, blockedReason: undefined, platformState: 'healthy', updatedAt: new Date().toISOString() }))
   }
 
   #indexOf(id: string): number {

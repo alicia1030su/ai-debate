@@ -150,6 +150,18 @@ async function waitForHealth(timeoutMs = 20_000): Promise<boolean> {
   return false
 }
 
+async function waitForJob(jobId: string, timeoutMs = 10_000): Promise<Record<string, unknown> | undefined> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const response = await call('/api/ai-debate/jobs')
+    const jobs = (response.body.jobs ?? []) as Record<string, unknown>[]
+    const job = jobs.find((entry) => entry.id === jobId)
+    if (job?.state === 'succeeded' || job?.state === 'failed' || job?.state === 'cancelled') return job
+    await delay(100)
+  }
+  return undefined
+}
+
 const mock = await startMockModel()
 let service = startService()
 
@@ -270,7 +282,13 @@ try {
   record('系统接口', system.status === 200 && typeof system.body.server === 'object', `HTTP ${system.status}`)
 
   const job = await call('/api/ai-debate/system/action', { method: 'POST', body: { action: 'backup' } })
-  record('创建备份任务', job.status === 200 && job.body.ok === true, JSON.stringify(job.body).slice(0, 120))
+  const queued = job.status === 202 && job.body.ok === true && typeof job.body.jobId === 'string'
+  record('创建备份任务', queued, `${job.status} ${JSON.stringify(job.body).slice(0, 120)}`)
+  const finished = queued ? await waitForJob(String(job.body.jobId)) : undefined
+  record('备份任务完成', finished?.state === 'succeeded', `state=${String(finished?.state ?? 'timeout')}`)
+  const backups = await call('/api/ai-debate/backups')
+  const listed = (backups.body.backups ?? []) as { valid?: boolean; kind?: string }[]
+  record('备份清单可校验', backups.status === 200 && listed.some((entry) => entry.kind === 'manual' && entry.valid === true), `${listed.length} 份`)
 
   // Restart the process and prove the state is on disk, not in memory.
   const statePath = join(DATA_DIR, 'state.json')

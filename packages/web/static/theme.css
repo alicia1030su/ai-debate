@@ -523,6 +523,11 @@ body {
   flex-shrink: 0;
 }
 
+.auto-row-actions {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
 .auto-banner {
   margin: 0;
   min-height: 18px;
@@ -572,6 +577,33 @@ body {
   font-size: 13px;
   font-weight: 600;
   color: var(--dsw-alias-label-primary);
+}
+
+.auto-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.auto-section-head .auto-section-title {
+  margin-bottom: 10px;
+}
+
+.auto-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.auto-section-note {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--dsw-alias-label-tertiary);
 }
 
 .auto-add {
@@ -663,6 +695,65 @@ body {
 .auto-pill-running {
   color: var(--dsw-alias-state-warning-primary);
   border-color: var(--dsw-alias-state-warning-primary);
+}
+
+.auto-platform-healthy {
+  color: var(--dsw-alias-state-success-primary);
+  border-color: var(--dsw-alias-state-success-primary);
+}
+
+.auto-platform-unauthorized,
+.auto-platform-forbidden,
+.auto-platform-adapter_error {
+  color: var(--dsw-alias-state-error-primary);
+  border-color: var(--dsw-alias-state-error-primary);
+}
+
+.auto-platform-rate_limited,
+.auto-platform-network_error {
+  color: var(--dsw-alias-state-warning-primary);
+  border-color: var(--dsw-alias-state-warning-primary);
+}
+
+.auto-platform-paused,
+.auto-platform-unknown {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.auto-backup {
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.auto-backup-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.auto-backup-name {
+  flex: 1 1 260px;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--dsw-alias-label-primary);
+  overflow-wrap: anywhere;
+}
+
+.auto-backup-meta {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary);
+  overflow-wrap: anywhere;
+}
+
+.auto-backup-actions {
+  margin-top: 8px;
+  justify-content: flex-end;
 }
 
 .auto-task {
