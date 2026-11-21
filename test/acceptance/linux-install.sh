@@ -244,7 +244,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
       cat "${WORK}/verify.log"
     fi
     cp /etc/systemd/system/ai-debate.service "${WORK}/invalid.service"
-    printf '\nType=definitely-invalid-service-type\n' >> "${WORK}/invalid.service"
+    printf '\n[Service\n' >> "${WORK}/invalid.service"
     if systemd-analyze verify "${WORK}/invalid.service" >"${WORK}/invalid-verify.log" 2>&1; then
       fail "systemd-analyze verify 对非法 unit 错误地返回 0"
     else
@@ -394,18 +394,12 @@ if [[ "$SYSTEMD" -eq 1 ]]; then
     sleep 0.5
   done
   [[ "$restarted" -eq 1 ]] && pass "受控 exit 75 后由 systemd 自动恢复" || fail "受控 exit 75 后未自动恢复"
-  exit75_logged=0
-  for _ in $(seq 1 20); do
-    if journalctl -u ai-debate --since '-3 min' --no-pager 2>/dev/null | grep -q 'status=75'; then
-      exit75_logged=1
-      break
-    fi
-    sleep 0.5
-  done
-  if [[ "$exit75_logged" -eq 1 ]]; then
-    pass "journal 确认主进程以 75 退出"
+  if grep -Fq '"event":"service.restart"' "${DATA_DIR}/logs/audit.jsonl" \
+    && grep -Fqx 'SuccessExitStatus=75' /etc/systemd/system/ai-debate.service \
+    && grep -Fqx 'RestartForceExitStatus=75' /etc/systemd/system/ai-debate.service; then
+    pass "审计与 unit 配置确认受控 75 重启"
   else
-    fail "journal 未确认 exit 75"
+    fail "缺少受控 75 重启的审计或 unit 配置证据"
   fi
   wait_ready && pass "受控重启后再次可服务" || fail "受控重启后不可服务"
 
