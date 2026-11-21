@@ -1,7 +1,9 @@
 name: Final Linux bin real upgrade (v0.2.2)
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - chore/v022-final-linux-upgrade
 
 permissions:
   contents: read
