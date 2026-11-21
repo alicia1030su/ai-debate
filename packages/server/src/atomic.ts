@@ -61,7 +61,7 @@ function classify(error: unknown, target: string): AtomicWriteError {
     return new AtomicWriteError('disk_full', target, `磁盘空间不足，无法写入 ${target}`, { cause: error })
   }
   if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS') {
-    return new AtomicWriteError('permission', target, `没有写入权限：${target}`, { cause: error })
+    return new AtomicWriteError('permission', target, `没有写入权限：${target}（${String(code)}）`, { cause: error })
   }
   return new AtomicWriteError('io', target, `写入失败：${target}（${String(code ?? 'unknown')}）`, { cause: error })
 }
@@ -89,6 +89,35 @@ function fsyncDirectory(file: string): void {
       } catch {
         // Already closed.
       }
+    }
+  }
+}
+
+/** Synchronous bounded backoff for Windows rename sharing violations. */
+const WINDOWS_RENAME_RETRY_DELAYS_MS = [10, 20, 30, 40, 50] as const
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function isTransientWindowsRenameError(error: unknown): boolean {
+  if (process.platform !== 'win32') return false
+  const code = (error as { code?: unknown }).code
+  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY'
+}
+
+function renameWithRetry(temp: string, file: string): void {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      renameSync(temp, file)
+      return
+    } catch (error) {
+      const delay = WINDOWS_RENAME_RETRY_DELAYS_MS[attempt]
+      if (!isTransientWindowsRenameError(error) || delay === undefined) throw error
+      // A concurrent reader/AV/indexer can briefly hold the target or directory
+      // open on NTFS. Retry the same fully-written temp file; deleting it here
+      // would turn a transient sharing violation into a lost ledger update.
+      sleepSync(delay + Math.floor(Math.random() * 5))
     }
   }
 }
@@ -143,7 +172,7 @@ export function writeFileAtomic(
   }
 
   try {
-    renameSync(temp, file)
+    renameWithRetry(temp, file)
   } catch (error) {
     try {
       unlinkSync(temp)

@@ -37,7 +37,7 @@ function sessionWithCandidate(sessionId: string, candidateId: string): SessionSu
   }
 }
 
-function probeWithReply(postId: string): ProbeResult {
+function probeWithReplies(postIds: readonly string[]): ProbeResult {
   const at = '2026-01-01T00:00:00.000Z'
   return {
     platform: PLATFORM,
@@ -46,8 +46,8 @@ function probeWithReply(postId: string): ProbeResult {
     url: 'https://fake.example/p/t016',
     complete: true,
     pagesRead: 1,
-    declaredTotal: 1,
-    replies: [{
+    declaredTotal: postIds.length,
+    replies: postIds.map((postId, index) => ({
       postId,
       kind: 'floor',
       authorName: '对方',
@@ -55,13 +55,17 @@ function probeWithReply(postId: string): ProbeResult {
       content: '一条新的反对意见。',
       createdAt: at,
       floorPostId: postId,
-      floorNumber: 1,
-      order: 0,
+      floorNumber: index + 1,
+      order: index,
       fingerprint: `fp-${postId}`,
       identityQuality: 'stable',
-    }],
-    scan: { mode: 'tail', complete: true, pagesRead: 1, totalPages: 1, repliesSeen: 1 },
+    })),
+    scan: { mode: 'tail', complete: true, pagesRead: 1, totalPages: 1, repliesSeen: postIds.length },
   }
+}
+
+function probeWithReply(postId: string): ProbeResult {
+  return probeWithReplies([postId])
 }
 
 interface Harness {
@@ -83,6 +87,7 @@ function harness(options: {
   analyze?: () => Promise<{ sessionId: string }>
   probe?: () => Promise<ProbeResult>
   session?: (sessionId: string) => Promise<SessionSummary | undefined>
+  concurrency?: number
 } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'ai-debate-orphan-'))
   const log = silentLogger()
@@ -133,6 +138,7 @@ function harness(options: {
     log,
     tickMs: 3_600_000,
     orphanSweepMs: 0,
+    concurrency: options.concurrency,
     now: () => now.value,
   })
   const engine = makeEngine(monitors, tasks, identities)
@@ -252,6 +258,91 @@ test('发现写序：分析任务写失败时游标不得推进，恢复后补�
     assert.equal(await tickUntil(kit, () => kit.tasks.all().some((task) => task.kind === 'analyze')), true)
     assert.equal(kit.monitors.get(kit.monitorId)?.seen.includes(POST_ID), false, '恢复任务不应伪造游标')
     assert.equal(kit.calls.generate, 0)
+  } finally {
+    kit.tasks.enqueue = originalEnqueue
+  }
+})
+
+test('running 分析批次覆盖旧身份时，新身份必须单独成批', async (t) => {
+  const newPostId = 'r5'
+  const newKey = `stable:${PLATFORM}:${THREAD_ID}:${newPostId}`
+  const kit = harness({ probe: async () => probeWithReplies([POST_ID, newPostId]) })
+  t.after(() => kit.dispose())
+  kit.monitors.markBaseline(kit.monitorId, new Date(kit.now.value - 1_000).toISOString())
+  claim(kit)
+  kit.tasks.enqueue({
+    kind: 'analyze',
+    monitorId: kit.monitorId,
+    postId: POST_ID,
+    postIds: [POST_ID],
+    identityKey: IDENTITY_KEY,
+    identityKeys: [IDENTITY_KEY],
+    dedupeKey: `analyze:${IDENTITY_KEY}`,
+  })
+  const firstBatch = kit.tasks.claim(kit.now.value + 1_000)
+  assert.equal(firstBatch?.state, 'running')
+  kit.tasks.enqueue({ kind: 'probe', monitorId: kit.monitorId, dedupeKey: `probe:${kit.monitorId}` })
+  kit.engine.start()
+
+  assert.equal(await tickUntil(kit, () => kit.monitors.get(kit.monitorId)?.seen.includes(newPostId) === true), true)
+  const analyses = kit.tasks.all().filter((task) => task.kind === 'analyze')
+  assert.equal(analyses.length, 2, '旧身份不得阻止新身份建立第二批')
+  const secondBatch = analyses.find((task) => task.id !== firstBatch?.id)
+  assert.ok(secondBatch !== undefined)
+  assert.deepEqual(secondBatch.identityKeys, [newKey])
+  assert.deepEqual(secondBatch.postIds, [newPostId])
+  assert.equal(secondBatch.dedupeKey, `analyze:${newKey}`)
+  assert.equal(firstBatch?.identityKeys?.includes(newKey) ?? false, false)
+})
+
+test('重复回复只认领一次，postIds 与 identityKeys 不得重复', async (t) => {
+  const newPostId = 'r5'
+  const newKey = `stable:${PLATFORM}:${THREAD_ID}:${newPostId}`
+  const kit = harness({ probe: async () => probeWithReplies([POST_ID, POST_ID, newPostId]) })
+  t.after(() => kit.dispose())
+  kit.monitors.markBaseline(kit.monitorId, new Date(kit.now.value - 1_000).toISOString())
+  kit.tasks.enqueue({ kind: 'probe', monitorId: kit.monitorId, dedupeKey: `probe:${kit.monitorId}` })
+  kit.engine.start()
+
+  assert.equal(await tickUntil(kit, () => kit.monitors.get(kit.monitorId)?.seen.includes(newPostId) === true), true)
+  const analyses = kit.tasks.all().filter((task) => task.kind === 'analyze')
+  assert.equal(analyses.length, 1)
+  assert.deepEqual(analyses[0]?.identityKeys, [IDENTITY_KEY, newKey])
+  assert.deepEqual(analyses[0]?.postIds, [POST_ID, newPostId])
+  assert.equal(kit.identities.all().length, 2)
+  assert.equal(kit.monitors.get(kit.monitorId)?.counters.discovered, 2)
+})
+
+test('分析去重返回未覆盖全部身份时，游标必须停止推进', async (t) => {
+  const newPostId = 'r5'
+  const newKey = `stable:${PLATFORM}:${THREAD_ID}:${newPostId}`
+  const kit = harness({ probe: async () => probeWithReplies([POST_ID, newPostId]) })
+  t.after(() => kit.dispose())
+  kit.monitors.markBaseline(kit.monitorId, new Date(kit.now.value - 1_000).toISOString())
+  claim(kit)
+  kit.tasks.enqueue({
+    kind: 'analyze',
+    monitorId: kit.monitorId,
+    postId: POST_ID,
+    identityKey: IDENTITY_KEY,
+    dedupeKey: `analyze:${IDENTITY_KEY}`,
+  })
+  const firstBatch = kit.tasks.claim(kit.now.value + 1_000)
+  assert.ok(firstBatch !== undefined)
+  const originalEnqueue = kit.tasks.enqueue.bind(kit.tasks)
+  kit.tasks.enqueue = (input) => input.kind === 'analyze'
+    ? { task: firstBatch, deduplicated: true }
+    : originalEnqueue(input)
+  const probe = kit.tasks.enqueue({ kind: 'probe', monitorId: kit.monitorId, dedupeKey: `probe:${kit.monitorId}` }).task
+  kit.engine.start()
+  try {
+    assert.equal(await tickUntil(kit, () =>
+      kit.tasks.get(probe.id)?.state === 'retry_wait' || kit.tasks.get(probe.id)?.state === 'failed'), true)
+    assert.equal(kit.monitors.get(kit.monitorId)?.seen.includes(POST_ID) ?? false, false)
+    assert.equal(kit.monitors.get(kit.monitorId)?.seen.includes(newPostId) ?? false, false)
+    assert.equal(kit.identities.get(newKey)?.state, 'claimed')
+    assert.equal(kit.tasks.all().filter((task) => task.kind === 'analyze').length, 1)
+    assert.match(kit.tasks.get(probe.id)?.lastError ?? '', /未覆盖全部新回复身份/)
   } finally {
     kit.tasks.enqueue = originalEnqueue
   }
@@ -712,6 +803,65 @@ test('生成候选身份：核心暂不可读时无模型延后核验，恢复�
   assert.equal(await tickUntil(kit, () => kit.tasks.get(task.id)?.state === 'needs_review'), true)
   assert.equal(kit.calls.generate, 0)
   assert.equal(kit.tasks.all().length, 1)
+})
+
+test('生成候选身份：恢复后 attempts 已达上限仍等待核心，恢复可读后无模型转待审核', async (t) => {
+  const kit = harness()
+  kit.setSession(async () => { throw new Error('core session unreadable') })
+  t.after(() => kit.dispose())
+  claim(kit)
+  kit.identities.attachSession(IDENTITY_KEY, 'generation-session')
+  kit.identities.markCandidate(IDENTITY_KEY, { sessionId: 'generation-session', candidateId: 'stored-candidate' })
+  const { task } = kit.tasks.enqueue({
+    kind: 'generate',
+    monitorId: kit.monitorId,
+    postId: POST_ID,
+    identityKey: IDENTITY_KEY,
+    sessionId: 'generation-session',
+    dedupeKey: `generate:${IDENTITY_KEY}`,
+    maxAttempts: 2,
+  })
+  const running = kit.tasks.claim(kit.now.value + 1_000)
+  assert.equal(running?.attempts, 1)
+  const reloaded = await kit.reload()
+  assert.deepEqual(reloaded.tasks.recoverInterrupted(), { recovered: 1, uncertain: 0 })
+  assert.equal(reloaded.tasks.get(task.id)?.attempts, 2)
+  assert.equal(reloaded.tasks.get(task.id)?.state, 'pending')
+  reloaded.engine.start()
+  assert.equal(await tickUntil(reloaded, () => reloaded.tasks.get(task.id)?.state === 'retry_wait'), true)
+  assert.equal(reloaded.tasks.get(task.id)?.lastErrorKind, 'candidate_unavailable')
+  assert.equal(reloaded.calls.generate, 0)
+
+  reloaded.setSession(async () => sessionWithCandidate('generation-session', 'stored-candidate'))
+  reloaded.now.value += 30_001
+  assert.equal(await tickUntil(reloaded, () => reloaded.tasks.get(task.id)?.state === 'needs_review'), true)
+  assert.equal(reloaded.calls.generate, 0)
+})
+
+test('core 锁超时：attempts 已达上限仍保持 retry_wait，恢复后无模型转待审核', async (t) => {
+  const kit = harness()
+  kit.setSession(async () => { throw Object.assign(new Error('状态写入锁被占用超过 5000ms'), { code: 'write_failed' }) })
+  t.after(() => kit.dispose())
+  claim(kit)
+  const { task } = kit.tasks.enqueue({
+    kind: 'generate',
+    monitorId: kit.monitorId,
+    postId: POST_ID,
+    identityKey: IDENTITY_KEY,
+    sessionId: 'generation-session',
+    dedupeKey: `generate:${IDENTITY_KEY}`,
+    maxAttempts: 1,
+  })
+  kit.engine.start()
+  assert.equal(await tickUntil(kit, () => kit.tasks.get(task.id)?.state === 'retry_wait'), true)
+  assert.equal(kit.tasks.get(task.id)?.lastErrorKind, 'core_lock_timeout')
+  assert.equal(kit.identities.get(IDENTITY_KEY)?.state, 'claimed')
+  assert.equal(kit.calls.generate, 0)
+
+  kit.setSession(async () => sessionWithCandidate('generation-session', 'stored-candidate'))
+  kit.now.value += 30_001
+  assert.equal(await tickUntil(kit, () => kit.tasks.get(task.id)?.state === 'needs_review'), true)
+  assert.equal(kit.calls.generate, 0)
 })
 
 test('生成候选身份：核心确认候选不存在时失败关闭，不得转待审核或调用模型', async (t) => {

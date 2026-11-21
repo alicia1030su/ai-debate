@@ -21,10 +21,15 @@ jobs:
   guard:
     name: Refuse to overwrite a published release
     runs-on: ubuntu-latest
+    outputs:
+      candidate_commit: ${{ steps.signoff.outputs.candidate_commit }}
+      tag_commit: ${{ steps.signoff.outputs.tag_commit }}
+      tag_object: ${{ steps.signoff.outputs.tag_object }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
       - name: Check the release does not exist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -76,6 +81,17 @@ jobs:
             }
           done
           echo "六份 ${TAG} 发布文档齐全"
+      - name: Verify the signed candidate, evidence and peeled tag commit
+        id: signoff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG_COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          test "$(git rev-parse HEAD)" = "$TAG_COMMIT"
+          node scripts/verify-release-signoff.mjs
+          test "$(git rev-parse HEAD)" = "$TAG_COMMIT"
 
   verify:
     name: Verify before release
@@ -84,7 +100,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ needs.guard.outputs.tag_commit }}
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -179,6 +196,8 @@ jobs:
         with:
           name: release-upgrade-failure
           path: /tmp/ai-debate-upgrade-*/**
+      - run: npm run test:soak-supervisor
+      - run: npm run test:release-signoff
       - run: npm run test:soak:v022
       - run: node scripts/assert-no-dsh.mjs
       - name: Soak the pipeline for five minutes
@@ -191,7 +210,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ needs.guard.outputs.tag_commit }}
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -234,7 +254,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ needs.guard.outputs.tag_commit }}
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -304,11 +325,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ needs.guard.outputs.tag_commit }}
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
+      - name: Re-verify the signed candidate before creating the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_CANDIDATE_COMMIT: ${{ needs.guard.outputs.candidate_commit }}
+          RELEASE_TAG_COMMIT: ${{ needs.guard.outputs.tag_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_TAG_COMMIT"
+          node scripts/verify-release-signoff.mjs
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -357,11 +388,12 @@ jobs:
   verify-assets:
     name: Download the draft assets and re-check them
     runs-on: ubuntu-latest
-    needs: publish
+    needs: [publish, guard]
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ needs.guard.outputs.tag_commit }}
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -477,11 +509,28 @@ jobs:
   finalize:
     name: Formalize the verified release
     runs-on: ubuntu-latest
-    needs: verify-assets
+    needs: [verify-assets, guard]
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ needs.guard.outputs.tag_commit }}
+          fetch-depth: 0
+      - name: Re-fetch the remote tag and re-verify the signed candidate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          RELEASE_CANDIDATE_COMMIT: ${{ needs.guard.outputs.candidate_commit }}
+          RELEASE_TAG_COMMIT: ${{ needs.guard.outputs.tag_commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.guard.outputs.tag_object }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          REMOTE_TAG_OBJECT=$(git rev-parse "refs/tags/${TAG}")
+          REMOTE_TAG_COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          test "$REMOTE_TAG_OBJECT" = "$RELEASE_TAG_OBJECT"
+          test "$REMOTE_TAG_COMMIT" = "$RELEASE_TAG_COMMIT"
+          test "$(git rev-parse HEAD)" = "$REMOTE_TAG_COMMIT"
+          node scripts/verify-release-signoff.mjs
       - name: Publish and mark latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

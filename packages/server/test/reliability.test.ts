@@ -14,7 +14,10 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { assertWritableSpace, readJsonWithBackup, writeJson, AtomicWriteError } from '../src/atomic.ts'
+import * as nodeFs from 'node:fs'
+import nodeFsDefault from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
+import { assertWritableSpace, readJsonWithBackup, writeFileAtomic, writeJson, AtomicWriteError } from '../src/atomic.ts'
 import { MonitorStore } from '../src/monitor/store.ts'
 import { AutoTaskStore } from '../src/monitor/tasks.ts'
 
@@ -93,6 +96,85 @@ test('原子写：磁盘空间不足时拒绝写入，而不是写坏文件', ()
   // And a normal write still works after that check.
   writeJson(join(dir, 'ok.json'), { ok: true })
   assert.deepEqual(JSON.parse(readFileSync(join(dir, 'ok.json'), 'utf8')), { ok: true })
+})
+
+function withWindowsPlatform<T>(run: () => T): T {
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+  try {
+    return run()
+  } finally {
+    if (descriptor !== undefined) Object.defineProperty(process, 'platform', descriptor)
+  }
+}
+
+test('原子写：Windows rename 瞬态 EPERM 有界重试后成功', (t) => {
+  const dir = scratch()
+  const file = join(dir, 'state.json')
+  writeFileSync(file, 'old', 'utf8')
+  const originalRename = nodeFsDefault.renameSync
+  let attempts = 0
+  const mockedRename = t.mock.method(nodeFsDefault, 'renameSync', ((from: nodeFs.PathLike, to: nodeFs.PathLike) => {
+    attempts += 1
+    if (attempts <= 2) {
+      assert.equal(readFileSync(file, 'utf8'), 'old', '重试期间旧文件必须保持可读')
+      throw Object.assign(new Error('injected sharing violation'), { code: 'EPERM' })
+    }
+    return originalRename(from, to)
+  }) as typeof nodeFs.renameSync)
+  syncBuiltinESMExports()
+  try {
+    withWindowsPlatform(() => writeFileAtomic(file, 'new'))
+    assert.equal(attempts, 3)
+    assert.equal(readFileSync(file, 'utf8'), 'new')
+    assert.equal(readdirSync(dir).some((name) => name.includes('.tmp-')), false)
+  } finally {
+    mockedRename.mock.restore()
+    syncBuiltinESMExports()
+  }
+})
+
+test('原子写：Windows rename 持续 EPERM 最终失败且不破坏旧文件', (t) => {
+  const dir = scratch()
+  const file = join(dir, 'state.json')
+  writeFileSync(file, 'old', 'utf8')
+  const mockedRename = t.mock.method(nodeFsDefault, 'renameSync', () => {
+    throw Object.assign(new Error('injected persistent sharing violation'), { code: 'EPERM' })
+  })
+  syncBuiltinESMExports()
+  try {
+    assert.throws(() => withWindowsPlatform(() => writeFileAtomic(file, 'new')), AtomicWriteError)
+    assert.equal(readFileSync(file, 'utf8'), 'old')
+    assert.equal(readdirSync(dir).some((name) => name.includes('.tmp-')), false)
+  } finally {
+    mockedRename.mock.restore()
+    syncBuiltinESMExports()
+  }
+})
+
+test('原子写：非瞬态 rename 错误不重试，原始 code/cause 保留', (t) => {
+  const dir = scratch()
+  const file = join(dir, 'state.json')
+  writeFileSync(file, 'old', 'utf8')
+  let attempts = 0
+  const mockedRename = t.mock.method(nodeFsDefault, 'renameSync', () => {
+    attempts += 1
+    throw Object.assign(new Error('injected read-only filesystem'), { code: 'EROFS' })
+  })
+  syncBuiltinESMExports()
+  try {
+    assert.throws(() => withWindowsPlatform(() => writeFileAtomic(file, 'new')), (error: unknown) => {
+      assert.ok(error instanceof AtomicWriteError)
+      assert.equal(error.kind, 'permission')
+      assert.equal((error.cause as { code?: string }).code, 'EROFS')
+      return true
+    })
+    assert.equal(attempts, 1)
+    assert.equal(readFileSync(file, 'utf8'), 'old')
+  } finally {
+    mockedRename.mock.restore()
+    syncBuiltinESMExports()
+  }
 })
 
 test('原子写：备份本身不可用时仍完成主写入', () => {

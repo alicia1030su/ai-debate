@@ -2,7 +2,7 @@
 
 更稳定的后台挂机、可恢复的备份中心，以及更容易定位问题的运行诊断。
 
-> **发布状态说明**：最终冻结候选回归已通过，B1–B4 与 Soak/持久化架构复审 **IS_PASS YES**；全新连续 24h Soak 正在运行。v0.2.2 CI、最终 Windows EXE/Linux TGZ 与正式 Release/Tag/Latest 尚未完成，当前判定为 **NO-GO**。文末“发布前验收状态”必须在正式打 Tag 前回填，不能把架构放行当作正式发布签字。
+> **发布状态说明**：最终冻结候选回归已通过，B1–B4 与 Soak/持久化架构复审 **IS_PASS YES**；v0.2.2 CI 全 job 已通过并产出双平台资产，全新连续 24h Soak 正在运行。最终资产下载复验与正式 Release/Tag/Latest 尚未完成，当前判定为 **NO-GO**。文末“发布前验收状态”必须在正式打 Tag 前回填，不能把架构放行当作正式发布签字。
 
 ## 升级
 
@@ -127,7 +127,7 @@ v0.2.2 的备份包含 `credentials.json` **密文**，但不是“可以公开�
 | 项目 | 当前结果 |
 |---|---|
 | core | 227/227 通过 |
-| server | 164/164 通过，exit 0（最终 server-only 写序修复前）；B1 四文件定向 74/74；monitor-engine 最终修复后 47/47 |
+| server | **CI 166/166 通过，fail 0**；本机历史快照 164/164（最终 server-only 写序修复前）；B1 四文件定向 74/74；monitor-engine 最终修复后 47/47 |
 | 迁移/终态身份 | 迁移 38/38；终态身份恢复 60/60 |
 | web | 12/12 通过 |
 | standalone | 27/27 通过 |
@@ -139,7 +139,7 @@ v0.2.2 的备份包含 `credentials.json` **密文**，但不是“可以公开�
 | 秘密扫描 | 仓库扫描通过，235 个受版本控制文件；扫描器回归 12/12；PE 同偏移与 ELF 节级 Node 基线差分均有回归 |
 | 类型与差异检查 | `tsc --noEmit`、`git diff --check`、`git diff --cached --check` 均通过 |
 
-这些结果对应 UTC 2026-11-21 10:01:17 的最终冻结候选。Server 全量完成于最后一次仅涉及 server 写序的修复之前；该修复后 monitor-engine、Soak 自测、两组故障 Soak 与类型检查均通过。最终 CI 与正式 Release 资产仍待完成。
+这些结果对应 UTC 2026-11-21 12:03:04 的最终冻结候选。本机 Server 全量完成于最后一次仅涉及 server 写序的修复之前；该修复后 monitor-engine、Soak 自测、两组故障 Soak 与类型检查均通过。最终 CI 已在提交 `a119b5d0772c77cd62c9058dbeb2e6ee87ac64fb` 上全量通过（运行 `44907546464`）；连续 24h Soak、最终资产下载复验与正式 Release 仍待完成。
 
 ## 已知限制
 
@@ -157,13 +157,13 @@ v0.2.2 的备份包含 `credentials.json` **密文**，但不是“可以公开�
 | 项目 | 状态 |
 |---|---|
 | 架构复审 | **最终 IS_PASS YES，B1–B4 与 Soak/持久化阻断全部关闭**；只放行冻结候选进入 24h Soak |
-| 最终候选类型检查 | 通过，退出码 0；最终 Tag 与 CI 待复验 |
+| 最终候选类型检查 | 本机与 CI 均通过，退出码 0；最终 Tag 驱动 Release 轮次待复验 |
 | 24 小时 Soak | **正在运行**。UTC `2026-11-21T12:05:15.222Z` 启动，状态目录 `.tmp-data/soak-v022-continuous-final-20261121T120304Z/`；预检 1000 监控 15s 与 40 监控 2 次 SIGKILL 15s 均通过 |
 | Soak/持久化发布阻断 | **已修复并复审通过**：durable-only 证据、孤儿锁回收、token CAS release、幽灵候选无模型收敛、identity-before-task 写序、恢复既有候选不重复计数、发现任务先于游标持久化 |
-| v0.2.2 CI | **多轮运行中**；三平台 Test、Windows 打包、真实升级、短 Soak 已通过，Linux ELF 基线修复等待最新完整轮次 |
-| 身份自动迁移 | **97/97 `migrated`，modelCalls=0；迁移相关 38/38**；最终 EXE 与 CI `upgrade-real` 待复验 |
-| 最终 Windows EXE | **待重建**。旧 EXE `adfb5112…` 为最终修复前资产，已解除资格 |
-| Linux TGZ | 已由 CI 构建，但最终 ELF 基线扫描与 systemd 生命周期等待最新完整轮次 |
+| v0.2.2 CI | **全 job 通过**：运行 `44907546464`，提交 `a119b5d0772c77cd62c9058dbeb2e6ee87ac64fb` |
+| 身份自动迁移 | **97/97 `migrated`，modelCalls=0；迁移相关 38/38**；CI `upgrade-real` 已通过，最终 EXE 下载复验待完成 |
+| 最终 Windows EXE | **CI 已构建**并通过版本、standalone/launcher 与 Node 基线秘密扫描；下载 SHA256 复验待完成。旧 EXE `adfb5112…` 为最终修复前资产，已解除资格 |
+| Linux TGZ | 已由 CI 构建，ELF 基线扫描、Ubuntu 22/24 systemd 生命周期与 Debian 12 兼容均通过；最终下载复验待完成 |
 | 下载后 SHA256/Latest | **待正式发布后回填** |
 | 真实平台/Windows 自启/Debian systemd | **未验证或受环境限制** |
 

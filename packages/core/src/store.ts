@@ -956,11 +956,24 @@ async function acquireLock(file: string, timeoutMs = DEFAULT_LOCK_TIMEOUT_MS): P
       // not create parents. Creating it here is also what makes the lock and the
       // state file share one directory, so a rename cannot cross filesystems.
       await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 })
-      const handle = await open(lockPath, 'wx', 0o600)
+      // Publish a fully written lock body atomically. Creating the live path
+      // with `open('wx')` and writing it afterwards left a crash window where a
+      // killed process left an empty lock that looked fresh for 30 seconds.
+      // A same-directory hard link gives us no-clobber publication without that
+      // window; the pending name is harmless if the process dies before/after
+      // linking and is never consulted as ownership evidence.
+      const pending = `${lockPath}.${process.pid}.${randomUUID()}.pending`
       try {
-        await handle.writeFile(body, 'utf8')
+        const pendingHandle = await open(pending, 'wx', 0o600)
+        try {
+          await pendingHandle.writeFile(body, 'utf8')
+          await pendingHandle.sync()
+        } finally {
+          await pendingHandle.close()
+        }
+        await link(pending, lockPath)
       } finally {
-        await handle.close()
+        await unlink(pending).catch(() => undefined)
       }
       registerLockToken(lockPath, token)
       let released = false
@@ -1149,16 +1162,20 @@ async function breakStaleLock(lockPath: string): Promise<boolean> {
     return isMissingFile(error)
   }
 
-  let parsed: { pid?: number; at?: number; token?: string } = {}
+  let parsed: { pid?: number; at?: number; token?: string } | undefined
   try {
-    parsed = JSON.parse(observed) as { pid?: number; at?: number; token?: string }
+    const candidate = JSON.parse(observed) as { pid?: number; at?: number; token?: string }
+    if (candidate !== null && typeof candidate === 'object') parsed = candidate
   } catch {
-    // A half-written body is not a valid claim. Fall through to the age check below,
-    // which will only break it once it is older than the threshold.
+    // A torn body is not a valid ownership claim. New acquisitions publish a
+    // complete body atomically, so this can only be legacy residue or external
+    // corruption. Breaking it is safe: a legacy writer that still holds the old
+    // inode will fail the pre-write token check and cannot delete the new lock.
   }
 
-  const owner = typeof parsed.pid === 'number' ? parsed.pid : undefined
-  const token = typeof parsed.token === 'string' && parsed.token !== '' ? parsed.token : undefined
+  const invalidBody = parsed === undefined
+  const owner = typeof parsed?.pid === 'number' ? parsed.pid : undefined
+  const token = typeof parsed?.token === 'string' && parsed.token !== '' ? parsed.token : undefined
 
   // 1. Same-process residue is the one case where PID liveness is misleading:
   // an earlier release may have failed after its owner stopped doing critical-
@@ -1175,8 +1192,8 @@ async function breakStaleLock(lockPath: string): Promise<boolean> {
 
   // 3. No usable liveness signal: decide by age, using the recorded timestamp when
   //    there is one and the file's own mtime when there is not.
-  if (owner === undefined) {
-    const at = typeof parsed.at === 'number' ? parsed.at : 0
+  if (owner === undefined && !invalidBody) {
+    const at = typeof parsed?.at === 'number' ? parsed.at : 0
     if (at !== 0) {
       if (Date.now() - at < LOCK_STALE_MS) return false
     } else {
@@ -1491,27 +1508,32 @@ export class DebateStore {
    */
   async readPersistedSnapshot(): Promise<StoreData> {
     await this.ready()
-    // A durable read is a filesystem critical section too. Wait for every write
-    // already queued on this instance before taking the same cross-process lock;
-    // otherwise it could observe the file between two same-instance mutations.
-    await this.writeChain
-    let lock: LockHandle
-    try {
-      lock = await acquireLock(this.file, this.options.lockTimeoutMs)
-    } catch (error) {
-      throw error instanceof StoreError
-        ? error
-        : new StoreError('read_failed', `无法读取持久状态（${this.file}）：${(error as Error).message}`, {
-            cause: error,
-          })
-    }
-    try {
-      // Deliberately do not assign to `this.data`: a dirty attempted mutation is
-      // still visible to its caller, but it is not durable candidate evidence.
-      return await this.readCurrentDocument()
-    } finally {
-      await this.releaseLock(lock)
-    }
+    // A durable read is a filesystem critical section too. Enqueue it on the
+    // same FIFO as mutations instead of merely awaiting the current tail and
+    // then racing new writes/reads for the cross-process lock. Without this,
+    // several concurrent recovery reads could starve one another for seconds
+    // even though each individual critical section was short.
+    const read = this.writeChain.then(async (): Promise<StoreData> => {
+      let lock: LockHandle
+      try {
+        lock = await acquireLock(this.file, this.options.lockTimeoutMs)
+      } catch (error) {
+        throw error instanceof StoreError
+          ? error
+          : new StoreError('read_failed', `无法读取持久状态（${this.file}）：${(error as Error).message}`, {
+              cause: error,
+            })
+      }
+      try {
+        // Deliberately do not assign to `this.data`: a dirty attempted mutation
+        // is still visible to its caller, but it is not durable evidence.
+        return await this.readCurrentDocument()
+      } finally {
+        await this.releaseLock(lock)
+      }
+    })
+    this.writeChain = read.catch(() => undefined)
+    return read
   }
 
   /** Find a session in the durable document, ignoring any dirty in-memory view. */

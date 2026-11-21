@@ -1,8 +1,8 @@
 # AI Debate v0.2.2 验收报告
 
-> 状态：**最终候选已重新冻结，Soak/持久化架构复审 IS_PASS YES；全新连续 24h Soak 正在运行，v0.2.2 CI、最终双平台资产与正式 Release/Tag/Latest 尚未完成；当前发布判定仍为 NO-GO**。
+> 状态：**最终候选已重新冻结，Soak/持久化架构复审 IS_PASS YES；v0.2.2 CI 全 job 已通过，全新连续 24h Soak 正在运行，最终双平台资产下载复验与正式 Release/Tag/Latest 尚未完成；当前发布判定仍为 NO-GO**。
 >
-> 未完成门禁：连续 24h Soak 报告、v0.2.2 CI 全 job、最终 Windows EXE/Linux TGZ、下载复验与 Latest 正式化。本报告不替代最终发布签字。
+> 未完成门禁：连续 24h Soak 报告、最终 Windows EXE/Linux TGZ 下载复验与 Latest 正式化。本报告不替代最终发布签字。
 
 ## 1. 环境与证据口径
 
@@ -13,7 +13,7 @@
 - 最终 `packages/server/test/monitor-engine.test.ts` SHA256：`0c549bd09b0da69e8b1f2179ba9c1b85aef2694fce791e159bfd264db627b47c`。
 - 最终 `test/stress/soak-v022.ts` SHA256：`14fddcede38f8bbef023570144d958414fb1e71b70e92b42488f220b5b7f4224`。
 - 既有 Windows EXE 构建于最终修复之前，已解除最终资产资格，必须重建；构建、测试与长跑证据不能相互替代。
-- 本次文档回填未 stage、未 commit；只更新六份发布文档，不改动产品代码、测试、工作流或 package 文件，也不把开发期或 CI 待办写成通过。
+- 本轮回填只更新六份发布文档，不改动产品代码、测试、工作流或 package 文件，也不把开发期或未完成门禁写成通过。
 
 ## 2. 最终候选回归
 
@@ -22,7 +22,7 @@
 | 项目 | 结果 | 边界 |
 |---|---|---|
 | Core | **227/227 通过** | 含 HTTP 出网、manual 重定向、DNS 固定、Abort/429 边界 |
-| Server | **164/164 通过，exit 0** | 最终 server-only 写序修复前执行全量；命令完整输出后本机安全策略附注拦截，未重试 |
+| Server | **CI 166/166 通过，fail 0** | 本机历史快照为 164/164，完成于最终 server-only 写序修复前且命令末尾被安全策略附注拦截；最终计数以 CI 为准 |
 | B1 四文件定向回归 | **74/74 通过** | 最终 Core 候选 |
 | monitor-engine 独立复跑 | **47/47 通过** | 最终写序修复后执行 |
 | Web | **12/12 通过** | 自动挂机、备份错误、诊断与未知值展示 |
@@ -38,7 +38,7 @@
 | TypeScript | **`tsc --noEmit` 通过** | B1–B4 修复候选 |
 | 差异检查 | **`git diff --check`、`git diff --cached --check` 均通过** | B1–B4 修复候选 |
 
-以上计数对应当前冻结候选。Server 全量 164/164 完成于最后的计数器与发现写序修复之前；修复后已独立复跑 monitor-engine 47/47、standalone 27/27、真实升级 97/97、Soak 自测 6/6、高磁盘故障压力测试、两组故障 Soak 与类型检查。最终 CI 仍须重新执行全量。
+以上计数对应当前冻结候选。本机 Server 全量 164/164 完成于最后的计数器与发现写序修复之前；修复后已独立复跑 monitor-engine 47/47、standalone 27/27、真实升级 97/97、Soak 自测 6/6、高磁盘故障压力测试、两组故障 Soak 与类型检查。最终 CI 已在提交 `a119b5d0772c77cd62c9058dbeb2e6ee87ac64fb` 上重新执行全量，运行 `44907546464` 的 10 个 job 全部通过。
 
 ### 2.2 B1 四文件基线
 
@@ -125,7 +125,7 @@
 - 最终 EXE 本地重建被 WorkBuddy 批量删除安全守卫阻断（`packages/core/lib` 276 个文件，超过阈值）；未绕过守卫，最终 Windows/Linux 资产改由 CI 打包 job 产出并复验。
 - 最终源码 bundle 的 standalone **27/27**、真实升级 **97/97** 已通过；`verify-release.mjs`、Node 基线秘密扫描、打包后 standalone/launcher 必须在 CI 最终资产上重跑。
 - 注册表自启被本机安全策略阻断，**未计通过**。
-- v0.2.2 CI 已多轮运行：三平台 Test、Windows 打包、真实升级、5 分钟 Soak 与秘密扫描均通过；Linux SEA 基线校验已修复为 ELF 节级差分，等待最新一轮完整通过。最终 Linux TGZ、正式 Release/Tag/Latest **尚未完成**。
+- v0.2.2 CI 全 job 已通过：运行 `44907546464`，提交 `a119b5d0772c77cd62c9058dbeb2e6ee87ac64fb`；覆盖三平台 Test、真实 v0.2.1/v0.2.0 升级、Windows 打包、Ubuntu 22/24 真实 systemd 生命周期、5 分钟 Soak、Debian 12 兼容与秘密扫描。最终资产下载复验与正式 Release/Tag/Latest **尚未完成**。
 - 真实贴吧/微博账号、Debian 12 真实 systemd：**未验证**。
 
 ## 7. 已知限制（P2，后续加固）
@@ -155,7 +155,6 @@ B1–B4 与新增 Soak/持久化阻断均已关闭，**最终架构复审 IS_PAS
 以下项目完成前仍不得正式发布：
 
 1. 取得最终冻结候选的连续 24h Soak 报告、墙钟时长、重启/杀死、不变量、峰值与结论。
-2. v0.2.2 CI 全 job 通过并回填运行链接。
-3. 重建最终 Windows EXE 与 Linux TGZ，并完成版本、SHA256、秘密扫描与安装/恢复验证。
-4. 正式 EXE/TGZ 完成下载后复验与 Latest 核验，并完成正式 Release/Tag。
-5. 产品负责人确认真实平台、Windows 自启、Debian systemd 等未覆盖项的风险接受。
+2. 对 CI 已构建的最终 Windows EXE 与 Linux TGZ 完成下载后 SHA256、版本、秘密扫描与安装/恢复复验。
+3. 完成 Tag 驱动 Release 工作流、draft 资产/GitHub digest 复验与 Latest 正式化。
+4. 产品负责人确认真实平台、Windows 自启、Debian systemd 等未覆盖项的风险接受。

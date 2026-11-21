@@ -859,11 +859,30 @@ async function runScenario(source: LegacySource, model: { port: number; calls():
       const callsBefore = model.calls()
       const resumed = await client.call('/api/ai-debate/automation/resume', { method: 'POST', body: {} })
       check(`${prefix} 升级后队列可恢复`, resumed.status === 200)
-      const settled = await waitUntil(() => {
-        const row = readJson(join(dataDir, 'auto-tasks.json')).tasks as JsonObject[]
-        return row.find((task) => task.id === 'upgrade-task-recover')?.state === 'needs_review'
+      let recoveryTask: JsonObject | undefined
+      const settled = await waitUntil(async () => {
+        const response = await client.call('/api/ai-debate/automation/tasks?limit=50')
+        const rows = (response.body?.tasks ?? []) as JsonObject[]
+        recoveryTask = rows.find((task) => task.id === 'upgrade-task-recover')
+        return recoveryTask?.state === 'needs_review'
+      }, 30_000)
+      // Read the ledger only once, after HTTP polling finishes. Tightly polling
+      // the file from this process used to amplify Windows rename sharing
+      // violations and make the acceptance itself a write-contention source.
+      const recoveryIdentities = readJson(join(dataDir, 'reply-identities.json')).identities
+      const recoveryStatus = await client.call('/api/ai-debate/automation/status')
+      const recoveryDiagnostics = JSON.stringify({
+        task: recoveryTask,
+        identities: recoveryIdentities,
+        status: recoveryStatus.body,
+        serviceLogTail: service.log().slice(-2_000),
+        modelCalls: model.calls() - callsBefore,
       })
-      check(`${prefix} 恢复任务复用旧候选而不重复生成`, settled && model.calls() === callsBefore, `modelCalls=${model.calls() - callsBefore}`)
+      check(
+        `${prefix} 恢复任务复用旧候选而不重复生成`,
+        settled && model.calls() === callsBefore,
+        settled ? `modelCalls=${model.calls() - callsBefore}` : recoveryDiagnostics.slice(-4_000),
+      )
       check(`${prefix} 复用旧候选后 state.json 仍不变`, sha256(readFileSync(stateFile)) === stateHashBefore)
       await client.call('/api/ai-debate/automation/pause', { method: 'POST', body: {} })
     }

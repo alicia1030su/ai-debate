@@ -2,7 +2,7 @@
 
 > 范围：存储、后台调度、平台失败处理、备份恢复、常驻部署与长跑验证。
 >
-> 状态：**最终冻结候选回归通过，B1–B4 与 Soak/持久化架构复审 IS_PASS YES；全新连续 24h Soak 正在运行（NO-GO）**。v0.2.2 CI、最终双平台资产与正式 Release/Tag/Latest 仍须回填。
+> 状态：**最终冻结候选回归通过，B1–B4 与 Soak/持久化架构复审 IS_PASS YES；v0.2.2 CI 全 job 已通过，全新连续 24h Soak 正在运行（NO-GO）**。最终双平台资产下载复验与正式 Release/Tag/Latest 仍须回填。
 >
 > 证据基线：UTC 2026-11-21 12:03:04 的最终冻结候选；清单见 `.tmp-data/soak-v022-continuous-final-20261121T120304Z/freeze.txt`。
 
@@ -85,14 +85,14 @@ open(temp) → 循环写满并拒绝短写 → fsync(file) → 复制 .bak → r
 
 ```text
 持久化 ReplyIdentityStore.claim()
-  → 持久化 MonitorStore.applyScan()
   → 持久化分析任务
+  → 持久化 MonitorStore.applyScan()
 ```
 
-两种崩溃窗口都可修复：
+分析任务写入失败时，本次发现操作向上传播，monitor cursor 不推进，探针任务保留 running 并交给租约恢复。两种崩溃窗口都可修复：
 
-- claim 成功、游标失败：下轮仍能看到回复，但全局 claim 阻止第二次认领。
-- claim 成功、游标成功、任务写入失败：orphan sweep 发现“有身份、无任务”，重新排入分析。
+- claim 成功、任务写入失败：游标仍指回旧位置，下轮能看到回复；全局 claim 与持久任务键共同阻止重复认领/入队。
+- claim 与任务成功、游标失败：orphan/任务对账能看到已有任务，不重复创建；下轮继续读取同一窗口。
 
 身份状态 `candidate/ignored` 是终态语义，不会被 orphan sweep 重新打开。批量分析覆盖 `identityKeys`，新身份可追加到 pending 批次；已 running 的批次不会被静默扩充。
 
@@ -258,12 +258,12 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 
 ### 9.1 最终冻结候选回归
 
-证据基线为 UTC 2026-11-21 12:03:04。Server 全量完成于最后一次仅涉及 server 写序的修复之前；该修复后已复跑 monitor-engine、Soak 自测、两组故障 Soak 与类型检查，最终 CI 仍须重新执行全量。
+证据基线为 UTC 2026-11-21 12:03:04。本机 Server 全量完成于最后一次仅涉及 server 写序的修复之前；该修复后已复跑 monitor-engine、Soak 自测、两组故障 Soak 与类型检查。最终 CI 已在提交 `a119b5d0772c77cd62c9058dbeb2e6ee87ac64fb` 上重新执行三平台全量、真实升级、打包、systemd 生命周期、短 Soak、Debian 兼容与秘密扫描，10 个 job 全部通过（运行 `44907546464`）。
 
 | 套件/检查 | 结果 | 边界 |
 |---|---|---|
 | Core | **227/227 通过** | 含 DNS 固定、manual 重定向、Cookie 隔离与出网边界 |
-| Server | **164/164 通过，exit 0** | 最终 server-only 写序修复前全量；命令输出后本机安全策略附注拦截，未重试 |
+| Server | **CI 166/166 通过，fail 0** | 本机历史快照 164/164 完成于最终 server-only 写序修复前，命令输出后本机安全策略附注拦截，未重试；最终计数以 CI 为准 |
 | B1 四文件定向 | **74/74 通过** | `net-audit.ts`、`platforms/http.ts` 与两份对应测试 |
 | monitor-engine | **47/47 通过** | 最终写序修复后独立复跑 |
 | Web | **12/12 通过** | 自动挂机、备份错误、诊断与未知值展示 |
@@ -285,13 +285,13 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 - 该 EXE 已因新 Soak 阻断解除最终冻结资格；修复后需重新构建并回填最终哈希。
 - `verify-release.mjs` 29/29；打包后 standalone 27/27；Windows launcher 1/1。
 - Node 基线秘密扫描通过，忽略 3 条运行时原字节匹配；应用 bundle 0 命中。
-- 注册表自启被本机安全策略阻断，未计通过；Linux TGZ 尚未构建。
+- 注册表自启被本机安全策略阻断，未计通过；Linux TGZ 已由 CI 构建并通过 ELF 基线扫描、Ubuntu 22/24 systemd 生命周期与 Debian 12 兼容验证。
 
 ### 9.3 历史快照与未完成项
 
 - 文档工程师早期复跑与 QA Round 3 计数均属于历史快照，已被 §9.1 B1–B4 修复候选结果取代，不作为当前结论。
 - 早期复跑使用 `npm run --ignore-scripts <suite>` 以避免重建钩子删除并重建产物；该命令边界仍只适用于对应历史证据。
-- 302.081s 与 5553.25s 失败现场均保留；最终冻结候选的连续 24h Soak 正在运行。v0.2.2 CI 多轮运行中，Linux ELF 基线修复等待最新完整轮次；最终 Linux/Windows 资产、下载后复验与 Latest 尚未完成。当前发布判定为 **NO-GO**。
+- 302.081s 与 5553.25s 失败现场均保留；最终冻结候选的连续 24h Soak 正在运行。v0.2.2 CI 全 job 已通过（运行 `44907546464`，提交 `a119b5d0772c77cd62c9058dbeb2e6ee87ac64fb`）；最终资产下载复验与 Latest 尚未完成。当前发布判定为 **NO-GO**。
 
 ## 10. 剩余可靠性风险
 
@@ -328,12 +328,12 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 
 | 项目 | 必须记录 |
 |---|---|
-| 类型与差异检查 | 最终冻结候选已通过；最终 Tag 与 CI 上的命令、退出码仍待复验 |
+| 类型与差异检查 | 最终冻结候选本机与 CI 已通过；最终 Tag 驱动 Release 轮次仍待复验 |
 | 24h Soak | 最终冻结候选连续 24h 报告、全部不变量、墙钟时长、重启/杀死、内存与队列/台账峰值 |
 | Soak/持久化阻断 | 已修复并复审通过；core 孤儿锁/durable-only/幽灵候选写序的确定性回归已通过，等待 24h 与 CI 复验 |
-| v0.2.2 CI | 运行链接、Ubuntu/Windows/真实升级/打包/systemd/Debian 各 job 结论 |
+| v0.2.2 CI | **全 job 通过**：运行 `44907546464`，提交 `a119b5d0772c77cd62c9058dbeb2e6ee87ac64fb`；最终 Tag 驱动 Release 轮次待复验 |
 | 身份迁移 | 迁移 20/20、身份 13/13、启动集成 5/5，合计 38/38；真实升级 97/97 `migrated`；最终 Tag 与 CI `upgrade-real` 待复验 |
-| 正式资产 | 既有 Windows EXE 非最终资产；最终 EXE/TGZ SHA256、版本、安装/恢复、下载复验与 Latest 待完成 |
+| 正式资产 | CI 已构建最终 EXE/TGZ 并通过版本、安装/恢复、生命周期与秘密扫描；下载 SHA256、GitHub digest 与 Latest 待完成。既有本机 Windows EXE 非最终资产 |
 | 真实平台与受限主机 | 实号、Windows 自启、Debian systemd 的实测结果或明确未覆盖说明 |
 
 最终结论以 `docs/acceptance-v0.2.2.md` 为准。

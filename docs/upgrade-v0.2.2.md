@@ -8,7 +8,7 @@
 - 主场景：v0.2.1 真实 EXE 通过 HTTP 写出的数据目录，由当前 v0.2.2 构建原地打开。
 - 兼容场景：v0.2.0 旧结构回归仍保留；本次未提供 v0.2.0 EXE，因此该场景是 fixture，不宣称真实旧版二进制验证。
 - 全局身份自动迁移：`packages/server/src/monitor/migrate.ts` 已在 `app.ts` 接到后台引擎启动前；迁移测试 20/20、身份测试 13/13、启动集成 5/5，合计 **38/38**；真实 v0.2.1 升级 **97/97 通过，`identityMigration: "migrated"`，`modelCalls=0`**。详见 §5.3。
-- 既有 Windows EXE 均完成于最终修复之前或本地重建被安全守卫阻断，已解除最终资产资格。最终 EXE 由 CI Windows job 打包，再用真实 v0.2.1 附件复验；CI `upgrade-real` 已在中间轮次通过，最终代码轮次待复验，Linux TGZ 已构建但最终扫描待通过。
+- 既有 Windows EXE 均完成于最终修复之前或本地重建被安全守卫阻断，已解除最终资产资格。最终 EXE 由 CI Windows job 打包；CI `upgrade-real` 已在全量通过轮次验证真实 v0.2.1/v0.2.0 Linux TGZ，Linux TGZ 的 ELF 基线扫描、systemd 生命周期与 Debian 12 兼容均通过。
 
 ## 2. 前置条件
 
@@ -153,18 +153,18 @@ Copy-Item -Recurse -Force "$env:LOCALAPPDATA\ai-debate" "$env:LOCALAPPDATA\ai-de
 | 当前源码包版本 | `0.2.2` |
 | 最终源码 bundle | 已重建；真实 v0.2.1 + v0.2.0 fixture 升级 97/97 通过 |
 | 历史 Windows EXE（非最终） | `AI Debate 0.2.2 (win32-x64)`；89,966,592 字节；SHA256 `adfb51128437b159ab05fd3be7377b09438887bbbfc9eaf268d21ded98f8fea2` |
-| 最终 Windows EXE | 由 CI 打包并回填 SHA256/大小/版本；本地重建被批量删除安全守卫阻断，未绕过 |
+| 最终 Windows EXE | 已由 CI 打包并通过版本、standalone/launcher 与 Node 基线秘密扫描；SHA256/大小待下载复验后回填。本地重建被批量删除安全守卫阻断，未绕过 |
 | 真实旧版 HTTP 写入 | setup=200、settings=200、两条 secrets=200、monitor=200 |
 | 模型陷阱调用数 | 0（恢复旧任务复用已有候选） |
 | v0.2.1 场景核心台账哈希 | `0c7952b50c76dd0870c8142edf1165abf7ace5dd3a94a97032783c1da67c0382` |
 | v0.2.1 凭据密文哈希 | `8ea2abe162aaeca946bacbd1add94e98807fce709c7c798506e2857230d8ea86` |
 | 全局身份迁移 | **`migrated`**；迁移 20/20、身份 13/13、启动集成 5/5，合计 38/38；真实升级 97/97 |
 | v0.2.0 兼容场景 | fixture 通过；未提供真实 v0.2.0 EXE |
-| CI `upgrade-real` | 已配置下载并校验真实 v0.2.1/v0.2.0 Linux TGZ；中间轮次已通过，最终代码轮次待复验 |
+| CI `upgrade-real` | 已配置下载并校验真实 v0.2.1/v0.2.0 Linux TGZ；全量通过轮次已运行成功 |
 
 证据边界：
 
 - 真实 v0.2.1 附件、管理员、配置、监控和加密凭据由旧 EXE 写出；核心台账、任务行、确定性游标和旧备份 manifest 是离线植入，不能算作旧版自然运行产生。
-- 97/97 升级验收使用计数器修复后的最终源码 bundle；旧 EXE 的 standalone 27/27 不能替代最终 EXE 验收。最终 EXE 与升级复验由 CI 完成后回填；CI `upgrade-real` 中间轮次已通过，最终代码轮次待复验。
+- 97/97 升级验收使用计数器修复后的最终源码 bundle；旧 EXE 的 standalone 27/27 不能替代最终 EXE 验收。最终 EXE 与升级复验由 CI 完成后回填；CI `upgrade-real` 已在全量通过轮次运行成功。
 - 没有访问真实贴吧，也没有调用真实模型；验证的是升级读写与去重，不是平台连通性或模型质量。
 - 备份 `list/verify` 通过 HTTP 验证；`restore` 在脚本中直接调用真实 `BackupService`，并检查预备快照与恢复结果。

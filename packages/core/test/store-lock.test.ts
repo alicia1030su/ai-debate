@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { syncBuiltinESMExports } from 'node:module'
 import test from 'node:test'
 
 import { DebateStore, type StoredCandidate, type StoredSession, type StoreData } from '../lib/store.js'
@@ -324,6 +325,30 @@ test('持久读等待同实例已经排队的写入，并观察到最终文档',
   assert.equal(store.hasUnsavedChanges, false)
 })
 
+test('并发持久读进入 FIFO，不在锁外互相饥饿', async (t) => {
+  const { dir, store } = makeStore(150)
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  await store.ready()
+  await store.mutate((data) => ({ ...data, sessions: [makeSession('s1', '2026-11-21T06:00:00.000Z')] }))
+  const target = store as unknown as { readCurrentDocument(): Promise<StoreData> }
+  const originalRead = target.readCurrentDocument.bind(store)
+  t.mock.method(target, 'readCurrentDocument', async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    return originalRead()
+  })
+  const reads = Array.from({ length: 20 }, () => store.readPersistedSnapshot())
+  const write = store.mutate((data) => ({
+    ...data,
+    sessions: data.sessions.map((session) => ({ ...session, statusText: 'after concurrent reads' })),
+  }))
+  const documents = await Promise.all(reads)
+  await write
+  assert.equal(documents.length, 20)
+  assert.ok(documents.every((document) => document.sessions[0]?.statusText === '等待生成'), 'FIFO 读应看到入队前的持久状态')
+  assert.equal(store.getSession('s1')?.statusText, 'after concurrent reads')
+  assert.equal(store.hasUnsavedChanges, false)
+})
+
 test('持久 thread 读取按 createdAt 降序，而不是 updatedAt', async (t) => {
   const { dir, store } = makeStore()
   t.after(() => rmSync(dir, { recursive: true, force: true }))
@@ -340,6 +365,60 @@ test('持久 thread 读取按 createdAt 降序，而不是 updatedAt', async (t)
     (await store.readPersistedSessionsForThread('thread-1')).map((session) => session.id),
     ['newer', 'older'],
   )
+})
+
+test('新鲜空锁和半写锁立即可回收，不再等待 30 秒', async (t) => {
+  for (const body of ['', '{"pid":']) {
+    const { dir, store } = makeStore(300)
+    t.after(() => rmSync(dir, { recursive: true, force: true }))
+    await store.ready()
+    writeFileSync(`${store.path}.lock`, body)
+    const started = Date.now()
+    await store.mutate((data) => ({ ...data, sessions: [makeSession('reclaimed', '2026-11-21T06:00:00.000Z')] }))
+    assert.ok(Date.now() - started < 1_000, '无效锁体必须在超时窗口内回收')
+    assert.equal(store.getSession('reclaimed')?.id, 'reclaimed')
+    assert.equal(existsSync(`${store.path}.lock`), false)
+  }
+})
+
+test('pending 残留不影响下一次获取，正常发布后 pending 被清理', async (t) => {
+  const { dir, store } = makeStore()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  await store.ready()
+  writeFileSync(`${store.path}.lock.999999.dead.pending`, '{"pid":999999}')
+  await store.mutate((data) => ({ ...data, sessions: [makeSession('pending-ok', '2026-11-21T06:00:00.000Z')] }))
+  assert.equal(store.getSession('pending-ok')?.id, 'pending-ok')
+  assert.equal(readdirSync(dir).some((name) => name.endsWith('.pending') && name.includes(`.${process.pid}.`)), false)
+})
+
+test('live lock 通过完整 pending 正文原子发布，不出现空锁窗口', async (t) => {
+  const { dir, store } = makeStore()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  await store.ready()
+  const originalLink = fs.link
+  let checked = false
+  const mockedLink = t.mock.method(fs, 'link', (async (...args: unknown[]) => {
+    const from = String(args[0])
+    const to = String(args[1])
+    if (from.endsWith('.pending') && to === `${store.path}.lock`) {
+      checked = true
+      const body = JSON.parse(readFileSync(from, 'utf8')) as { pid?: number; token?: string }
+      assert.equal(body.pid, process.pid)
+      assert.equal(typeof body.token, 'string')
+      assert.notEqual(body.token, '')
+      assert.equal(existsSync(to), false, 'link 成功前 live lock 必须不存在')
+    }
+    return Reflect.apply(originalLink, fs, args)
+  }) as typeof fs.link)
+  syncBuiltinESMExports()
+  try {
+    await store.mutate((data) => ({ ...data, sessions: [makeSession('atomic-lock', '2026-11-21T06:00:00.000Z')] }))
+    assert.equal(checked, true)
+    assert.equal(store.getSession('atomic-lock')?.id, 'atomic-lock')
+  } finally {
+    mockedLink.mock.restore()
+    syncBuiltinESMExports()
+  }
 })
 
 test('其他活进程的 token 即使很旧也绝不抢占', async (t) => {

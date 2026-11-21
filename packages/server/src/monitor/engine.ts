@@ -124,6 +124,10 @@ export function classifyFailure(error: unknown): {
   const retryAfterMs = (error as { retryAfterMs?: unknown }).retryAfterMs
   const status = (error as { status?: unknown }).status
 
+  if (code === 'write_failed' && /状态写入锁/.test(message)) {
+    return { kind: 'core_lock_timeout', retryable: true, blocksMonitor: false, message }
+  }
+
   if (typeof code === 'string') {
     if (code === 'egress_blocked') {
       return {
@@ -314,6 +318,9 @@ export class AutomationEngine {
   resume(): void {
     this.#tasks.resumeQueue()
     this.#log.info('后台挂机已恢复')
+    // An operator resuming after an upgrade expects due work to start now, not
+    // after the next scheduler heartbeat. #tick is re-entrancy guarded.
+    void this.#tick()
   }
 
   /**
@@ -580,6 +587,13 @@ export class AutomationEngine {
           this.#log.warn(`监控 ${task.monitorId} 因 ${failure.kind} 被暂停：${failure.message}`)
           return
         }
+        if (failure.kind === 'core_lock_timeout') {
+          // A core lock timeout says nothing about the model/platform outcome and
+          // can outlive the normal attempt budget after a crash. Keep the row
+          // retryable; candidate_unavailable uses the same fail-closed rule.
+          this.#tasks.retryLater(task.id, 30_000, { error: failure.message, errorKind: failure.kind })
+          return
+        }
         if (failure.retryable && attemptsLeft) {
           const delay = failure.retryAfterMs ?? backoffFor(task.attempts, failure.kind)
           this.#tasks.retryLater(task.id, delay, { error: failure.message, errorKind: failure.kind })
@@ -638,6 +652,7 @@ export class AutomationEngine {
   ): readonly { postId: string; key: string }[] {
     const wanted = new Set(freshIds)
     const claimed: { postId: string; key: string }[] = []
+    const visited = new Set<string>()
     for (const reply of replies) {
       if (!wanted.has(reply.postId)) continue
       const key = replyIdentityKey({
@@ -647,6 +662,11 @@ export class AutomationEngine {
         quality: reply.identityQuality,
         fingerprint: reply.fingerprint,
       })
+      // A page boundary or a faulty adapter can repeat the same floor in one
+      // probe. Claim it once so the analysis batch cannot contain duplicate
+      // identity keys that later misalign with postIds.
+      if (visited.has(key)) continue
+      visited.add(key)
       const result = this.#identities.claim({
         platform: monitor.platform,
         threadId: monitor.threadId,
@@ -673,8 +693,9 @@ export class AutomationEngine {
     monitor: MonitorTarget,
     claimed: readonly { postId: string; key: string }[],
   ): void {
-    const uncovered: { postId: string; key: string }[] = []
+    const uncovered = new Map<string, { postId: string; key: string }>()
     for (const entry of claimed) {
+      if (uncovered.has(entry.key)) continue
       const identity = this.#identities.get(entry.key)
       if (identity?.state === 'candidate' || identity?.state === 'ignored') continue
       const covering = this.#tasks.all().find(
@@ -683,10 +704,10 @@ export class AutomationEngine {
           (task.identityKey === entry.key || task.identityKeys?.includes(entry.key) === true),
       )
       if (covering === undefined) {
-        uncovered.push(entry)
+        uncovered.set(entry.key, entry)
         continue
       }
-      if (covering.state === 'completed' || covering.state === 'needs_review') continue
+      if (covering.state === 'completed' || covering.state === 'needs_review' || covering.state === 'running') continue
       if (covering.state === 'pending' || covering.state === 'retry_wait') {
         try {
           if (this.#tasks.appendIdentities(covering.id, [{ postId: entry.postId, identityKey: entry.key }])) continue
@@ -695,22 +716,35 @@ export class AutomationEngine {
           this.#log.warn(`补充分析批次失败：${this.#lastError}`)
         }
       }
-      // Running, failed, blocked or cancelled: this identity is not safely covered.
-      uncovered.push(entry)
+      // Failed, blocked or cancelled work no longer covers this identity. A
+      // running batch does cover the identities it captured; only identities not
+      // present in that batch reach this branch and need a separate row.
+      uncovered.set(entry.key, entry)
     }
-    if (uncovered.length === 0) return
+    if (uncovered.size === 0) return
+    const entries = [...uncovered.values()]
     // Discovery must not advance the monitor cursor unless the analysis row is
     // durable. Let write failures propagate so the probe stays running for lease
     // recovery and the next scan can retry the same fresh reply.
-    this.#tasks.enqueue({
+    const queued = this.#tasks.enqueue({
       kind: 'analyze',
       monitorId: monitor.id,
-      postId: uncovered[0]!.postId,
-      postIds: uncovered.map((entry) => entry.postId),
-      identityKey: uncovered[0]!.key,
-      identityKeys: uncovered.map((entry) => entry.key),
-      dedupeKey: `analyze:${uncovered[0]!.key}`,
+      postId: entries[0]!.postId,
+      postIds: entries.map((entry) => entry.postId),
+      identityKey: entries[0]!.key,
+      identityKeys: entries.map((entry) => entry.key),
+      dedupeKey: `analyze:${entries[0]!.key}`,
     })
+    // A non-recurring enqueue may return an existing row with the same dedupe
+    // key. That is only safe when the returned row covers every identity in this
+    // batch; otherwise the cursor would advance past silently dropped replies.
+    const covered = new Set<string>()
+    if (queued.task.identityKey !== undefined) covered.add(queued.task.identityKey)
+    for (const key of queued.task.identityKeys ?? []) covered.add(key)
+    const missing = entries.filter((entry) => !covered.has(entry.key))
+    if (missing.length > 0) {
+      throw new Error(`分析任务未覆盖全部新回复身份：${missing.map((entry) => entry.key).join(', ')}`)
+    }
   }
 
   /**

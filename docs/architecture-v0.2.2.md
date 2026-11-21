@@ -108,8 +108,8 @@ sequenceDiagram
   E->>A: probe(tail)
   A-->>E: replies + fingerprints + scan.complete
   E->>I: 先持久化全局身份 claim
-  E->>M: applyScan() 同一次写入 seen/指纹/游标
   E->>T: 批量 analyze 任务（identityKeys）
+  E->>M: applyScan() 同一次写入 seen/指纹/游标
   E->>A: analyze(thread)
   A-->>E: sessionId
   E->>T: 每条身份一个 generate 任务
@@ -152,7 +152,7 @@ fallback:<platform>:<threadId>:sha256(规范化内容)
 
 贴吧楼层与楼中楼暴露持久 post id，使用 `stable`；其他适配器只有经验证后才能声明稳定 ID，否则使用 `fallback`。fallback 不能区分编辑与新回复，这一限制由 `identityQuality` 明确表达。
 
-身份状态为 `claimed → candidate | ignored`。身份 claim 先于监控游标持久化：若两次写入之间崩溃，orphan sweep 能重新排入分析；若任务已存在，持久任务键阻止重复。第二个监控看到同一回复时得到同一身份与 `fresh:false`。
+身份状态为 `claimed → candidate | ignored`。新回复的持久顺序是 identity → analysis task → monitor cursor：身份 claim 先落盘，分析任务随后落盘，最后才推进 seen/指纹/游标。任务写入失败时本次扫描直接失败，游标不得推进，探针任务保留 running 并交给租约恢复；若身份已写而任务缺失，orphan sweep 能重新排入分析。若任务已存在，持久任务键阻止重复。第二个监控看到同一回复时得到同一身份与 `fresh:false`。
 
 启动时，`migrateLegacyReplyIdentities()` 在引擎观察监控前从 v0.2.1 的 `seen`、游标指纹、任务与核心候选重建身份。身份文件不存在时原子创建；已存在时不覆盖新证据；旧任务缺 key 时可幂等回填。`state.json` 损坏、监控/会话上下文冲突、非法候选、未知任务 kind 或多个已批准候选冲突时迁移熔断，不写出不完整身份或回填任务，也不写迁移完成标记。持久完成标记让同源重启无写入，源变化只做安全增量。身份或监控源台账不可读时，服务与 `/healthz` 保持可用，但自动化与核心/手工分析接口熔断并报告 `identityMigrationError`，避免以空身份栅栏重放旧回复。
 
@@ -285,8 +285,8 @@ Linux 路径策略将 prefix 限制在 `/opt/ai-debate` 或 `/usr/local/ai-debat
 | v0.2.1 → v0.2.2 全局身份自动迁移 | **已接线并通过**。迁移 20/20、身份 13/13、启动集成 5/5，合计 38/38；真实升级 97/97（`migrated`，`modelCalls=0`） | 最终候选测试结果与 CI `upgrade-real` 链接 |
 | 24 小时 Soak | 最终冻结候选于 UTC `2026-11-21T12:05:15.222Z` 启动，`monitors=1000`、`seed=1`、`kill-every=300`、`seconds=86400`；状态目录 `.tmp-data/soak-v022-continuous-final-20261121T120304Z/`。**正在运行，尚无最终报告** | 连续 24h 报告、墙钟时长、重启/杀死、不变量、峰值与结论 |
 | Soak/持久化发布阻断 | **已修复并复审通过**。durable-only 候选证据、同 PID 孤儿锁回收、token CAS release、幽灵候选无模型收敛、unavailable fail-closed、identity-before-task 写序、恢复候选不重复计数、identity → analysis task → cursor 发现写序 | 最终 24h Soak 与 CI 复验 |
-| v0.2.2 CI | **多轮运行中**；三平台 Test、Windows 打包、真实升级、短 Soak 已通过，Linux ELF 基线修复等待最新完整轮次 | 各 job 结果、运行链接、失败项与复验结果 |
-| 正式 EXE/TGZ | 既有 Windows EXE 为最终修复前资产，已解除资格；Linux TGZ 已构建但最终扫描/生命周期待最新 CI | 最终双平台 SHA256、`--version`、安装/生命周期、下载后复验、Latest 校验 |
+| v0.2.2 CI | **全 job 通过**：运行 `44907546464`，提交 `a119b5d0772c77cd62c9058dbeb2e6ee87ac64fb` | 最终 Tag 与 Release 工作流复验 |
+| 正式 EXE/TGZ | CI 已构建最终双平台资产并通过版本、standalone/launcher、Node 基线秘密扫描、Ubuntu 22/24 systemd 生命周期与 Debian 12 兼容；既有本机 Windows EXE 为最终修复前资产，已解除资格 | 下载后 SHA256、GitHub digest、安装/恢复复验与 Latest 校验 |
 | 真实贴吧/微博账号 | 未验证 | 实号只读/限流/认证/嵌套读取结果；未验证能力继续保持 unavailable |
 | Windows 注册表自启 | launcher 1/1 通过，但注册表自启被本机安全策略阻断，未计通过 | 可写主机上的开启/关闭/重启结果 |
 | Debian systemd | 仅计划二进制兼容与无 init 安装验证 | Debian 12 真实 systemd 生命周期结果，或明确接受未覆盖 |

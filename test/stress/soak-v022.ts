@@ -42,7 +42,7 @@ import {
 } from '../support/soak-faults.ts'
 
 const PLATFORM = 'faketieba'
-const STATE_VERSION = 1 as const
+const STATE_VERSION = 2 as const
 const MAX_HEAP_MB = 512
 const MAX_THREAD_REPLIES = 12
 const MONITOR_INTERVAL_SEC = 2 * 24 * 60 * 60
@@ -73,6 +73,8 @@ export interface SoakOptions {
   readonly scanBatch: number
   readonly scanEveryMs: number
   readonly capacity: number
+  readonly maxTickActiveMs: number
+  readonly drainTimeoutMs: number
   readonly platformFaultChance: number
   readonly modelFaultChance: number
   readonly diskFaultChance: number
@@ -120,6 +122,12 @@ export interface SoakState {
   retries: number
   restarts: number
   kills: number
+  activeMs: number
+  maxTickActiveMs: number
+  readonly tickActiveLimitMs: number
+  readonly drainTimeoutMs: number
+  drainSeconds: number
+  drainTimedOut: boolean
   peakQueue: number
   peakLedger: number
   duplicateCandidates: number
@@ -179,6 +187,8 @@ export interface SoakReport {
   readonly wallClockSeconds: number
   readonly cumulativeSeconds: number
   readonly requestedSeconds: number
+  readonly killEverySeconds: number
+  readonly noKill: boolean
   readonly resumed: boolean
   readonly resumedAfterFailure: boolean
   readonly monitors: number
@@ -196,6 +206,12 @@ export interface SoakReport {
   readonly retries: number
   readonly restarts: number
   readonly kills: number
+  readonly activeSeconds: number
+  readonly maxTickActiveMs: number
+  readonly tickActiveLimitMs: number
+  readonly drainTimeoutMs: number
+  readonly drainSeconds: number
+  readonly drainTimedOut: boolean
   readonly memoryPeakMb: number
   readonly heapFinalMb: number
   readonly cpuUsage: { userMicros: number; systemMicros: number; percent: number }
@@ -348,7 +364,7 @@ function parseArguments(argv: readonly string[]): SoakOptions {
   const known = new Set([
     'seconds', 'deadline', 'monitors', 'interval-ms', 'seed', 'state-file', 'resume', 'kill-every',
     'no-kill', 'report', 'threads', 'reply-every-ms', 'scan-batch', 'scan-every-ms',
-    'capacity', 'platform-fault-chance', 'model-fault-chance', 'disk-fault-chance',
+    'capacity', 'max-tick-active-ms', 'drain-timeout-ms', 'platform-fault-chance', 'model-fault-chance', 'disk-fault-chance',
     'backlog-fault-chance', 'duplicate-reply-chance', 'disk-store', 'acknowledge-failures', 'no-faults', 'self-test',
   ])
   for (const name of new Set([...values.keys(), ...flags])) {
@@ -372,6 +388,8 @@ function parseArguments(argv: readonly string[]): SoakOptions {
     scanBatch: Math.min(monitors, number('scan-batch', shortRun ? Math.min(8, monitors) : 1, 1, true)),
     scanEveryMs: number('scan-every-ms', shortRun ? intervalMs : 10_000, 10, true),
     capacity: Math.max(50, Math.min(20_000, number('capacity', Math.max(1_500, monitors + 500), 50, true))),
+    maxTickActiveMs: number('max-tick-active-ms', 15_000, 250, true),
+    drainTimeoutMs: number('drain-timeout-ms', 300_000, 250, true),
     platformFaultChance: noFaults ? 0 : probability('platform-fault-chance', 0.08),
     modelFaultChance: noFaults ? 0 : probability('model-fault-chance', 0.12),
     diskFaultChance: noFaults ? 0 : probability('disk-fault-chance', 0.01),
@@ -392,6 +410,8 @@ export function createSoakState(input: {
   monitors: number
   threads: number
   capacity: number
+  maxTickActiveMs: number
+  drainTimeoutMs: number
   replyEveryMs: number
   scanBatch: number
   scanEveryMs: number
@@ -409,6 +429,12 @@ export function createSoakState(input: {
     retries: 0,
     restarts: 0,
     kills: 0,
+    activeMs: 0,
+    maxTickActiveMs: 0,
+    tickActiveLimitMs: input.maxTickActiveMs,
+    drainTimeoutMs: input.drainTimeoutMs,
+    drainSeconds: 0,
+    drainTimedOut: false,
     peakQueue: 0,
     peakLedger: 0,
     duplicateCandidates: 0,
@@ -470,19 +496,25 @@ export function loadSoakState(file: string): SoakState {
   if (parsed.version !== STATE_VERSION) throw new Error(`不认识的 soak 状态版本：${String(parsed.version)}`)
   const requiredNumbers = [
     'iterations', 'scans', 'analyses', 'generations', 'failures', 'retries', 'restarts',
-    'kills', 'peakQueue', 'peakLedger', 'duplicateCandidates', 'lostTasks',
+    'kills', 'activeMs', 'maxTickActiveMs', 'tickActiveLimitMs', 'drainTimeoutMs', 'drainSeconds', 'peakQueue', 'peakLedger', 'duplicateCandidates', 'lostTasks',
     'cursorRegressions', 'completedTaskReexecutions', 'unrecordedInterruptions',
     'unhandledErrors', 'memoryPeakMb', 'seed', 'monitors', 'threads', 'capacity',
   ] as const
   for (const key of requiredNumbers) {
-    if (typeof parsed[key] !== 'number' || !Number.isFinite(parsed[key])) {
-      throw new Error(`soak 状态字段 ${key} 缺失或不是数字`)
+    if (typeof parsed[key] !== 'number' || !Number.isFinite(parsed[key]) || parsed[key] < 0) {
+      throw new Error(`soak 状态字段 ${key} 缺失、不是数字或为负数`)
     }
+  }
+  if (parsed.tickActiveLimitMs! < 250) throw new Error('soak tick active 上限无效')
+  if (parsed.drainTimeoutMs! < 250) throw new Error('soak 排空超时上限无效')
+  if (parsed.maxTickActiveMs! > parsed.tickActiveLimitMs!) {
+    throw new Error('soak maxTickActiveMs 超过持久上限')
   }
   for (const key of ['startedAt', 'lastTickAt', 'dataDir'] as const) {
     if (typeof parsed[key] !== 'string') throw new Error(`soak 状态字段 ${key} 缺失`)
   }
   if (typeof parsed.completed !== 'boolean') throw new Error('soak 状态字段 completed 缺失')
+  if (typeof parsed.drainTimedOut !== 'boolean') throw new Error('soak 状态字段 drainTimedOut 缺失')
   if (!Array.isArray(parsed.threadStates) || !Array.isArray(parsed.invariantFailures)) {
     throw new Error('soak 状态的 threadStates / invariantFailures 结构不正确')
   }
@@ -892,13 +924,23 @@ function makeProductApi(
       }
     },
     session: async (sessionId: string) => {
-      const session = await context.store.readPersistedSession(sessionId)
-      return session === undefined ? undefined : summarizeSession(session)
+      try {
+        const session = await context.store.readPersistedSession(sessionId)
+        return session === undefined ? undefined : summarizeSession(session)
+      } catch (error) {
+        recordCoreLockTimeout(context, error, 'session')
+        throw error
+      }
     },
     sessionForThread: async (url: string) => {
-      const threadId = url.split('/').pop() ?? ''
-      const session = (await context.store.readPersistedSessionsForThread(threadId))[0]
-      return session === undefined ? undefined : summarizeSession(session)
+      try {
+        const threadId = url.split('/').pop() ?? ''
+        const session = (await context.store.readPersistedSessionsForThread(threadId))[0]
+        return session === undefined ? undefined : summarizeSession(session)
+      } catch (error) {
+        recordCoreLockTimeout(context, error, 'sessionForThread')
+        throw error
+      }
     },
     ownerIdentity: () => ({ handle: 'owner-handle', userName: '楼主' }),
   }
@@ -909,6 +951,23 @@ function addInvariantFailure(state: SoakState, message: string): void {
     state.invariantFailures.push(message)
     state.invariantFailures = state.invariantFailures.slice(-30)
   }
+}
+
+/**
+ * Account for one scheduler tick. Normal cadence (including its bounded sleep)
+ * counts as active; a stalled tick is capped and fails the run. On resume the
+ * caller must pass the new child process start time, never the previous
+ * process's persisted lastTickAt, so supervisor downtime is excluded.
+ */
+export function recordTickActive(state: SoakState, previousTickAt: number, now = Date.now()): boolean {
+  const delta = Math.max(0, now - previousTickAt)
+  state.activeMs += Math.min(delta, state.tickActiveLimitMs)
+  state.maxTickActiveMs = Math.max(state.maxTickActiveMs, delta)
+  if (delta > state.tickActiveLimitMs) {
+    addInvariantFailure(state, `单 tick 间隔 ${delta}ms 超过 active 上限 ${state.tickActiveLimitMs}ms`)
+    return false
+  }
+  return true
 }
 
 export async function inspectInvariants(context: SoakContext, allowTransientLostTasks = false): Promise<InvariantResult> {
@@ -1063,6 +1122,7 @@ export async function inspectInvariants(context: SoakContext, allowTransientLost
   if (tasks.queuedCount() > tasks.capacity) failures.push(`待执行队列 ${tasks.queuedCount()} 超过容量 ${tasks.capacity}`)
   if (state.memoryPeakMb > MAX_HEAP_MB) failures.push(`堆峰值 ${state.memoryPeakMb.toFixed(1)} MB 超过 ${MAX_HEAP_MB} MB`)
   if (state.unhandledErrors > 0) failures.push(`发生 ${state.unhandledErrors} 个未处理异常`)
+  if (state.coreLockTimeouts > 0) failures.push(`发生 ${state.coreLockTimeouts} 次 core 状态锁超时`)
   if (state.unrecordedInterruptions > 0) failures.push(`${state.unrecordedInterruptions} 个中断任务没有恢复记录`)
   if (state.storeCorruptions > 0) failures.push(`检测到 ${state.storeCorruptions} 次 store 损坏`)
   if (stuckIdentity > 0) failures.push(`${stuckIdentity} 个身份的覆盖任务已终态但仍未收敛`)
@@ -1085,6 +1145,40 @@ export async function inspectInvariants(context: SoakContext, allowTransientLost
   return { duplicateCandidates, lostTasks, convergenceLag, stuckIdentity, authBlockedIdentity, cursorRegressions, completedTaskReexecutions, failures }
 }
 
+/** Derive every PASS gate from the same live ledgers used to build the report. */
+function invariantsOf(context: Pick<SoakContext, 'state' | 'tasks' | 'engine'>): Record<string, boolean> {
+  const { state, tasks, engine } = context
+  const engineStatus = engine.status()
+  return {
+    uniqueReplyCandidates: state.duplicateCandidates === 0,
+    completedTasksNotReexecuted: state.completedTaskReexecutions === 0,
+    cursorNeverRegresses: state.cursorRegressions === 0,
+    interruptedTasksRecorded: state.unrecordedInterruptions === 0,
+    queueWithinCapacity: state.peakQueue <= state.capacity,
+    heapWithinThreshold: state.memoryPeakMb <= MAX_HEAP_MB,
+    noUnhandledErrors: state.unhandledErrors === 0,
+    noCoreLockTimeouts: state.coreLockTimeouts === 0,
+    noLostTasks: state.lostTasks === 0,
+    noStuckIdentity: state.stuckIdentity === 0,
+    noIdentityLedgerDrift: state.duplicateCandidates === 0
+      && state.lostTasks === 0
+      && state.convergenceLag === 0
+      && state.stuckIdentity === 0,
+    noTaskLedgerDrift: state.completedTaskReexecutions === 0
+      && state.cursorRegressions === 0
+      && state.unrecordedInterruptions === 0,
+    noStoreCorruption: state.storeCorruptions === 0,
+    diskFailuresDegraded: state.undegradedDiskSessions === 0,
+    activeTicksWithinLimit: state.maxTickActiveMs <= state.tickActiveLimitMs,
+    drainConverged: !state.drainTimedOut
+      && state.drainSeconds <= state.drainTimeoutMs
+      && tasks.queuedCount() === 0
+      && tasks.runningCount() === 0
+      && engineStatus.queued === 0
+      && engineStatus.runningTasks === 0,
+  }
+}
+
 function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'failed'): SoakReport {
   const { state, options, faults, tasks, identities, engine, model, monitors, threads } = context
   const endedAt = new Date(endedAtMs).toISOString()
@@ -1094,19 +1188,7 @@ function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'f
   const byThread = new Map<string, number>()
   for (const monitor of monitors.list()) byThread.set(monitor.threadId, (byThread.get(monitor.threadId) ?? 0) + 1)
   const queue = tasks.stats(Date.now())
-  const invariants: Record<string, boolean> = {
-    uniqueReplyCandidates: state.duplicateCandidates === 0,
-    completedTasksNotReexecuted: state.completedTaskReexecutions === 0,
-    cursorNeverRegresses: state.cursorRegressions === 0,
-    interruptedTasksRecorded: state.unrecordedInterruptions === 0,
-    queueWithinCapacity: state.peakQueue <= state.capacity,
-    heapWithinThreshold: state.memoryPeakMb <= MAX_HEAP_MB,
-    noUnhandledErrors: state.unhandledErrors === 0,
-    noLostTasks: state.lostTasks === 0,
-    noStuckIdentity: state.stuckIdentity === 0,
-    noStoreCorruption: state.storeCorruptions === 0,
-    diskFailuresDegraded: state.undegradedDiskSessions === 0,
-  }
+  const invariants = invariantsOf(context)
   return {
     schemaVersion: 1,
     tool: 'soak-v022',
@@ -1117,6 +1199,8 @@ function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'f
     wallClockSeconds: Number(wallClockSeconds.toFixed(3)),
     cumulativeSeconds: Number(cumulativeSeconds.toFixed(3)),
     requestedSeconds: options.seconds,
+    killEverySeconds: options.killEvery,
+    noKill: options.noKill,
     resumed: state.restarts > 0,
     resumedAfterFailure: options.resume && options.acknowledgeFailures,
     monitors: state.monitors,
@@ -1134,6 +1218,12 @@ function reportOf(context: SoakContext, endedAtMs: number, status: 'passed' | 'f
     retries: state.retries,
     restarts: state.restarts,
     kills: state.kills,
+    activeSeconds: Number((state.activeMs / 1000).toFixed(3)),
+    maxTickActiveMs: state.maxTickActiveMs,
+    tickActiveLimitMs: state.tickActiveLimitMs,
+    drainTimeoutMs: state.drainTimeoutMs,
+    drainSeconds: Number((state.drainSeconds / 1000).toFixed(3)),
+    drainTimedOut: state.drainTimedOut,
     memoryPeakMb: Number(state.memoryPeakMb.toFixed(2)),
     heapFinalMb: Number((process.memoryUsage().heapUsed / 1_048_576).toFixed(2)),
     cpuUsage: {
@@ -1218,6 +1308,8 @@ function valuesOf(options: SoakOptions, name: string): number | undefined {
     case 'monitors': return options.monitors
     case 'threads': return options.threads
     case 'capacity': return options.capacity
+    case 'max-tick-active-ms': return options.maxTickActiveMs
+    case 'drain-timeout-ms': return options.drainTimeoutMs
     case 'reply-every-ms': return options.replyEveryMs
     case 'scan-batch': return options.scanBatch
     case 'scan-every-ms': return options.scanEveryMs
@@ -1241,6 +1333,8 @@ async function buildContext(options: SoakOptions): Promise<SoakContext> {
       ['monitors', state.monitors],
       ['threads', state.threads],
       ['capacity', state.capacity],
+      ['max-tick-active-ms', state.tickActiveLimitMs],
+      ['drain-timeout-ms', state.drainTimeoutMs],
       ['reply-every-ms', state.replyEveryMs],
       ['scan-batch', state.scanBatch],
       ['scan-every-ms', state.scanEveryMs],
@@ -1255,6 +1349,8 @@ async function buildContext(options: SoakOptions): Promise<SoakContext> {
       monitors: state.monitors,
       threads: state.threads,
       capacity: state.capacity,
+      maxTickActiveMs: state.tickActiveLimitMs,
+      drainTimeoutMs: state.drainTimeoutMs,
       replyEveryMs: state.replyEveryMs,
       scanBatch: state.scanBatch,
       scanEveryMs: state.scanEveryMs,
@@ -1283,6 +1379,8 @@ async function buildContext(options: SoakOptions): Promise<SoakContext> {
       monitors: options.monitors,
       threads: options.threads,
       capacity: options.capacity,
+      maxTickActiveMs: options.maxTickActiveMs,
+      drainTimeoutMs: options.drainTimeoutMs,
       replyEveryMs: options.replyEveryMs,
       scanBatch: options.scanBatch,
       scanEveryMs: options.scanEveryMs,
@@ -1295,6 +1393,8 @@ async function buildContext(options: SoakOptions): Promise<SoakContext> {
     state.monitors !== options.monitors ||
     state.threads !== options.threads ||
     state.capacity !== options.capacity ||
+    state.tickActiveLimitMs !== options.maxTickActiveMs ||
+    state.drainTimeoutMs !== options.drainTimeoutMs ||
     state.replyEveryMs !== options.replyEveryMs ||
     state.scanBatch !== options.scanBatch ||
     state.scanEveryMs !== options.scanEveryMs
@@ -1313,7 +1413,8 @@ async function buildContext(options: SoakOptions): Promise<SoakContext> {
   }
   const faults = options.resume ? FaultInjector.restore(state.faults, faultOptions) : new FaultInjector(faultOptions)
   faults.armKillSchedule(nowMs)
-  if (options.resume) state.restarts += 1
+  // The supervisor owns restart accounting. Counting here as well double-counted
+  // every resume and made kills != restarts in otherwise valid reports.
   state.faults = faults.snapshot()
   mkdirSync(state.dataDir, { recursive: true })
   state.recoveredDiskBlockers += DiskWriteFault.recover(state.dataDir)
@@ -1499,6 +1600,9 @@ async function runSoak(options: SoakOptions): Promise<void> {
     const shortRunGraceDeadline = options.deadline === undefined && options.seconds <= 10 ? deadline + 5_000 : deadline
     lastScanAt = context.startedAtMs - options.scanEveryMs
     lastPruneAt = context.startedAtMs
+    // Node startup is active initialization, not supervisor downtime. Including
+    // it prevents planned restarts from silently shrinking the active budget.
+    let previousTickAt = context.startedAtMs - process.uptime() * 1_000
 
     while (
       Date.now() < deadline ||
@@ -1506,6 +1610,8 @@ async function runSoak(options: SoakOptions): Promise<void> {
     ) {
       if (fatalError !== undefined) break
       const now = Date.now()
+      if (!recordTickActive(state, previousTickAt, now)) break
+      previousTickAt = now
       state.iterations += 1
 
       if (now < deadline && now >= state.nextReplyAt) {
@@ -1728,7 +1834,10 @@ async function runSoak(options: SoakOptions): Promise<void> {
 
       persistThreads(state, threads)
       state.faults = faults.snapshot()
-      state.lastTickAt = new Date().toISOString()
+      const tickEndedAt = Date.now()
+      if (!recordTickActive(state, previousTickAt, tickEndedAt)) break
+      previousTickAt = tickEndedAt
+      state.lastTickAt = new Date(tickEndedAt).toISOString()
       const safeForKill =
         activeDisk === undefined &&
         Date.now() + options.killEvery * 1_000 < deadline
@@ -1785,11 +1894,56 @@ async function runSoak(options: SoakOptions): Promise<void> {
       state.operatorResumes += 1
       backlogUntil = 0
     }
-    await engine.tick()
+    if (tasks.paused) tasks.resumeQueue()
+
+    // The loop may finish its final bounded sleep exactly at the deadline, so no
+    // subsequent iteration exists to account for that tail. Capture it before
+    // drain starts; otherwise a valid run can finish just under requestedSeconds.
+    const loadEndedAt = Date.now()
+    recordTickActive(state, previousTickAt, loadEndedAt)
+    previousTickAt = loadEndedAt
+
+    // The requested soak window is over. Stop creating work and let the already
+    // discovered pipeline converge. A PASS with pending/running/retry_wait rows
+    // would only prove that the clock expired, not that the ledger converged.
+    const drainStartedAt = Date.now()
+    while (fatalError === undefined) {
+      await engine.tick()
+      const tickEndedAt = Date.now()
+      if (!recordTickActive(state, previousTickAt, tickEndedAt)) break
+      previousTickAt = tickEndedAt
+      state.drainSeconds = tickEndedAt - drainStartedAt
+      state.lastTickAt = new Date(tickEndedAt).toISOString()
+      const engineStatus = engine.status()
+      const idle = tasks.queuedCount() === 0
+        && tasks.runningCount() === 0
+        && engineStatus.queued === 0
+        && engineStatus.runningTasks === 0
+      const timedOut = !idle && state.drainSeconds >= options.drainTimeoutMs
+      if (timedOut) {
+        state.drainTimedOut = true
+        addInvariantFailure(state, `截止后 ${options.drainTimeoutMs}ms 内队列仍未收敛：queued=${tasks.queuedCount()} running=${tasks.runningCount()} engineRunningTasks=${engineStatus.runningTasks}`)
+      }
+      saveSoakState(context.stateFile, state)
+      if (idle || timedOut) break
+      await sleep(Math.min(options.intervalMs, options.drainTimeoutMs - state.drainSeconds))
+    }
     await engine.stop()
-    await inspectInvariants(context)
+    const finalInvariants = await inspectInvariants(context)
+    if (finalInvariants.lostTasks > 0) {
+      addInvariantFailure(state, `截止后仍有 ${finalInvariants.lostTasks} 个已发现回复缺少身份或任务记录`)
+    }
+    if (finalInvariants.convergenceLag > 0) {
+      addInvariantFailure(state, `截止后仍有 ${finalInvariants.convergenceLag} 个身份未收敛`)
+    }
+    for (const [name, passed] of Object.entries(invariantsOf(context))) {
+      if (!passed) addInvariantFailure(state, `最终不变量 ${name} 不为 true`)
+    }
+    recordTickActive(state, previousTickAt, Date.now())
     if (fatalError !== undefined) addInvariantFailure(state, fatalError)
-    state.completed = state.invariantFailures.length === 0 && fatalError === undefined
+    state.completed = state.invariantFailures.length === 0
+      && fatalError === undefined
+      && Object.values(invariantsOf(context)).every(Boolean)
     state.lastTickAt = new Date().toISOString()
     if (!state.completed) state.stoppedAt ??= state.lastTickAt
     state.faults = faults.snapshot()
@@ -1836,6 +1990,8 @@ async function runSoak(options: SoakOptions): Promise<void> {
         wallClockSeconds: 0,
         cumulativeSeconds: 0,
         requestedSeconds: options.seconds,
+        killEverySeconds: options.killEvery,
+        noKill: options.noKill,
         resumed: options.resume,
         resumedAfterFailure: options.resume && options.acknowledgeFailures,
         monitors: options.monitors,
@@ -1853,6 +2009,12 @@ async function runSoak(options: SoakOptions): Promise<void> {
         retries: 0,
         restarts: 0,
         kills: 0,
+        activeSeconds: 0,
+        maxTickActiveMs: 0,
+        tickActiveLimitMs: options.maxTickActiveMs,
+        drainTimeoutMs: options.drainTimeoutMs,
+        drainSeconds: 0,
+        drainTimedOut: false,
         memoryPeakMb: 0,
         heapFinalMb: Number((process.memoryUsage().heapUsed / 1_048_576).toFixed(2)),
         cpuUsage: { userMicros: 0, systemMicros: 0, percent: 0 },
@@ -1927,6 +2089,7 @@ export async function runSoakSelfTests(): Promise<void> {
         monitors: 20,
         threads: 4,
         capacity: 1_500,
+        maxTickActiveMs: 15_000, drainTimeoutMs: 300_000,
         replyEveryMs: 500,
         scanBatch: 20,
         scanEveryMs: 250,
@@ -1936,6 +2099,7 @@ export async function runSoakSelfTests(): Promise<void> {
       state.scans = 73
       state.generations = 9
       state.authBlockedIdentity = 2
+      state.drainSeconds = 1_234
       state.completed = false
       saveSoakState(file, state)
       const restored = loadSoakState(file)
@@ -1943,10 +2107,73 @@ export async function runSoakSelfTests(): Promise<void> {
       assert.equal(restored.scans, 73)
       assert.equal(restored.generations, 9)
       assert.equal(restored.authBlockedIdentity, 2)
+      assert.equal(restored.drainTimeoutMs, 300_000)
+      assert.equal(restored.drainSeconds, 1_234)
+      assert.equal(restored.drainTimedOut, false)
       assert.equal(restored.completed, false)
       restored.iterations += 1
       saveSoakState(file, restored)
       assert.equal(loadSoakState(file).iterations, 42)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('soak v2 active：按 tick 累计、设上限，超限即失败', () => {
+    const state = createSoakState({
+      startedAt: '2026-01-01T00:00:00.000Z',
+      now: Date.parse('2026-01-01T00:00:00.000Z'),
+      seed: 7,
+      dataDir: '/tmp/soak-active',
+      monitors: 1,
+      threads: 1,
+      capacity: 1_500,
+      maxTickActiveMs: 1_000,
+      drainTimeoutMs: 300_000,
+      replyEveryMs: 500,
+      scanBatch: 1,
+      scanEveryMs: 250,
+      faults: new FaultInjector({ seed: 7 }).snapshot(),
+    })
+    assert.equal(recordTickActive(state, 0, 400), true)
+    assert.equal(recordTickActive(state, 400, 1_200), true)
+    assert.equal(state.activeMs, 1_200)
+    assert.equal(state.maxTickActiveMs, 800)
+    assert.equal(recordTickActive(state, 1_200, 2_600), false)
+    assert.equal(state.activeMs, 2_200, '超限部分不得计入 active')
+    assert.equal(state.maxTickActiveMs, 1_400)
+    assert.match(state.invariantFailures.at(-1) ?? '', /超过 active 上限/)
+  })
+
+  test('soak v2 拒绝恢复缺少 active 字段的旧状态', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ai-debate-soak-v1-reject-'))
+    try {
+      const file = join(dir, 'state.json')
+      writeFileSync(file, JSON.stringify({ version: 1, startedAt: '2026-01-01T00:00:00.000Z' }))
+      assert.throws(() => loadSoakState(file), /状态版本/)
+      const state = createSoakState({
+        startedAt: '2026-01-01T00:00:00.000Z',
+        now: Date.parse('2026-01-01T00:00:00.000Z'),
+        seed: 7,
+        dataDir: join(dir, 'data'),
+        monitors: 1,
+        threads: 1,
+        capacity: 1_500,
+        maxTickActiveMs: 1_000,
+        drainTimeoutMs: 300_000,
+        replyEveryMs: 500,
+        scanBatch: 1,
+        scanEveryMs: 250,
+        faults: new FaultInjector({ seed: 7 }).snapshot(),
+      })
+      const { activeMs: _activeMs, maxTickActiveMs: _maxTickActiveMs, tickActiveLimitMs: _limit, ...withoutActive } = state
+      writeFileSync(file, JSON.stringify({ ...withoutActive, version: 2 }))
+      assert.throws(() => loadSoakState(file), /activeMs 缺失/)
+      const { drainTimeoutMs: _drainTimeoutMs, ...withoutDrainTimeout } = state
+      writeFileSync(file, JSON.stringify({ ...withoutDrainTimeout, version: 2 }))
+      assert.throws(() => loadSoakState(file), /drainTimeoutMs 缺失/)
+      writeFileSync(file, JSON.stringify({ ...state, version: 2, drainTimeoutMs: 0 }))
+      assert.throws(() => loadSoakState(file), /排空超时上限无效/)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -1978,6 +2205,7 @@ export async function runSoakSelfTests(): Promise<void> {
         monitors: 1,
         threads: 1,
         capacity: 1_500,
+        maxTickActiveMs: 15_000, drainTimeoutMs: 300_000,
         replyEveryMs: 500,
         scanBatch: 1,
         scanEveryMs: 250,
@@ -2122,6 +2350,7 @@ export async function runSoakSelfTests(): Promise<void> {
       monitors: 1,
       threads: 1,
       capacity: 1_500,
+      maxTickActiveMs: 15_000, drainTimeoutMs: 300_000,
       replyEveryMs: 500,
       scanBatch: 1,
       scanEveryMs: 250,
@@ -2194,7 +2423,10 @@ export async function runSoakSelfTests(): Promise<void> {
     tasks.load()
     identities.load()
     const monitorA = monitors.create({ name: 'A', url: urlA }, { platform: PLATFORM, threadId: 't1' })
-    const monitorB = monitors.create({ name: 'B', url: urlB }, { platform: PLATFORM, threadId: 't1' })
+    // B is driven explicitly below. If its scheduler probe runs first it records
+    // r1/r2 before A owns them, and the test no longer exercises the mixed
+    // old-running-identity + new-identity batch that used to lose r3.
+    const monitorB = monitors.create({ name: 'B', url: urlB, enabled: false }, { platform: PLATFORM, threadId: 't1' })
     const baselineFingerprint = fingerprintOf({
       kind: 'floor',
       authorId: baseline.authorId,
@@ -2284,6 +2516,7 @@ export async function runSoakSelfTests(): Promise<void> {
       await tickUntil(() => analysisStarted && tasks.runningCount() === 1)
       const firstBatch = tasks.all().find((task) => task.kind === 'analyze' && task.state === 'running')
       assert.ok(firstBatch !== undefined, 'A 的分析批次应处于运行中')
+      assert.deepEqual(monitors.get(monitorB.id)?.seen, [baseline.postId], 'B 不得提前自动记录 r1/r2')
       repliesB.push(r3)
       tasks.enqueue({ kind: 'probe', monitorId: monitorB.id, dedupeKey: `probe:${monitorB.id}` })
       const r3Key = replyIdentityKey({
@@ -2303,6 +2536,8 @@ export async function runSoakSelfTests(): Promise<void> {
       assert.ok(covering !== undefined, 'r3 必须被分析批次覆盖，不能成为 orphan')
       assert.notEqual(covering.id, firstBatch.id, '运行中的第一批不能吞掉 r3')
       assert.equal(firstBatch.identityKeys?.includes(r3Key) ?? false, false)
+      assert.deepEqual(covering.identityKeys, [r3Key], '第二批只能包含尚未覆盖的 r3')
+      assert.deepEqual(covering.postIds, [r3.postId])
 
       releaseFirst('session-a')
       await tickUntil(() => identities.get(r3Key)?.state === 'candidate' && generatedTargets.length === 3)

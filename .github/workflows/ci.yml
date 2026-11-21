@@ -57,6 +57,15 @@ jobs:
       - name: Secret scanner regression tests
         shell: bash
         run: npm run test:secrets
+      - name: Soak supervisor fail-closed regressions
+        shell: bash
+        run: npm run test:soak-supervisor
+      - name: Release sign-off verifier regressions
+        shell: bash
+        run: npm run test:release-signoff
+      - name: Resumable soak harness self-tests
+        shell: bash
+        run: npm run test:soak:v022
       - name: End-to-end acceptance
         shell: bash
         run: node --experimental-transform-types test/acceptance/standalone.ts
