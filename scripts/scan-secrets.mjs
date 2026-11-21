@@ -5,9 +5,12 @@
  *   - no target: scan tracked files (CI on every push).
  *   - one or more files/directories: scan those artefacts before publication.
  *   - --baseline <node-binary>: for an explicitly named SEA executable, ignore
- *     only matches whose exact bytes already exist at the same offset in the
- *     trusted Node runtime. Every changed or appended byte is still scanned.
- *     A target that is not demonstrably derived from the baseline fails closed.
+ *     only matches proven to come from the trusted Node runtime. PE uses exact
+ *     same-offset bytes; ELF injection may relocate sections, so ELF requires
+ *     >=99% of allocatable sections to match by name, size and exact content,
+ *     and suppresses matches only inside those matched ranges. Every added,
+ *     rebuilt, changed or unmatched byte is still scanned. A target that is not
+ *     demonstrably derived from the baseline fails closed.
  */
 import { execFileSync } from 'node:child_process'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
@@ -93,6 +96,106 @@ function explicitFiles(targets) {
   return files
 }
 
+function isElf(buffer) {
+  return buffer.length >= 4 && buffer[0] === 0x7f && buffer[1] === 0x45 && buffer[2] === 0x4c && buffer[3] === 0x46
+}
+
+/** Parse the 64-bit little-endian ELF section table used by the release binaries. */
+function parseElfSections(buffer) {
+  if (buffer.length < 64 || buffer[4] !== 2 || buffer[5] !== 1) {
+    throw new Error('ELF 基线校验只支持 64 位小端 ELF')
+  }
+  const sectionOffset = Number(buffer.readBigUInt64LE(40))
+  const entrySize = buffer.readUInt16LE(58)
+  const count = buffer.readUInt16LE(60)
+  const namesIndex = buffer.readUInt16LE(62)
+  if (sectionOffset === 0 || entrySize < 64 || count === 0 || namesIndex >= count) {
+    throw new Error('ELF 节表不完整，拒绝按基线扫描')
+  }
+  if (sectionOffset + entrySize * count > buffer.length) {
+    throw new Error('ELF 节表越界，拒绝按基线扫描')
+  }
+  const headers = []
+  for (let index = 0; index < count; index += 1) {
+    const offset = sectionOffset + index * entrySize
+    headers.push({
+      nameOffset: buffer.readUInt32LE(offset),
+      type: buffer.readUInt32LE(offset + 4),
+      flags: Number(buffer.readBigUInt64LE(offset + 8)),
+      fileOffset: Number(buffer.readBigUInt64LE(offset + 24)),
+      size: Number(buffer.readBigUInt64LE(offset + 32)),
+    })
+  }
+  const names = headers[namesIndex]
+  if (names.fileOffset + names.size > buffer.length) {
+    throw new Error('ELF 节名称表越界，拒绝按基线扫描')
+  }
+  const table = buffer.subarray(names.fileOffset, names.fileOffset + names.size)
+  return headers.map((header) => {
+    const end = table.indexOf(0, header.nameOffset)
+    const name = end < 0 ? '' : table.toString('utf8', header.nameOffset, end)
+    return { ...header, name }
+  })
+}
+
+/**
+ * ELF injection rebuilds the layout, so original bytes can move. Match original
+ * sections by name, size and exact content; only those proven-identical ranges
+ * may suppress a runtime match. Added/rebuilt notes and changed sections remain
+ * fully scanned.
+ */
+function createElfBaselineMatcher(target, baseline) {
+  const targetSections = parseElfSections(target)
+  const baselineSections = parseElfSections(baseline)
+  const used = new Set()
+  const matchedBaselineSections = new Set()
+  const ranges = []
+
+  for (const section of baselineSections) {
+    if (section.size === 0 || section.fileOffset + section.size > baseline.length) continue
+    const candidateIndex = targetSections.findIndex((candidate, index) =>
+      !used.has(index)
+      && candidate.name === section.name
+      && candidate.size === section.size
+      && candidate.fileOffset + candidate.size <= target.length
+      && target.subarray(candidate.fileOffset, candidate.fileOffset + candidate.size)
+        .equals(baseline.subarray(section.fileOffset, section.fileOffset + section.size)),
+    )
+    if (candidateIndex < 0) continue
+    used.add(candidateIndex)
+    matchedBaselineSections.add(section)
+    const candidate = targetSections[candidateIndex]
+    ranges.push({
+      targetStart: candidate.fileOffset,
+      targetEnd: candidate.fileOffset + candidate.size,
+      baselineStart: section.fileOffset,
+    })
+  }
+
+  // Sum every baseline allocatable section, including those without an identical
+  // target counterpart, so a stripped or replaced runtime cannot pass.
+  let allocatableBytes = 0
+  let matchedAllocatableBytes = 0
+  for (const section of baselineSections) {
+    if (section.size === 0 || (section.flags & 0x2) === 0) continue
+    allocatableBytes += section.size
+    if (matchedBaselineSections.has(section)) matchedAllocatableBytes += section.size
+  }
+  const similarity = allocatableBytes === 0 ? 0 : matchedAllocatableBytes / allocatableBytes
+  if (similarity < MIN_BASELINE_SIMILARITY) {
+    throw new Error(`ELF 目标与 Node 基线可加载节匹配不足 ${(MIN_BASELINE_SIMILARITY * 100).toFixed(0)}%，拒绝按基线扫描`)
+  }
+  return {
+    similarity,
+    isUnchanged(start, end) {
+      const range = ranges.find((entry) => start >= entry.targetStart && end <= entry.targetEnd)
+      if (range === undefined) return false
+      const baselineOffset = range.baselineStart + start - range.targetStart
+      return target.subarray(start, end).equals(baseline.subarray(baselineOffset, baselineOffset + end - start))
+    },
+  }
+}
+
 function validateBaseline(target, baseline) {
   if (target.length < baseline.length) {
     throw new Error('SEA 目标小于 Node 基线，拒绝按基线扫描')
@@ -105,7 +208,22 @@ function validateBaseline(target, baseline) {
   if (similarity < MIN_BASELINE_SIMILARITY) {
     throw new Error(`SEA 目标与 Node 基线相似度不足 ${(MIN_BASELINE_SIMILARITY * 100).toFixed(0)}%，拒绝按基线扫描`)
   }
-  return similarity
+  return {
+    similarity,
+    isUnchanged(start, end) {
+      return end <= baseline.length && target.subarray(start, end).equals(baseline.subarray(start, end))
+    },
+  }
+}
+
+function createBaselineMatcher(target, baseline) {
+  if (isElf(target) || isElf(baseline)) {
+    if (!isElf(target) || !isElf(baseline)) {
+      throw new Error('SEA 目标与 Node 基线格式不一致，拒绝按基线扫描')
+    }
+    return createElfBaselineMatcher(target, baseline)
+  }
+  return validateBaseline(target, baseline)
 }
 
 function* matches(text, expression) {
@@ -119,9 +237,11 @@ function scanBuffer(data, label, baseline, allowBaseline) {
   const seen = new Set()
   let ignoredBaselineMatches = 0
   let baselineSimilarity
+  let baselineMatcher
 
   if (allowBaseline && baseline !== undefined && binary) {
-    baselineSimilarity = validateBaseline(data, baseline)
+    baselineMatcher = createBaselineMatcher(data, baseline)
+    baselineSimilarity = baselineMatcher.similarity
   }
 
   if (!binary) {
@@ -145,12 +265,9 @@ function scanBuffer(data, label, baseline, allowBaseline) {
         if (seen.has(key)) continue
         seen.add(key)
         const matchEnd = start + match[0].length
-        if (baselineSimilarity !== undefined && matchEnd <= baseline.length) {
-          const unchanged = data.subarray(start, matchEnd).equals(baseline.subarray(start, matchEnd))
-          if (unchanged) {
-            ignoredBaselineMatches += 1
-            continue
-          }
+        if (baselineMatcher?.isUnchanged(start, matchEnd) === true) {
+          ignoredBaselineMatches += 1
+          continue
         }
         findings.push(`${label}@${start}  ${rule.name}`)
       }

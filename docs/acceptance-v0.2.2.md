@@ -34,7 +34,7 @@
 | 迁移相关 | **38/38 通过** | migrate 20/20 + identities 13/13 + startup-migration 5/5 |
 | 终态身份恢复 | **59/59 通过** | identities 13/13 + monitor-engine 46/46 |
 | Soak harness 自测 | **6/6 通过** | soak-v022 4/4 + soak-faults 2/2；不代替 24h |
-| 秘密扫描器回归 | **7/7 通过** | 仓库秘密扫描通过，覆盖 235 个受版本控制文件 |
+| 秘密扫描器回归 | **10/10 通过** | 仓库秘密扫描通过，覆盖 235 个受版本控制文件；含 ELF 节偏移迁移基线回归 |
 | TypeScript | **`tsc --noEmit` 通过** | B1–B4 修复候选 |
 | 差异检查 | **`git diff --check`、`git diff --cached --check` 均通过** | B1–B4 修复候选 |
 
@@ -129,7 +129,7 @@
 ## 7. 已知限制（P2，后续加固）
 
 - `scripts/scan-secrets.mjs` 默认整文件豁免 scanner 与 `test/acceptance/fixtures/README.md`；这两个文件误存真实凭据时不会被默认扫描发现。
-- 目录扫描模式对 `>4 MiB` 文件、深度 `>8`、文件数 `>5000` 静默跳过；SEA 二进制通过 `--baseline` 单独差分扫描，只放行同偏移、同字节的 Node 运行时原匹配。
+- 目录扫描模式对 `>4 MiB` 文件、深度 `>8`、文件数 `>5000` 静默跳过；SEA 二进制通过 `--baseline` 单独差分扫描：PE 只放行同偏移、同字节的 Node 运行时原匹配；ELF 要求至少 99% 可加载节按名称、大小和内容完全匹配，只在这些已匹配节内放行运行时原字节，新增 note 与未匹配区域仍全量扫描。
 - 模型请求不是 exactly-once；中断重试可能重复计费/调用。
 - 租约与实例记录不是分布式锁；不支持多实例。
 - manual/pre-restore 备份永不自动删除；长期运行需关注磁盘。

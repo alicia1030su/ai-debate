@@ -136,7 +136,7 @@ v0.2.2 的备份包含 `credentials.json` **密文**，但不是“可以公开�
 | paging | 7/7 通过 |
 | upgrade | 97/97 通过，身份迁移 `migrated`（真实 v0.2.1 Windows EXE，modelCalls=0；v0.2.0 为 fixture） |
 | Soak 自测 | 6/6 通过；不代替连续 24h |
-| 秘密扫描 | 仓库扫描通过，235 个受版本控制文件；扫描器回归 7/7；对应 EXE 按 Node 基线差分通过 |
+| 秘密扫描 | 仓库扫描通过，235 个受版本控制文件；扫描器回归 10/10；PE 同偏移与 ELF 节级 Node 基线差分均有回归 |
 | 类型与差异检查 | `tsc --noEmit`、`git diff --check`、`git diff --cached --check` 均通过 |
 
 这些结果对应 UTC 2026-11-21 10:01:17 的最终冻结候选。Server 全量完成于最后一次仅涉及 server 写序的修复之前；该修复后 monitor-engine、Soak 自测、两组故障 Soak 与类型检查均通过。最终 CI 与正式 Release 资产仍待完成。
@@ -147,7 +147,7 @@ v0.2.2 的备份包含 `credentials.json` **密文**，但不是“可以公开�
 - 全模式私网/回环/link-local/metadata 拒绝与 DNS rebinding socket 级固定已通过 Core 227/227；`isPinned` 仅在成功策略校验的 socket lookup 后为 true，忽略 dispatcher 的自定义/注入 fetch 不会触发真实 lookup，代理配置兼容与 CookieJar 属性模型仍是已知边界。
 - Windows 注册表自启在本构建机上受主机策略限制，未验证。
 - Debian 12 的 systemd 生命周期尚未在真实 init 环境验证。
-- 秘密扫描默认整文件豁免 scanner 与 fixtures README，目录模式会跳过 >4 MiB、深度>8、文件数>5000；SEA 二进制通过 `--baseline` 单独差分，只放行 Node 运行时同偏移原字节，新增或改写字节仍拦截。
+- 秘密扫描默认整文件豁免 scanner 与 fixtures README，目录模式会跳过 >4 MiB、深度>8、文件数>5000；SEA 二进制通过 `--baseline` 单独差分：PE 只放行 Node 运行时同偏移原字节；ELF 要求至少 99% 可加载节完全匹配，只放行已匹配节内原字节，新增 note、改写或未匹配字节仍拦截。
 - 备份中的手动/恢复前副本不会自动清理，长期运行需关注磁盘空间。
 - 日志轮转使用 `copytruncate`，极短的截断/写入窗口可能丢失少量日志。
 - Windows EXE 未代码签名，首次运行可能出现 SmartScreen 提示。

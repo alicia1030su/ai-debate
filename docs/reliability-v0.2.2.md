@@ -274,7 +274,7 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 | 迁移相关 | **38/38** | migrate 20/20 + identities 13/13 + startup-migration 5/5 |
 | 终态身份恢复 | **59/59** | identities 13/13 + monitor-engine 46/46 |
 | Soak harness 自测 | **6/6 通过** | soak-v022 4/4 + soak-faults 2/2；不代替连续 24h |
-| 秘密扫描器回归 | **7/7 通过** | 仓库扫描通过，235 个受版本控制文件 |
+| 秘密扫描器回归 | **10/10 通过** | 仓库扫描通过，235 个受版本控制文件；含 ELF 节偏移迁移基线回归 |
 | 类型与差异检查 | **`tsc --noEmit`、`git diff --check`、`git diff --cached --check` 均通过** | 最终冻结候选 |
 
 ### 9.2 最终修复前 Windows 资产证据（非发布资产）
@@ -308,7 +308,7 @@ QA 最后快照（UTC 02:10:49）：`completed=false`，lastTickAge `0.329s`，i
 | 有界读取 | 窗口外编辑、超页嵌套与超 `maxFloorPages` 内容可能漏读 | 明确 incomplete 原因、补偿与手动全量 |
 | 真实平台行为未知 | 风控、限流阈值、页面结构可能与 fixture 不同 | 诊断、冷却、失败分类；实号验收未完成 |
 | 身份迁移源损坏 | 以空身份栅栏启动可能重放旧回复 | 启动前迁移；身份/监控源不可读时自动化熔断，服务与健康检查仍可用 |
-| 秘密扫描静默边界 | 允许文件或超大/过深目录可能漏扫 | 默认整文件豁免 scanner 与 fixtures README；目录模式跳过 >4 MiB、深度>8、文件数>5000；SEA 二进制通过 `--baseline` 单独差分，只放行 Node 运行时同偏移原字节 |
+| 秘密扫描静默边界 | 允许文件或超大/过深目录可能漏扫 | 默认整文件豁免 scanner 与 fixtures README；目录模式跳过 >4 MiB、深度>8、文件数>5000；SEA 二进制通过 `--baseline` 单独差分：PE 同偏移原字节；ELF 至少 99% 可加载节完全匹配后，只放行已匹配节内原字节 |
 
 ## 11. 运维处置
 
