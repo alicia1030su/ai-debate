@@ -1,0 +1,122 @@
+name: Final Linux bin real upgrade (v0.2.2)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CI_RUN_ID: 44934742145
+      CANDIDATE_COMMIT: 021acdf3a930e849dcb33a2ef2c8e3978fac6911
+      LINUX_ARTIFACT_DIGEST: sha256:f71896db4b565ef3e5efbb6668415d5e38ad16396e4ff768ffc88d7eac7fd190
+      FINAL_TGZ_SHA256: daa2bc7d90835dba83ad3473c5ddb91261d0e32ebb345bac05929c9df70d4393
+      FINAL_BIN_SHA256: 13487e4d77503c4c243ead69ce61b967faaed6e965c12f415dbeca77cb3465b6
+      OLD_V021_TGZ_SHA256: 2b658c70dbcacca3ccb74a5e794b4603132017d8d3d96655815f4f204a5d5f61
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 021acdf3a930e849dcb33a2ef2c8e3978fac6911
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install and build the candidate test harness
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build:core
+          npm run bundle
+      - name: Download and verify the final Linux artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/artifact
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/artifacts" --paginate > evidence/ci-artifacts.json
+          artifact_id=$(jq -r '.artifacts[] | select(.name == "linux-tgz") | .id' evidence/ci-artifacts.json)
+          digest=$(jq -r '.artifacts[] | select(.name == "linux-tgz") | .digest' evidence/ci-artifacts.json)
+          test -n "$artifact_id"
+          test "$digest" = "$LINUX_ARTIFACT_DIGEST"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > evidence/linux-tgz-artifact.zip
+          printf '%s  %s\n' "${digest#sha256:}" evidence/linux-tgz-artifact.zip | sha256sum -c -
+          unzip -q evidence/linux-tgz-artifact.zip -d evidence/artifact
+          printf '%s  %s\n' "$FINAL_TGZ_SHA256" evidence/artifact/ai-debate-linux-x64.tgz | sha256sum -c -
+          mkdir -p final
+          tar -xzf evidence/artifact/ai-debate-linux-x64.tgz -C final
+          chmod +x final/ai-debate-linux-x64/bin/ai-debate
+          printf '%s  %s\n' "$FINAL_BIN_SHA256" final/ai-debate-linux-x64/bin/ai-debate | sha256sum -c -
+          final/ai-debate-linux-x64/bin/ai-debate --version | tee evidence/final-bin-version.log
+      - name: Download and verify the real v0.2.1 Linux binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p old/pkg
+          gh release download v0.2.1 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'ai-debate-linux-x64.tgz' --pattern 'SHA256SUMS.txt' \
+            --dir old --clobber
+          printf '%s  %s\n' "$OLD_V021_TGZ_SHA256" old/ai-debate-linux-x64.tgz | sha256sum -c -
+          (cd old && grep -E '  ai-debate-linux-x64\.tgz$' SHA256SUMS.txt | sha256sum -c -)
+          tar -xzf old/ai-debate-linux-x64.tgz -C old/pkg
+          old_bin=$(find old/pkg -path '*/bin/ai-debate' -type f -print -quit)
+          test -n "$old_bin"
+          chmod +x "$old_bin"
+          "$old_bin" --version | tee evidence/old-bin-version.log
+          printf '%s\n' "$old_bin" > evidence/old-bin-path.txt
+      - name: Run the final Linux bin against real v0.2.1 data
+        run: |
+          set -euo pipefail
+          AI_DEBATE_BIN="$PWD/final/ai-debate-linux-x64/bin/ai-debate" \
+          AI_DEBATE_V021_BIN="$PWD/$(cat evidence/old-bin-path.txt)" \
+          AI_DEBATE_CURRENT_VERSION=0.2.2 \
+            node --experimental-transform-types test/acceptance/upgrade.ts 2>&1 | tee evidence/linux-bin-real-upgrade.log
+      - name: Summarize and enforce the Linux upgrade result
+        run: |
+          set -euo pipefail
+          sha256sum \
+            evidence/artifact/ai-debate-linux-x64.tgz \
+            final/ai-debate-linux-x64/bin/ai-debate \
+            old/ai-debate-linux-x64.tgz \
+            "$PWD/$(cat evidence/old-bin-path.txt)" > evidence/asset-sha256.txt
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto'
+          import { readFileSync, writeFileSync } from 'node:fs'
+          const log = readFileSync('evidence/linux-bin-real-upgrade.log', 'utf8')
+          const summaries = log.split(/\r?\n/).filter((line) => line.startsWith('{')).map((line) => JSON.parse(line))
+          const v021 = summaries.find((entry) => entry.version === '0.2.1')
+          const modelCalls = [...log.matchAll(/modelCalls=(\d+)/g)].map((match) => Number(match[1]))
+          const passed = /97\/97 项通过/.test(log) && !log.includes('✖')
+          const result = {
+            runId: process.env.GITHUB_RUN_ID,
+            headSha: process.env.CANDIDATE_COMMIT,
+            sourceRunId: Number(process.env.CI_RUN_ID),
+            passed: passed ? 97 : 0,
+            failed: passed ? 0 : 1,
+            modelCalls: modelCalls.length === 0 ? null : Math.max(...modelCalls),
+            source: v021?.source,
+            identityMigration: v021?.identityMigration,
+            legacySha256: v021?.binarySha256,
+            stateSha256: v021?.stateSha256,
+            finalTgzSha256: process.env.FINAL_TGZ_SHA256,
+            finalBinSha256: process.env.FINAL_BIN_SHA256,
+            logSha256: createHash('sha256').update(readFileSync('evidence/linux-bin-real-upgrade.log')).digest('hex'),
+          }
+          writeFileSync('evidence/linux-bin-upgrade-summary.json', `${JSON.stringify(result, null, 2)}\n`)
+          if (!passed || result.failed !== 0 || result.modelCalls !== 0 || result.source !== 'real' || result.identityMigration !== 'migrated') {
+            process.stderr.write(`${JSON.stringify(result, null, 2)}\n`)
+            process.exit(1)
+          }
+          process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
+          NODE
+      - name: Upload the complete Linux upgrade evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v022-final-linux-upgrade-${{ github.run_id }}
+          path: evidence/**
+          if-no-files-found: error
