@@ -11,7 +11,8 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as nodeFs from 'node:fs'
@@ -25,6 +26,14 @@ const quiet = { warn: () => undefined }
 
 function scratch(): string {
   return mkdtempSync(join(tmpdir(), 'ai-debate-p0-'))
+}
+
+function waitForFile(file: string, timeoutMs = 10_000): void {
+  const startedAt = Date.now()
+  while (!existsSync(file)) {
+    if (Date.now() - startedAt > timeoutMs) throw new Error(`等待文件超时：${file}`)
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+  }
 }
 
 test('原子写：失败的写入不破坏原文件，也不把内存状态带偏', () => {
@@ -131,6 +140,34 @@ test('原子写：Windows rename 瞬态 EPERM 有界重试后成功', (t) => {
   } finally {
     mockedRename.mock.restore()
     syncBuiltinESMExports()
+  }
+})
+
+test('原子写：Windows FileShare.None 实锁 800ms 后原子替换成功', { skip: process.platform !== 'win32' }, async () => {
+  const dir = scratch()
+  const file = join(dir, 'state.json')
+  const ready = join(dir, 'ready.txt')
+  writeFileSync(file, 'old', 'utf8')
+  const script = '$fs = [System.IO.File]::Open($env:LOCK_TARGET, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None); [System.IO.File]::WriteAllText($env:LOCK_READY, "ready"); [System.Threading.Thread]::Sleep(800); $fs.Dispose()'
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env: { ...process.env, LOCK_TARGET: file, LOCK_READY: ready },
+  })
+  let stderr = ''
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8') })
+  try {
+    waitForFile(ready)
+    const startedAt = Date.now()
+    writeFileAtomic(file, 'new')
+    const elapsedMs = Date.now() - startedAt
+    assert.ok(elapsedMs >= 700, `应等待真实持锁释放，实际 ${elapsedMs}ms`)
+    assert.ok(elapsedMs < 5_000, `真实持锁应在5秒预算内成功，实际 ${elapsedMs}ms`)
+    assert.equal(readFileSync(file, 'utf8'), 'new')
+    const exitCode = await new Promise<number | null>((resolve) => child.once('exit', resolve))
+    assert.equal(exitCode, 0, stderr)
+  } finally {
+    if (child.exitCode === null) child.kill()
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 
