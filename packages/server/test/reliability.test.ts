@@ -176,22 +176,27 @@ test('原子写：Windows rename 持续 EPERM 最终失败且不破坏旧文件'
   const file = join(dir, 'state.json')
   writeFileSync(file, 'old', 'utf8')
   let attempts = 0
+  let nowMs = 0
   const mockedRename = t.mock.method(nodeFsDefault, 'renameSync', () => {
     attempts += 1
     throw Object.assign(new Error('injected persistent sharing violation'), { code: 'EPERM' })
   })
+  const mockedNow = t.mock.method(Date, 'now', () => {
+    nowMs += 100
+    return nowMs
+  })
+  const mockedWait = t.mock.method(Atomics, 'wait', (() => 'timed-out') as typeof Atomics.wait)
   syncBuiltinESMExports()
   try {
-    const startedAt = Date.now()
     assert.throws(() => withWindowsPlatform(() => writeFileAtomic(file, 'new')), AtomicWriteError)
-    const elapsedMs = Date.now() - startedAt
-    assert.ok(elapsedMs >= 4_900, `持久 EPERM 应耗尽约5秒预算，实际 ${elapsedMs}ms`)
-    assert.ok(elapsedMs <= 8_000, `持久 EPERM 不得无界重试，实际 ${elapsedMs}ms`)
-    assert.ok(attempts > 1, '持久 EPERM 应进行有界重试')
+    assert.ok(nowMs >= 5_000, `持久 EPERM 应耗尽5秒虚拟预算，实际 ${nowMs}ms`)
+    assert.ok(attempts > 6, '持久 EPERM 应进行有界指数退避重试')
     assert.equal(readFileSync(file, 'utf8'), 'old')
     assert.equal(readdirSync(dir).some((name) => name.includes('.tmp-')), false)
   } finally {
     mockedRename.mock.restore()
+    mockedNow.mock.restore()
+    mockedWait.mock.restore()
     syncBuiltinESMExports()
   }
 })
