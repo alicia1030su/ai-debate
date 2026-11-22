@@ -94,7 +94,8 @@ function fsyncDirectory(file: string): void {
 }
 
 /** Synchronous bounded backoff for Windows rename sharing violations. */
-const WINDOWS_RENAME_RETRY_DELAYS_MS = [10, 20, 30, 40, 50] as const
+const WINDOWS_RENAME_RETRY_BUDGET_MS = 5_000
+const WINDOWS_RENAME_RETRY_MAX_DELAY_MS = 250
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
@@ -107,17 +108,22 @@ function isTransientWindowsRenameError(error: unknown): boolean {
 }
 
 function renameWithRetry(temp: string, file: string): void {
-  for (let attempt = 0; ; attempt += 1) {
+  const startedAt = Date.now()
+  let delayMs = 10
+  for (;;) {
     try {
       renameSync(temp, file)
       return
     } catch (error) {
-      const delay = WINDOWS_RENAME_RETRY_DELAYS_MS[attempt]
-      if (!isTransientWindowsRenameError(error) || delay === undefined) throw error
+      if (!isTransientWindowsRenameError(error)) throw error
+      const remainingMs = WINDOWS_RENAME_RETRY_BUDGET_MS - (Date.now() - startedAt)
+      if (remainingMs <= 0) throw error
       // A concurrent reader/AV/indexer can briefly hold the target or directory
       // open on NTFS. Retry the same fully-written temp file; deleting it here
       // would turn a transient sharing violation into a lost ledger update.
-      sleepSync(delay + Math.floor(Math.random() * 5))
+      const waitMs = Math.min(delayMs + Math.floor(Math.random() * 5), WINDOWS_RENAME_RETRY_MAX_DELAY_MS, remainingMs)
+      sleepSync(waitMs)
+      delayMs = Math.min(delayMs * 2, WINDOWS_RENAME_RETRY_MAX_DELAY_MS)
     }
   }
 }

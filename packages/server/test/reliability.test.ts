@@ -116,7 +116,7 @@ test('原子写：Windows rename 瞬态 EPERM 有界重试后成功', (t) => {
   let attempts = 0
   const mockedRename = t.mock.method(nodeFsDefault, 'renameSync', ((from: nodeFs.PathLike, to: nodeFs.PathLike) => {
     attempts += 1
-    if (attempts <= 2) {
+    if (attempts <= 8) {
       assert.equal(readFileSync(file, 'utf8'), 'old', '重试期间旧文件必须保持可读')
       throw Object.assign(new Error('injected sharing violation'), { code: 'EPERM' })
     }
@@ -125,7 +125,7 @@ test('原子写：Windows rename 瞬态 EPERM 有界重试后成功', (t) => {
   syncBuiltinESMExports()
   try {
     withWindowsPlatform(() => writeFileAtomic(file, 'new'))
-    assert.equal(attempts, 3)
+    assert.equal(attempts, 9)
     assert.equal(readFileSync(file, 'utf8'), 'new')
     assert.equal(readdirSync(dir).some((name) => name.includes('.tmp-')), false)
   } finally {
@@ -138,12 +138,19 @@ test('原子写：Windows rename 持续 EPERM 最终失败且不破坏旧文件'
   const dir = scratch()
   const file = join(dir, 'state.json')
   writeFileSync(file, 'old', 'utf8')
+  let attempts = 0
   const mockedRename = t.mock.method(nodeFsDefault, 'renameSync', () => {
+    attempts += 1
     throw Object.assign(new Error('injected persistent sharing violation'), { code: 'EPERM' })
   })
   syncBuiltinESMExports()
   try {
+    const startedAt = Date.now()
     assert.throws(() => withWindowsPlatform(() => writeFileAtomic(file, 'new')), AtomicWriteError)
+    const elapsedMs = Date.now() - startedAt
+    assert.ok(elapsedMs >= 4_900, `持久 EPERM 应耗尽约5秒预算，实际 ${elapsedMs}ms`)
+    assert.ok(elapsedMs <= 8_000, `持久 EPERM 不得无界重试，实际 ${elapsedMs}ms`)
+    assert.ok(attempts > 1, '持久 EPERM 应进行有界重试')
     assert.equal(readFileSync(file, 'utf8'), 'old')
     assert.equal(readdirSync(dir).some((name) => name.includes('.tmp-')), false)
   } finally {
